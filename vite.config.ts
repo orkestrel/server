@@ -91,47 +91,6 @@ export const guides = (config?: UserConfig): UserConfig =>
 		),
 	)
 
-// Extends srcCore: browser-only library (`src/browser`, e.g. the IndexedDB
-// driver). Builds an ES lib and runs its tests in a real Chromium via
-// Playwright, where DOM and `indexedDB` are available. No Vue — this surface is
-// plain TypeScript; add the plugin here if a browser app surface ever needs it.
-export const srcBrowser = (config?: UserConfig): UserConfig =>
-	srcCore(
-		mergeConfig(
-			{
-				build: {
-					lib: {
-						entry: resolveWorkspacePath('src/browser/index.ts'),
-						formats: ['es'],
-						fileName: () => 'index.js',
-					},
-					outDir: 'dist/src/browser',
-					// The browser lib and the core lib ship as two subpaths of one package,
-					// so the published build references the sibling `dist/src/core` (CJS)
-					// instead of inlining a copy. Build-only — the test project below
-					// resolves `@src/core` from source through the shared `resolve` alias.
-					rolldownOptions: {
-						external: (id: string) => id === '@src/core',
-						output: { paths: { '@src/core': '../core/index.cjs' } },
-					},
-				},
-				test: {
-					name: { label: 'src:browser', color: 'yellow' },
-					include: ['tests/src/browser/**/*.test.ts'],
-					exclude: ['tests/src/core/**/*.test.ts'],
-					setupFiles: ['./tests/setup.ts', './tests/setupBrowser.ts'],
-					browser: {
-						enabled: true,
-						provider: createBrowserProvider(),
-						instances: [{ browser: 'chromium', headless: true }],
-					},
-					fileParallelism: false,
-				},
-			},
-			config ?? {},
-		),
-	)
-
 // Extends srcCore: server-only library (`src/server`, e.g. the SQLite wrapper +
 // driver over node:sqlite). Builds a CJS lib for Node and runs its tests in the
 // node environment. Externalizes `node:*` (so node:sqlite is never bundled) AND
@@ -169,6 +128,6 @@ export const srcServer = (config?: UserConfig): UserConfig =>
 export default defineConfig({
 	resolve,
 	test: {
-		projects: [srcCore, srcBrowser, srcServer, guides],
+		projects: [srcCore, srcServer, guides],
 	},
 })

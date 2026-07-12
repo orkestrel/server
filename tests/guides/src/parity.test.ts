@@ -53,7 +53,7 @@ const manifest = parseManifest(readText('guides/README.md'), 'guides')
 // so the fence-import check resolves each specifier to ITS OWN face's exports rather than
 // only the current manifest entry's, per the specifier → module map below.
 const SPECIFIER_MODULES: Readonly<Record<string, string>> = {
-	'@orkestrel/server': 'src/server',
+	'@orkestrel/server': 'src/core',
 	'@src/core': 'src/core',
 	'@src/server': 'src/server',
 }

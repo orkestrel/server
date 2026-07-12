@@ -3,8 +3,18 @@
 A dual-axis index into this repository's guides — by concept, and by
 directory (AGENTS §22).
 
-This package has no `src/` yet — concept and by-directory rows land with the
-implementation, once the public API is designed and built.
+## By concept
+
+| Concept | Spec                             | Source                                                   | Tests                                                                            |
+| ------- | -------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Server  | [`src/server.md`](src/server.md) | [`src/core`](../src/core), [`src/server`](../src/server) | [`tests/src/core`](../tests/src/core), [`tests/src/server`](../tests/src/server) |
+
+## By directory
+
+| Directory    | Guide                            |
+| ------------ | -------------------------------- |
+| `src/core`   | [`src/server.md`](src/server.md) |
+| `src/server` | [`src/server.md`](src/server.md) |
 
 ## Dependency reference
 
@@ -41,6 +51,13 @@ suite (`tests/guides/src/parity.test.ts`). It documents **that package's**
 surface (`Guide` / `Source`, the manifest and comparison helpers), not anything
 sourced in this repo; it is kept here so a reader of the parity suite can see
 the primitives it is built from without leaving this guide set.
+
+[`src/timeout.md`](src/timeout.md) is a byte-identical mirror of the guide for
+`@orkestrel/timeout` — this package's fifth runtime dependency. It documents
+**that package's** surface (the `Timeout` class, `TimeoutInterface`, and the
+start/clear deadline lifecycle), not anything sourced in this repo; it is
+kept here so a reader of this package can see the primitives it is built
+from without leaving this guide set.
 
 ## See also
 
