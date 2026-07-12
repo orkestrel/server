@@ -22,7 +22,7 @@ import {
 
 const ROOT = fileURLToPath(new URL('../../../', import.meta.url))
 const WALK_DIRS = ['src', 'guides', 'tests']
-const SELF_SPECIFIERS = ['@orkestrel/router', '@src/core', '@src/browser', '@src/server']
+const SELF_SPECIFIERS = ['@orkestrel/server', '@src/core', '@src/server']
 
 function walk(dir: string, acc: Record<string, string>): void {
 	for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
@@ -53,9 +53,8 @@ const manifest = parseManifest(readText('guides/README.md'), 'guides')
 // so the fence-import check resolves each specifier to ITS OWN face's exports rather than
 // only the current manifest entry's, per the specifier → module map below.
 const SPECIFIER_MODULES: Readonly<Record<string, string>> = {
-	'@orkestrel/router': 'src/core',
+	'@orkestrel/server': 'src/server',
 	'@src/core': 'src/core',
-	'@src/browser': 'src/browser',
 	'@src/server': 'src/server',
 }
 const specifierSources = new Map<string, ReturnType<typeof createSource>>()

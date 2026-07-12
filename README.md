@@ -1,32 +1,33 @@
-# @orkestrel/router
+# @orkestrel/server
 
-A typed request router for the `@orkestrel` line — the first `@orkestrel`
-package to ship both server and browser environments alongside its shared
-core. Built to sit beside `@orkestrel/contract` (validation) and
-`@orkestrel/emitter` (observable lifecycle), reusing both as it takes shape.
+A typed HTTP server for the `@orkestrel` line — composes the
+`@orkestrel/router` dispatcher behind a managed lifecycle over a pluggable
+node adapter seam. Built to sit beside `@orkestrel/contract` (validation),
+`@orkestrel/emitter` (observable lifecycle), and `@orkestrel/abort`
+(cancellation), reusing all three as it takes shape. Its middleware
+architecture is still under design.
 
 ## Install
 
 ```sh
-npm install @orkestrel/router
+npm install @orkestrel/server
 ```
 
 ## Requirements
 
 - Node.js >= 24
 - ESM-only (no CommonJS build)
-- Server and browser environments both supported
 
 ## Status
 
 The public API is under design and not yet implemented — this package
-currently ships no runtime code. This README will gain an install snippet,
-usage examples, and a guide link once the design lands.
+currently ships no runtime code. An upcoming `PROPOSAL.md` will define the
+server surface (lifecycle, middleware, node adapter) before implementation
+begins.
 
 ## Package
 
-Published as three environment-scoped entry points per the `exports` field in
-`package.json`: a shared core, `./browser`, and `./server`.
+Published as a single entry point per the `exports` field in `package.json`.
 
 ## License
 

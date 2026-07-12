@@ -1,21 +1,21 @@
 {
-	"name": "@orkestrel/router",
+	"name": "@orkestrel/server",
 	"version": "0.0.1",
-	"description": "A typed request router for the @orkestrel line — server and browser environments. Part of the @orkestrel line.",
+	"description": "A typed HTTP server for the @orkestrel line — composes the @orkestrel/router dispatcher behind a managed lifecycle. Part of the @orkestrel line.",
 	"keywords": [
-		"browser",
+		"fetch",
+		"http",
+		"middleware",
 		"router",
-		"routing",
 		"server",
-		"typescript",
-		"url"
+		"typescript"
 	],
-	"homepage": "https://github.com/orkestrel/router#readme",
-	"bugs": "https://github.com/orkestrel/router/issues",
+	"homepage": "https://github.com/orkestrel/server#readme",
+	"bugs": "https://github.com/orkestrel/server/issues",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/orkestrel/router.git"
+		"url": "git+https://github.com/orkestrel/server.git"
 	},
 	"files": [
 		"dist",
