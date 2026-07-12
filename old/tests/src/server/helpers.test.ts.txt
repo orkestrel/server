@@ -1,0 +1,1760 @@
+import type { ServerInterface } from '@src/server'
+import type { StartedServerInterface } from '../../../setupServer.js'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createServer as createNetServer } from 'node:net'
+import { join, resolve, sep } from 'node:path'
+import { brotliDecompressSync, gunzipSync, gzipSync } from 'node:zlib'
+import { describe, expect, it } from 'vitest'
+import {
+	bindStreamingAbort,
+	codingQuality,
+	compressBody,
+	computeBodyETag,
+	computeWeakETag,
+	contentType,
+	contentTypeOf,
+	cookieSessionTransport,
+	createServer,
+	createUploadedFile,
+	decodeCookieValue,
+	decompressBody,
+	detectMIME,
+	discoverPort,
+	extractToken,
+	flattenHeaders,
+	flattenOutgoing,
+	headerSessionTransport,
+	HTTPError,
+	isAddressInfo,
+	isCompressibleType,
+	isCookieName,
+	isDotfilePath,
+	isMultipartBody,
+	isSessionControl,
+	lookupContentType,
+	matchesMagic,
+	mergeVary,
+	moveUploadedFile,
+	multipartBoundary,
+	negotiateEncoding,
+	normalizeSecret,
+	openSSEStream,
+	parseAcceptHeader,
+	parseCookies,
+	parsePartHeaders,
+	parseRange,
+	parseURL,
+	readSignedCookie,
+	readUploadedFile,
+	requestEncoding,
+	requestEncrypted,
+	requestMethod,
+	resolveClientKey,
+	resolveOrigin,
+	resolveSecure,
+	resolveSecurityHeader,
+	resolveStaticPath,
+	safeCompare,
+	serialize,
+	serializeCookie,
+	Session,
+	signToken,
+	streamUploadedFile,
+	TOKEN_STATE,
+	transferSessionData,
+	verifyToken,
+} from '@src/server'
+import { collectSSE, createRecorder, readSSEStream, waitForDelay } from '../../../setup.js'
+import {
+	createContextStub,
+	createRequestStub,
+	createStaticFixture,
+	createTeardown,
+	startServer,
+} from '../../../setupServer.js'
+
+// src/server/http/helpers.ts — the pure request/response helpers PLUS the generic SSE
+// seam (the seam's exported free functions live here per AGENTS §5: WHERE a member
+// lives, not whether it's public). The path-matching primitives now live in the shared
+// `@src/core` router engine (their unit tests in tests/src/core/router) — this server
+// suite proves the COMPOSITION (route registration / dispatch / 405 / OPTIONS) in the
+// RouteManager / Route suites. `parseURL`, `requestMethod`, `contentType`,
+// `flattenHeaders`, `serialize`, and the token internals `normalizeSecret` /
+// `safeCompare` are exercised directly (they take plain values /
+// fixtures); the response SENDERS (`sendJSON` / `sendText` / `sendEmpty` / `sendError`),
+// `collectBody`, and the SSE seam (`openSSEStream` / `bindStreamingAbort`) are proven
+// THROUGH a real server + `fetch` (the context wraps them), so the over-the-wire shape
+// is asserted against a genuine `node:http` exchange, not a fake response object
+// (AGENTS §16). The SSE round-trip decodes the response body with the core `SSEParser`
+// (collectSSE / readSSEStream) — the proof the wire is the encode ↔ decode inverse.
+
+describe('discoverPort — free TCP port probe', () => {
+	const { track } = createTeardown((handle: StartedServerInterface) => handle.stop())
+
+	it('returns a free, usable ephemeral port when none is preferred', async () => {
+		const port = await discoverPort()
+		expect(port).toBeGreaterThan(0)
+		// The probe released it — a real server can bind it (no lingering listener).
+		const server = createServer({ port })
+		const handle = track(await startServer(server))
+		expect(handle.port).toBe(port)
+	})
+
+	it('returns the preferred port when it is free', async () => {
+		// First discover a free port, then ASK for that exact one — it must be returned
+		// unchanged (it was free at the first probe and still is).
+		const preferred = await discoverPort()
+		expect(await discoverPort(preferred)).toBe(preferred)
+	})
+
+	it('falls back to an ephemeral port when the preferred one is taken', async () => {
+		// Occupy a real port with a throwaway net server, then ask discoverPort for it: the
+		// EADDRINUSE must trigger the fallback to a DIFFERENT free ephemeral port (never the
+		// taken one, never a reject). The blocker binds the SAME scope discoverPort's probe
+		// uses (all interfaces — no host), so the bind genuinely collides; a loopback-only
+		// blocker would NOT conflict with the probe's wildcard bind.
+		const taken = await discoverPort()
+		const blocker = createNetServer()
+		await new Promise<void>((done) => blocker.listen(taken, done))
+		try {
+			const fallback = await discoverPort(taken)
+			expect(fallback).toBeGreaterThan(0)
+			expect(fallback).not.toBe(taken)
+		} finally {
+			await new Promise<void>((done) => blocker.close(() => done()))
+		}
+	})
+})
+
+describe('isAddressInfo — node:net address narrow', () => {
+	it('accepts a structured AddressInfo with a numeric port', () => {
+		expect(isAddressInfo({ address: '127.0.0.1', family: 'IPv4', port: 4321 })).toBe(true)
+	})
+
+	it('rejects a pipe string, null, and a portless record', () => {
+		expect(isAddressInfo('/tmp/socket.pipe')).toBe(false)
+		expect(isAddressInfo(null)).toBe(false)
+		expect(isAddressInfo({ address: '127.0.0.1' })).toBe(false)
+	})
+})
+
+describe('parseURL — request → absolute URL', () => {
+	it('reconstructs the origin from the Host header', () => {
+		const url = parseURL(
+			createRequestStub({ url: '/users?active=1', headers: { host: 'example.com' } }),
+		)
+		expect(url.host).toBe('example.com')
+		expect(url.pathname).toBe('/users')
+		expect(url.searchParams.get('active')).toBe('1')
+	})
+
+	it('falls back to localhost + root for a missing host / url', () => {
+		const url = parseURL(createRequestStub({}))
+		expect(url.host).toBe('localhost')
+		expect(url.pathname).toBe('/')
+	})
+})
+
+describe('requestMethod — narrow to an HTTPMethod', () => {
+	it('passes a known verb through', () => {
+		expect(requestMethod(createRequestStub({ method: 'POST' }))).toBe('POST')
+	})
+
+	it('falls back to GET for an unknown / missing method', () => {
+		expect(requestMethod(createRequestStub({ method: 'BREW' }))).toBe('GET')
+		expect(requestMethod(createRequestStub({}))).toBe('GET')
+	})
+})
+
+describe('contentType — bare content type', () => {
+	it('strips the charset parameter and lower-cases', () => {
+		expect(
+			contentType(
+				createRequestStub({ headers: { 'content-type': 'Application/JSON; charset=utf-8' } }),
+			),
+		).toBe('application/json')
+	})
+
+	it('returns the empty string when absent', () => {
+		expect(contentType(createRequestStub({}))).toBe('')
+	})
+})
+
+describe('flattenHeaders — IncomingHttpHeaders → Record<string, string>', () => {
+	it('keeps a string value, joins an array with ", ", and skips an absent one', () => {
+		// `x-forwarded-for` is a non-known header, so it hits the `string | string[]` index
+		// signature (the known `accept` is typed `string`, not an array). `x-absent: undefined`
+		// must be dropped, not stringified.
+		expect(
+			flattenHeaders({
+				'content-type': 'application/json',
+				'x-forwarded-for': ['10.0.0.1', '10.0.0.2'],
+				'x-absent': undefined,
+			}),
+		).toEqual({ 'content-type': 'application/json', 'x-forwarded-for': '10.0.0.1, 10.0.0.2' })
+	})
+})
+
+// `serialize` (the SSEMessage → wire encoder) is a pure string function — exercise it
+// directly here; the over-the-wire round-trip (serialize → SSEParser) is proven live
+// in the SSE-seam suites below.
+describe('serialize — SSEMessage → SSE wire', () => {
+	it('emits a single data: line terminated by a blank line', () => {
+		expect(serialize({ data: 'hello' })).toBe('data: hello\n\n')
+	})
+
+	it('splits multi-line data into one data: line per \\n segment', () => {
+		// The inverse of the parser's multi-`data` concat — each segment is its own line.
+		expect(serialize({ data: 'a\nb\nc' })).toBe('data: a\ndata: b\ndata: c\n\n')
+	})
+
+	it('emits event: / id: / retry: lines for the present fields, in order', () => {
+		expect(serialize({ event: 'token', id: '42', retry: 1500, data: 'hi' })).toBe(
+			'event: token\nid: 42\nretry: 1500\ndata: hi\n\n',
+		)
+	})
+
+	it('omits an absent optional field (no stray line)', () => {
+		expect(serialize({ event: 'token', data: 'hi' })).toBe('event: token\ndata: hi\n\n')
+	})
+
+	it('an empty data string still emits one empty data: line', () => {
+		expect(serialize({ data: '' })).toBe('data: \n\n')
+	})
+})
+
+// signToken / verifyToken — the stateless HMAC-signed token primitives behind
+// createTokenGuard. Pure + deterministic (no server): a round-trip returns the original
+// value; tampering (signature OR payload) is rejected; a non-token / no-dot string is
+// rejected; rotation accepts an older secret; an HMAC-bound expiry rejects a past token
+// (and a realistic short-timer path); a value containing dots survives the lastIndexOf
+// split; an empty secret list makes verify total-`undefined` and signToken throw.
+describe('signToken / verifyToken — stateless signed tokens', () => {
+	it('round-trips: a signed value verifies back to the original', () => {
+		const token = signToken('client', { secret: 'secret-k' })
+		expect(verifyToken(token, 'secret-k')).toBe('client')
+	})
+
+	it('rejects a tampered signature', () => {
+		const token = signToken('client', { secret: 'secret-k' })
+		// Flip the last char of the signature (after the dot) — the HMAC no longer matches.
+		const last = token.endsWith('a') ? 'b' : 'a'
+		const tampered = token.slice(0, -1) + last
+		expect(verifyToken(tampered, 'secret-k')).toBeUndefined()
+	})
+
+	it('rejects a tampered payload (re-encoding a different value under the old signature)', () => {
+		const token = signToken('client', { secret: 'secret-k' })
+		const signature = token.slice(token.lastIndexOf('.') + 1)
+		// Swap in a payload encoding a DIFFERENT value but keep the original signature —
+		// the recomputed HMAC over the new payload won't match.
+		const forgedPayload = Buffer.from(JSON.stringify({ value: 'admin' })).toString('base64url')
+		expect(verifyToken(`${forgedPayload}.${signature}`, 'secret-k')).toBeUndefined()
+	})
+
+	it('rejects a non-token string with no dot', () => {
+		expect(verifyToken('not-a-token', 'secret-k')).toBeUndefined()
+		expect(verifyToken('', 'secret-k')).toBeUndefined()
+	})
+
+	it('rejects a wrong secret', () => {
+		const token = signToken('client', { secret: 'secret-k' })
+		expect(verifyToken(token, 'other-secret')).toBeUndefined()
+	})
+
+	it('rotation: a token signed with A verifies under [B, A] but not under [B] alone', () => {
+		// signToken always signs with the FIRST secret (A here); verifyToken accepts ANY in
+		// the list — so a rotation list with the old secret still present accepts it, and
+		// dropping it (only the new B) rejects it.
+		const token = signToken('client', { secret: 'secret-a' })
+		expect(verifyToken(token, ['secret-b', 'secret-a'])).toBe('client')
+		expect(verifyToken(token, ['secret-b'])).toBeUndefined()
+	})
+
+	it('signs with the current (first) secret of a rotation list', () => {
+		// A rotation list signs with its head ('current'); verifying with that head alone works.
+		const token = signToken('client', { secret: ['current', 'older'] })
+		expect(verifyToken(token, 'current')).toBe('client')
+		expect(verifyToken(token, 'older')).toBeUndefined()
+	})
+
+	it('expiry: an already-past ttl rejects, a generous ttl verifies', () => {
+		const expired = signToken('client', { secret: 'secret-k', ttl: -1000 })
+		expect(verifyToken(expired, 'secret-k')).toBeUndefined()
+		const live = signToken('client', { secret: 'secret-k', ttl: 10_000 })
+		expect(verifyToken(live, 'secret-k')).toBe('client')
+	})
+
+	it('expiry: a short real timer elapses and the token stops verifying', async () => {
+		const token = signToken('client', { secret: 'secret-k', ttl: 10 })
+		expect(verifyToken(token, 'secret-k')).toBe('client')
+		await waitForDelay(20)
+		expect(verifyToken(token, 'secret-k')).toBeUndefined()
+	})
+
+	it('a value containing dots survives the round-trip (split on the LAST dot)', () => {
+		const token = signToken('a.b.c', { secret: 'secret-k' })
+		expect(verifyToken(token, 'secret-k')).toBe('a.b.c')
+	})
+
+	it('an empty secret list: verify is total-undefined, signToken throws', () => {
+		expect(verifyToken('anything.signature', [])).toBeUndefined()
+		expect(() => signToken('client', { secret: [] })).toThrow(HTTPError)
+	})
+
+	it('a blank / whitespace-only secret is fail-closed on sign (throws)', () => {
+		// No usable (non-blank) secret left after normalization → the empty-list guard
+		// trips, so a publicly-computable empty-key HMAC can never sign.
+		expect(() => signToken('client', { secret: '' })).toThrow(HTTPError)
+		expect(() => signToken('client', { secret: '   ' })).toThrow(HTTPError)
+		expect(() => signToken('client', { secret: ['', '  '] })).toThrow(HTTPError)
+	})
+
+	it('a blank secret is fail-closed on verify (rejects a real-secret token)', () => {
+		// A token signed with a REAL secret must NOT verify under a blank secret — the
+		// blank is dropped, leaving nothing usable, so verify is total-undefined.
+		const token = signToken('client', { secret: 'secret-k' })
+		expect(verifyToken(token, '')).toBeUndefined()
+	})
+
+	it('a blank entry in a rotation list is ignored — a real secret still verifies', () => {
+		// A blank alongside a real secret must NOT break a valid token: the blank is
+		// dropped and the real secret still matches.
+		const token = signToken('client', { secret: 'secret-k' })
+		expect(verifyToken(token, ['', 'secret-k'])).toBe('client')
+	})
+})
+
+// normalizeSecret / safeCompare — the token internals behind signToken / verifyToken,
+// now exported. normalizeSecret resolves a TokenSecret to the usable (non-blank) list;
+// safeCompare is the length-guarded constant-time compare (it must NOT throw on a
+// length mismatch — `timingSafeEqual` would, hence the guard).
+describe('normalizeSecret — TokenSecret → usable secret list', () => {
+	it('wraps a single string in a one-element list', () => {
+		expect([...normalizeSecret('secret-k')]).toEqual(['secret-k'])
+	})
+
+	it('copies a rotation list verbatim', () => {
+		const list = ['current', 'older']
+		const out = normalizeSecret(list)
+		expect([...out]).toEqual(['current', 'older'])
+	})
+
+	it('drops blank / whitespace-only entries (keeping the real ones, verbatim)', () => {
+		expect([...normalizeSecret(['', '  ', 'secret-k', '\t'])]).toEqual(['secret-k'])
+	})
+
+	it('an all-blank secret normalizes to the empty list (fail-closed)', () => {
+		expect([...normalizeSecret('')]).toEqual([])
+		expect([...normalizeSecret('   ')]).toEqual([])
+		expect([...normalizeSecret(['', '  '])]).toEqual([])
+	})
+})
+
+describe('safeCompare — length-guarded constant-time compare', () => {
+	it('equal strings compare true', () => {
+		expect(safeCompare('abc', 'abc')).toBe(true)
+	})
+
+	it('unequal strings of the SAME length compare false', () => {
+		expect(safeCompare('abc', 'abd')).toBe(false)
+	})
+
+	it('unequal-LENGTH strings compare false WITHOUT throwing (the length guard)', () => {
+		// `timingSafeEqual` throws on a length mismatch; the guard returns false instead.
+		expect(safeCompare('abc', 'abcd')).toBe(false)
+		expect(safeCompare('', 'x')).toBe(false)
+	})
+})
+
+// ── The cookie machinery (signed-cookie session transport + CSRF) ────────────
+//
+// src/server/http/helpers.ts — the cookie helpers behind the signed-cookie session
+// transport (`createCookieSession`) and `createCSRFGuard`. `parseCookies` /
+// `decodeCookieValue` / `serializeCookie` are pure (plain string in/out); the SIGNED
+// pair (`readSignedCookie`, paired with `signToken` for the wire value) is exercised
+// against a request STUB carrying a `Cookie` header (no `as`, §14) — proving the HMAC
+// sign↔verify round-trip AND tamper rejection without a server (the over-the-wire
+// `Set-Cookie` writes are proven through a real cookie session in middlewares.test.ts).
+
+describe('parseCookies — raw Cookie header → name/value lookup', () => {
+	it('parses a multi-cookie header, trimming whitespace around each pair', () => {
+		expect(parseCookies('session=abc; theme=dark; lang=en')).toEqual({
+			session: 'abc',
+			theme: 'dark',
+			lang: 'en',
+		})
+	})
+
+	it('URL-decodes the value (the inverse of serializeCookie encoding)', () => {
+		// A value with reserved characters round-trips: `a b/c` → `a%20b%2Fc` on the wire → decoded back.
+		expect(parseCookies('x=a%20b%2Fc')).toEqual({ x: 'a b/c' })
+	})
+
+	it('keeps a quoted value verbatim (quotes are part of the value, not stripped)', () => {
+		// RFC 6265 quoted cookie-values: the surrounding quotes are passed through (decodeURIComponent
+		// leaves them), so a reader sees the literal quoted text — not unwrapped.
+		expect(parseCookies('q="spaced value"')).toEqual({ q: '"spaced value"' })
+	})
+
+	it('skips a pair with no = and an empty name; an absent / empty header is {}', () => {
+		expect(parseCookies('flag; =orphan; ok=1')).toEqual({ ok: '1' })
+		expect(parseCookies('')).toEqual({})
+		expect(parseCookies(undefined)).toEqual({})
+	})
+
+	it('a later duplicate name wins', () => {
+		expect(parseCookies('a=1; a=2')).toEqual({ a: '2' })
+	})
+
+	// SECURITY (the __Host- / __Secure- prefix-integrity fix): a cookie NAME is NOT trimmed into
+	// compliance — a name carrying leading / trailing (or any) whitespace, or any char outside the
+	// RFC 6265 cookie-token set, is REJECTED rather than reconciled, so a `'  __Host-x'` cannot
+	// silently become the prefix-protected `__Host-x`.
+	it('does NOT trim a leading-whitespace name into a __Host- / __Secure- prefix', () => {
+		// The attacker plants `  __Host-session=evil` hoping the trim makes it the protected name. The
+		// key is NOT `__Host-session` (the whitespace name is dropped); a browser would reject this
+		// `__Host-`-prefixed cookie outright, and our parser must not undo that by trimming.
+		const hostAttack = parseCookies('  __Host-session=evil')
+		expect(hostAttack['__Host-session']).toBeUndefined()
+		expect(Object.keys(hostAttack)).not.toContain('__Host-session')
+
+		const secureAttack = parseCookies(' __Host-x=evil')
+		expect(secureAttack['__Host-x']).toBeUndefined()
+		expect(Object.keys(secureAttack)).not.toContain('__Host-x')
+	})
+
+	it('rejects a name with interior or trailing whitespace, or a non-token char', () => {
+		// Trailing whitespace, interior whitespace, and a separator char are all outside the cookie
+		// token set — each pair is skipped (not reconciled), keeping a clean cookie alongside it intact.
+		expect(parseCookies('bad name=1; ok=2')).toEqual({ ok: '2' }) // interior space → name rejected
+		expect(parseCookies('trailing\t=1; ok=2')).toEqual({ ok: '2' }) // trailing tab → rejected
+		expect(parseCookies('a(b=1; ok=2')).toEqual({ ok: '2' }) // `(` is a separator → rejected
+	})
+
+	it('rejects a name padded with a Unicode (non-ASCII) space — the prefix cannot be smuggled', () => {
+		// U+00A0 (no-break space) is NOT in the cookie token set and IS matched by the name guard's
+		// rejection — so a Unicode-space-padded `__Host-` name is dropped, not trimmed into the prefix.
+		const nbsp = ' '
+		const attack = parseCookies(`${nbsp}__Host-id=evil`)
+		expect(attack['__Host-id']).toBeUndefined()
+	})
+
+	it('still accepts a clean prefix-named cookie (the guard does not over-reject)', () => {
+		// A correctly-formed `__Host-` cookie (no surrounding whitespace) parses normally — the fix
+		// rejects only WHITESPACE-padded / malformed names, never a legitimate prefixed one.
+		expect(parseCookies('__Host-session=good; __Secure-id=ok')).toEqual({
+			'__Host-session': 'good',
+			'__Secure-id': 'ok',
+		})
+	})
+})
+
+describe('isCookieName — RFC 6265 cookie-token guard', () => {
+	it('accepts a clean token (including the __Host- / __Secure- prefixes)', () => {
+		expect(isCookieName('session')).toBe(true)
+		expect(isCookieName('__Host-session')).toBe(true)
+		expect(isCookieName('__Secure-id')).toBe(true)
+		expect(isCookieName("a!#$%&'*+-.^_`|~9Z")).toBe(true)
+	})
+
+	it('rejects an empty name, surrounding / interior whitespace, and separators', () => {
+		expect(isCookieName('')).toBe(false)
+		expect(isCookieName(' x')).toBe(false)
+		expect(isCookieName('x ')).toBe(false)
+		expect(isCookieName('a b')).toBe(false)
+		expect(isCookieName(' x')).toBe(false) // a Unicode space is not a token char
+		expect(isCookieName('a;b')).toBe(false)
+		expect(isCookieName('a=b')).toBe(false)
+		expect(isCookieName('a,b')).toBe(false)
+	})
+})
+
+describe('decodeCookieValue — total percent-decode', () => {
+	it('decodes valid percent-encoding', () => {
+		expect(decodeCookieValue('a%2Bb')).toBe('a+b')
+	})
+
+	it('falls back to the raw value on a malformed escape (never throws)', () => {
+		// A lone `%` is invalid percent-encoding; the helper returns it verbatim rather than throwing
+		// (keeps parseCookies total on untrusted input, §14).
+		expect(decodeCookieValue('100%')).toBe('100%')
+	})
+})
+
+describe('serializeCookie — name/value + attributes → Set-Cookie value', () => {
+	it('defaults to Path=/, HttpOnly, SameSite=Lax (no Secure, no Max-Age)', () => {
+		expect(serializeCookie('session', 'abc')).toBe('session=abc; Path=/; HttpOnly; SameSite=Lax')
+	})
+
+	it('URL-encodes the value', () => {
+		expect(serializeCookie('x', 'a b/c')).toBe('x=a%20b%2Fc; Path=/; HttpOnly; SameSite=Lax')
+	})
+
+	it('emits the present attributes in canonical order (Domain, Path, Max-Age, HttpOnly, Secure, SameSite)', () => {
+		expect(
+			serializeCookie('s', 'v', {
+				domain: 'example.test',
+				path: '/app',
+				maxAge: 3600,
+				secure: true,
+				sameSite: 'Strict',
+			}),
+		).toBe('s=v; Domain=example.test; Path=/app; Max-Age=3600; HttpOnly; Secure; SameSite=Strict')
+	})
+
+	it('omits HttpOnly only with an explicit httpOnly:false (the CSRF-cookie shape)', () => {
+		expect(serializeCookie('csrf', 't', { httpOnly: false, sameSite: 'Strict' })).toBe(
+			'csrf=t; Path=/; SameSite=Strict',
+		)
+	})
+
+	it('emits Max-Age=0 (the immediate-expiry clear form), distinct from an omitted Max-Age', () => {
+		expect(serializeCookie('s', '', { maxAge: 0 })).toBe(
+			's=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax',
+		)
+	})
+
+	// SECURITY (attribute-injection fix): the `Domain` / `Path` values are validated, not interpolated
+	// raw — a value carrying `;` / `,` / whitespace / a control char could inject another `Set-Cookie`
+	// attribute or split the header, so it THROWS a clear error (a programmer misconfiguration, §12).
+	it('rejects a Domain carrying an injected attribute (`; Secure`)', () => {
+		expect(() => serializeCookie('s', 'v', { domain: 'evil.test; Secure' })).toThrow(/Domain/)
+	})
+
+	it('rejects a Path carrying a header-splitting / control sequence', () => {
+		expect(() => serializeCookie('s', 'v', { path: '/a\r\nSet-Cookie: x=y' })).toThrow(/Path/)
+		expect(() => serializeCookie('s', 'v', { path: '/a b' })).toThrow(/Path/) // a space is illegal
+	})
+
+	it('accepts a clean Domain / Path (the guard does not over-reject normal values)', () => {
+		expect(serializeCookie('s', 'v', { domain: 'sub.example.test', path: '/app/v2' })).toBe(
+			's=v; Domain=sub.example.test; Path=/app/v2; HttpOnly; SameSite=Lax',
+		)
+	})
+
+	// SECURITY (SameSite=None requires Secure): a `None` cookie is rejected by browsers unless it is
+	// `Secure`, so serializeCookie FORCES `Secure` on a `None` cookie even when `secure` is unset / false.
+	it('forces Secure when sameSite is None (even with secure unset or false)', () => {
+		expect(serializeCookie('s', 'v', { sameSite: 'None' })).toBe(
+			's=v; Path=/; HttpOnly; Secure; SameSite=None',
+		)
+		// An explicit `secure: false` cannot defeat the spec requirement — `None` is still `Secure`.
+		expect(serializeCookie('s', 'v', { sameSite: 'None', secure: false })).toContain('Secure')
+	})
+
+	it("treats a stray un-resolved 'auto' as OFF (the bare builder has no request to read TLS from)", () => {
+		// `'auto'` is resolved by the request-aware writers before serializeCookie; if one reaches the
+		// pure builder it falls to OFF (the safe-for-dev default), never emitting Secure on its own.
+		expect(serializeCookie('s', 'v', { secure: 'auto' })).toBe(
+			's=v; Path=/; HttpOnly; SameSite=Lax',
+		)
+	})
+})
+
+describe('resolveSecure / requestEncrypted — the auto-secure resolution', () => {
+	it('resolveSecure honors an explicit boolean and resolves auto from the TLS flag', () => {
+		expect(resolveSecure(true, false)).toBe(true) // explicit true → always Secure
+		expect(resolveSecure(false, true)).toBe(false) // explicit false → never Secure
+		expect(resolveSecure('auto', true)).toBe(true) // auto over TLS → Secure
+		expect(resolveSecure('auto', false)).toBe(false) // auto over plaintext → off
+		expect(resolveSecure(undefined, true)).toBe(true) // omitted == auto
+		expect(resolveSecure(undefined, false)).toBe(false)
+	})
+
+	it('requestEncrypted narrows request.socket.encrypted (TLSSocket) — true only for encrypted === true', () => {
+		// A `node:tls` TLSSocket carries `encrypted: true`; a plain `node:net` socket has no such field.
+		expect(requestEncrypted(createRequestStub({ socket: { encrypted: true } }))).toBe(true)
+		expect(requestEncrypted(createRequestStub({ socket: { encrypted: false } }))).toBe(false)
+		expect(requestEncrypted(createRequestStub())).toBe(false) // no encrypted field → plaintext
+	})
+})
+
+describe('readSignedCookie + signToken — HMAC cookie sign ↔ verify + tamper rejection', () => {
+	const SECRET = 'cookie-secret'
+
+	// Drive readSignedCookie with a request stub whose `Cookie` header carries a `name=<signToken>`
+	// cookie (the exact wire serializeCookie/writeSignedCookie produce) — no server needed (§14/§16).
+	function requestWithCookie(cookie: string): ReturnType<typeof createRequestStub> {
+		return createRequestStub({ headers: { cookie } })
+	}
+
+	it('round-trips: a signed cookie value verifies back to the embedded value', () => {
+		const wire = signToken('session-7', { secret: SECRET })
+		const request = requestWithCookie(`sid=${wire}`)
+		expect(readSignedCookie(request, 'sid', SECRET)).toBe('session-7')
+	})
+
+	it('rejects a TAMPERED cookie value (flip the last char) → undefined', () => {
+		const wire = signToken('session-7', { secret: SECRET })
+		const tampered = `${wire.slice(0, -1)}${wire.endsWith('a') ? 'b' : 'a'}`
+		const request = requestWithCookie(`sid=${tampered}`)
+		expect(readSignedCookie(request, 'sid', SECRET)).toBeUndefined()
+	})
+
+	it('rejects a cookie signed with a DIFFERENT secret, and an ABSENT cookie → undefined', () => {
+		const wire = signToken('session-7', { secret: 'other-secret' })
+		expect(readSignedCookie(requestWithCookie(`sid=${wire}`), 'sid', SECRET)).toBeUndefined()
+		// No `sid` cookie present at all (only an unrelated one) → undefined.
+		expect(readSignedCookie(requestWithCookie('unrelated=1'), 'sid', SECRET)).toBeUndefined()
+	})
+
+	it('accepts a cookie signed by any secret in a rotation list (rotation)', () => {
+		// Signed with the OLD secret, verified under `[new, old]` — the rotation path (mirrors verifyToken).
+		const wire = signToken('session-7', { secret: 'old-secret' })
+		const request = requestWithCookie(`sid=${wire}`)
+		expect(readSignedCookie(request, 'sid', ['new-secret', 'old-secret'])).toBe('session-7')
+		expect(readSignedCookie(request, 'sid', ['new-secret'])).toBeUndefined()
+	})
+})
+
+describe('headerSessionTransport / cookieSessionTransport — the id transport seam', () => {
+	it('headerSessionTransport reads a single header value, narrowing an array / absent to undefined', () => {
+		const transport = headerSessionTransport('session-id')
+		// A single string is the id; a repeated header (string[]) is ambiguous → undefined (§14).
+		expect(
+			transport.read(
+				createContextStub({ request: createRequestStub({ headers: { 'session-id': 'abc' } }) }),
+			),
+		).toBe('abc')
+		expect(
+			transport.read(
+				createContextStub({
+					request: createRequestStub({ headers: { 'session-id': ['a', 'b'] } }),
+				}),
+			),
+		).toBeUndefined()
+		expect(transport.read(createContextStub())).toBeUndefined()
+	})
+
+	it('cookieSessionTransport reads a signed id cookie, rejecting a tampered one', () => {
+		const SECRET = 'tport-secret'
+		const transport = cookieSessionTransport('sid', SECRET, {})
+		const wire = signToken('id-42', { secret: SECRET })
+		expect(
+			transport.read(
+				createContextStub({ request: createRequestStub({ headers: { cookie: `sid=${wire}` } }) }),
+			),
+		).toBe('id-42')
+		const tampered = `${wire.slice(0, -1)}${wire.endsWith('a') ? 'b' : 'a'}`
+		expect(
+			transport.read(
+				createContextStub({
+					request: createRequestStub({ headers: { cookie: `sid=${tampered}` } }),
+				}),
+			),
+		).toBeUndefined()
+	})
+})
+
+describe('transferSessionData — copy the data bag on id rotation', () => {
+	it('copies every data entry from one Session to another (the regenerate state carry-over)', () => {
+		const from = new Session('old')
+		from.data.set('user', 'ada')
+		from.data.set('hits', 3)
+		const to = new Session('new')
+		transferSessionData(from, to)
+		expect(to.data.get('user')).toBe('ada')
+		expect(to.data.get('hits')).toBe(3)
+		// It is a COPY — the destination is independent of the source after the transfer.
+		from.data.set('extra', 1)
+		expect(to.data.has('extra')).toBe(false)
+	})
+
+	it("is a no-op for a non-Session shape (the id still rotates; custom state is the consumer's)", () => {
+		// Two plain SessionInterface records (NOT default Session instances) — neither is `instanceof
+		// Session`, so the copy is skipped and the call simply does nothing (never throws).
+		const from = { id: 'old', role: 'admin' }
+		const to = { id: 'new' }
+		expect(() => transferSessionData(from, to)).not.toThrow()
+		expect(to).toEqual({ id: 'new' }) // untouched — no `role` copied across
+	})
+})
+
+describe('isSessionControl — the control-handle boundary guard', () => {
+	it('accepts a record with regenerate + destroy functions, rejects anything else', () => {
+		expect(isSessionControl({ regenerate: () => {}, destroy: () => {} })).toBe(true)
+		expect(isSessionControl({ regenerate: () => {} })).toBe(false)
+		expect(isSessionControl({ regenerate: 1, destroy: 2 })).toBe(false)
+		expect(isSessionControl(undefined)).toBe(false)
+		expect(isSessionControl('control')).toBe(false)
+	})
+})
+
+// resolveOrigin / extractToken / resolveClientKey — the middleware-factory glue helpers
+// (now exported from helpers.ts per AGENTS §5: a factory's private glue step is an
+// exported helper, even a one-off). All three are pure decisions over plain values, so
+// they're exercised directly here; the factories that compose them (createCors /
+// createTokenGuard / createRateLimiter) are still proven over a real server in
+// factories.test.ts. resolveClientKey takes a RouteHandlerContextInterface — only its
+// `state` (the TOKEN_STATE lookup) and `request.socket.remoteAddress` are read, so a
+// minimal structural stub crossing the boundary with a guard (no `as`, §14) drives it.
+describe('resolveOrigin — the CORS allow-origin value', () => {
+	it('passes a single configured origin straight through', () => {
+		expect(resolveOrigin('https://app.test', 'https://other.test')).toBe('https://app.test')
+		// The request origin is irrelevant for a single fixed origin — it is returned regardless.
+		expect(resolveOrigin('https://app.test', undefined)).toBe('https://app.test')
+	})
+
+	it('passes the wildcard `*` straight through', () => {
+		expect(resolveOrigin('*', 'https://anything.test')).toBe('*')
+		expect(resolveOrigin('*', undefined)).toBe('*')
+	})
+
+	it('echoes a request origin present in the allow-list', () => {
+		const allow = ['https://a.test', 'https://b.test']
+		expect(resolveOrigin(allow, 'https://b.test')).toBe('https://b.test')
+	})
+
+	it('returns undefined (no header) for an allow-list miss / absent / array origin', () => {
+		const allow = ['https://a.test', 'https://b.test']
+		expect(resolveOrigin(allow, 'https://evil.test')).toBeUndefined() // not in the list
+		expect(resolveOrigin(allow, undefined)).toBeUndefined() // no Origin header
+		// A repeated Origin header arrives as an array — only a single string is considered.
+		expect(resolveOrigin(allow, ['https://a.test', 'https://b.test'])).toBeUndefined()
+	})
+})
+
+describe('extractToken — the bare bearer from a raw header', () => {
+	it('strips the scheme prefix and returns the trimmed remainder', () => {
+		expect(extractToken('Bearer abc', 'Bearer')).toBe('abc')
+		// The scheme match is case-insensitive; the remainder is trimmed.
+		expect(extractToken('bearer   abc  ', 'Bearer')).toBe('abc')
+	})
+
+	it('returns undefined for a wrong / absent scheme prefix', () => {
+		expect(extractToken('Basic abc', 'Bearer')).toBeUndefined()
+		// The scheme requires a trailing space — a bare scheme with no token is no token.
+		expect(extractToken('Bearer', 'Bearer')).toBeUndefined()
+	})
+
+	it('returns undefined for a missing / blank header', () => {
+		expect(extractToken(undefined, 'Bearer')).toBeUndefined()
+		// A `Bearer ` with only whitespace after it trims to empty → undefined.
+		expect(extractToken('Bearer    ', 'Bearer')).toBeUndefined()
+	})
+
+	it('treats the whole (trimmed) value as the token under an empty scheme', () => {
+		expect(extractToken('  raw-token  ', '')).toBe('raw-token')
+		// An empty / whitespace-only header under an empty scheme is still no token.
+		expect(extractToken('   ', '')).toBeUndefined()
+		expect(extractToken(undefined, '')).toBeUndefined()
+	})
+})
+
+// A context for resolveClientKey — only its `state` Map (the TOKEN_STATE lookup) and
+// `request.socket.remoteAddress` are read. Built from the shared `createContextStub`
+// (its `request` carries the peer socket), so the one full default shape and its guard
+// live in the setup, not here.
+function contextStub(fields: {
+	token?: unknown
+	remoteAddress?: string
+}): ReturnType<typeof createContextStub> {
+	const state = new Map<string, unknown>()
+	if (fields.token !== undefined) state.set(TOKEN_STATE, fields.token)
+	return createContextStub({
+		state,
+		request: createRequestStub({ socket: { remoteAddress: fields.remoteAddress } }),
+	})
+}
+
+describe('resolveClientKey — the default rate-limit client key', () => {
+	it('keys by the verified token when one is present on state', () => {
+		// An upstream token guard stashed the verified value under TOKEN_STATE → token-derived key.
+		expect(resolveClientKey(contextStub({ token: 'alice' }))).toBe('token:alice')
+	})
+
+	it('falls back to the socket peer IP when no token is present', () => {
+		expect(resolveClientKey(contextStub({ remoteAddress: '10.0.0.7' }))).toBe('ip:10.0.0.7')
+	})
+
+	it('falls back to ip:unknown when neither a token nor a peer address is present', () => {
+		expect(resolveClientKey(contextStub({}))).toBe('ip:unknown')
+	})
+
+	it('prefers the token over the IP when both are present', () => {
+		// A non-string token (a hostile/odd state value) is NOT a token — it falls through to the IP.
+		expect(resolveClientKey(contextStub({ token: 'bob', remoteAddress: '10.0.0.7' }))).toBe(
+			'token:bob',
+		)
+		expect(resolveClientKey(contextStub({ token: 42, remoteAddress: '10.0.0.7' }))).toBe(
+			'ip:10.0.0.7',
+		)
+	})
+})
+
+// The senders + body collection, proven over a real exchange (the context wraps them).
+describe('response senders + collectBody — over a real server', () => {
+	const { track } = createTeardown((handle: StartedServerInterface) => handle.stop())
+
+	it('sendJSON / sendText / sendEmpty / sendError write the right status + body', async () => {
+		const server = createServer()
+		server.route([
+			{ method: 'GET', path: '/json', handler: (c) => c.json({ ok: true }, 201) },
+			{ method: 'GET', path: '/text', handler: (c) => c.text('hello', 202) },
+			{ method: 'GET', path: '/empty', handler: (c) => c.empty(204) },
+			{ method: 'GET', path: '/error', handler: (c) => c.error(400, 'bad input') },
+		])
+		const handle = track(await startServer(server))
+
+		const json = await fetch(`${handle.base}/json`)
+		expect(json.status).toBe(201)
+		expect(json.headers.get('content-type')).toContain('application/json')
+		expect(await json.json()).toEqual({ ok: true })
+
+		const text = await fetch(`${handle.base}/text`)
+		expect(text.status).toBe(202)
+		expect(text.headers.get('content-type')).toContain('text/plain')
+		expect(await text.text()).toBe('hello')
+
+		const empty = await fetch(`${handle.base}/empty`)
+		expect(empty.status).toBe(204)
+		expect(await empty.text()).toBe('')
+
+		const error = await fetch(`${handle.base}/error`)
+		expect(error.status).toBe(400)
+		expect(await error.json()).toEqual({ error: 'bad input' })
+	})
+
+	it('collectBody reads the full body, and the context caches it across reads', async () => {
+		const server = createServer()
+		server.route({
+			method: 'POST',
+			path: '/twice',
+			handler: async (c) => {
+				const first = await c.body()
+				const second = await c.body()
+				// Same cached value object — proves a single collection path, no double-read.
+				c.json({ same: first === second, value: first })
+			},
+		})
+		const handle = track(await startServer(server))
+
+		const response = await fetch(`${handle.base}/twice`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ n: 5 }),
+		})
+		expect(await response.json()).toEqual({ same: true, value: { n: 5 } })
+	})
+})
+
+// The GENERIC SSE seam (openSSEStream + bindStreamingAbort) over a REAL node:http
+// server (no mocks, the node src:server project). Each test stands a server on an
+// ephemeral port, drives it with real fetch, decodes the response body with the core
+// SSEParser (collectSSE / readSSEStream), and stops + destroys it in afterEach so no
+// socket leaks. The decode-with-SSEParser is the proof the wire round-trips: every
+// assertion is on the events the parser dispatched from the bytes the seam serialized —
+// the encode ↔ decode inverse. Covers: SSE headers, single + multiline data,
+// event/id/retry fields, comment keep-alives, write-after-end no-op, ordering, the
+// disconnect→once-only-abort binding + leak-free cleanup, and the graceful-drain
+// interaction (an open stream + server.stop() resolves, never hangs).
+
+const { track } = createTeardown((handle: StartedServerInterface) => handle.stop())
+
+// A server whose single GET /sse route runs `drive` against a fresh SSE stream — the
+// shared scaffold for the deterministic seam tests. `drive` writes events then ends.
+function sseServer(drive: (sse: ReturnType<typeof openSSEStream>) => void): ServerInterface {
+	const server = createServer()
+	server.route({
+		method: 'GET',
+		path: '/sse',
+		handler: (context) => {
+			drive(openSSEStream(context))
+		},
+	})
+	return server
+}
+
+describe('openSSEStream — headers + round-trip', () => {
+	it('sets the SSE response headers', async () => {
+		const handle = track(await startServer(sseServer((sse) => sse.end())))
+		const response = await fetch(`${handle.base}/sse`)
+		expect(response.headers.get('content-type')).toBe('text/event-stream; charset=utf-8')
+		expect(response.headers.get('cache-control')).toBe('no-cache')
+		await response.text()
+	})
+
+	it('round-trips a single-line data event through the SSEParser', async () => {
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					sse.write({ data: 'hello' })
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		expect(events).toEqual([{ data: 'hello' }])
+	})
+
+	it('round-trips multi-line data (the \\n → multiple data: lines split + concat)', async () => {
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					sse.write({ data: 'a\nb\nc' })
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		// The seam split 'a\nb\nc' into three data: lines; the parser concatenated them
+		// back with \n — proving the encode + decode are exact inverses.
+		expect(events).toEqual([{ data: 'a\nb\nc' }])
+	})
+
+	it('round-trips the event / id / retry fields', async () => {
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					sse.write({ event: 'token', id: '42', retry: 1500, data: 'hi' })
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		expect(events).toEqual([{ event: 'token', id: '42', retry: 1500, data: 'hi' }])
+	})
+
+	it('streams multiple events in order', async () => {
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					sse.write({ event: 'token', data: 'one' })
+					sse.write({ event: 'token', data: 'two' })
+					sse.write({ event: 'token', data: 'three' })
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		expect(events.map((event) => event.data)).toEqual(['one', 'two', 'three'])
+		expect(events.every((event) => event.event === 'token')).toBe(true)
+	})
+
+	it('a comment keep-alive produces no spurious event', async () => {
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					sse.comment('keep-alive')
+					sse.comment('ping')
+					sse.write({ data: 'real' })
+					sse.comment('after')
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		// Only the real event survives — the SSEParser ignores comment lines.
+		expect(events).toEqual([{ data: 'real' }])
+	})
+})
+
+describe('openSSEStream — close semantics', () => {
+	it('write / comment after end() are no-ops (no throw) and closed is true', async () => {
+		// Capture the stream so the test can assert `closed` after the handler ends it.
+		let captured: ReturnType<typeof openSSEStream> | undefined
+		const handle = track(
+			await startServer(
+				sseServer((sse) => {
+					captured = sse
+					sse.write({ data: 'first' })
+					sse.end()
+					// These must be safe no-ops — no throw, nothing added to the wire.
+					sse.write({ data: 'after-end' })
+					sse.comment('after-end')
+					sse.end()
+				}),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		expect(events).toEqual([{ data: 'first' }])
+		expect(captured?.closed).toBe(true)
+	})
+})
+
+describe('bindStreamingAbort — disconnect → once-only abort', () => {
+	it('a client aborting the fetch fires onAbort exactly once, server-side', async () => {
+		const aborts = createRecorder<readonly [unknown]>()
+		const server = createServer()
+		server.route({
+			method: 'GET',
+			path: '/sse',
+			handler: async (context) => {
+				const sse = openSSEStream(context)
+				bindStreamingAbort(context, (reason) => aborts.handler(reason))
+				// Stream slowly and indefinitely until the client disconnects — never end
+				// server-side, so the ONLY thing that stops it is the client abort.
+				for (let n = 0; n < 200 && !sse.closed; n += 1) {
+					sse.write({ event: 'tick', data: String(n) })
+					await waitForDelay(15)
+				}
+			},
+		})
+		const handle = track(await startServer(server))
+		const controller = new AbortController()
+		const response = await fetch(`${handle.base}/sse`, { signal: controller.signal })
+
+		// Consume a couple of real events, then abort the client fetch mid-stream.
+		let seen = 0
+		try {
+			for await (const event of readSSEStream(response)) {
+				void event
+				seen += 1
+				if (seen >= 2) {
+					controller.abort()
+					break
+				}
+			}
+		} catch {
+			// The reader rejecting on abort is expected once we cancel — not a failure.
+		}
+		expect(seen).toBeGreaterThanOrEqual(2)
+
+		// Give the server a moment to observe the socket close and fire onAbort.
+		await waitForDelay(150)
+		// Fired — and exactly once (the request close + response close are coalesced).
+		expect(aborts.count).toBe(1)
+	})
+
+	it('the cleanup fn removes the listeners — a normal end never fires onAbort', async () => {
+		const aborts = createRecorder<readonly [unknown]>()
+		const handle = track(
+			await startServer(
+				(() => {
+					const server = createServer()
+					server.route({
+						method: 'GET',
+						path: '/sse',
+						handler: (context) => {
+							const sse = openSSEStream(context)
+							const cleanup = bindStreamingAbort(context, (reason) => aborts.handler(reason))
+							sse.write({ data: 'done' })
+							sse.end()
+							// The stream ended normally — detach the disconnect listeners so the
+							// response's own 'close' does NOT later fire onAbort (no leak).
+							cleanup()
+						},
+					})
+					return server
+				})(),
+			),
+		)
+		const events = await collectSSE(await fetch(`${handle.base}/sse`))
+		expect(events).toEqual([{ data: 'done' }])
+		// Let any (removed) close listeners have fired — they must not have.
+		await waitForDelay(100)
+		expect(aborts.count).toBe(0)
+	})
+})
+
+describe('graceful drain — an open SSE stream + server.stop() resolves', () => {
+	it('does not hang: stop fires, the bound abort ends the stream, drain completes', async () => {
+		const aborts = createRecorder<readonly [unknown]>()
+		const server = createServer({ drain: 2_000 })
+		server.route({
+			method: 'GET',
+			path: '/sse',
+			handler: async (context) => {
+				const sse = openSSEStream(context)
+				const cleanup = bindStreamingAbort(context, (reason) => aborts.handler(reason))
+				// The CLEAN drain path: observe the server's stop event and end the stream,
+				// so stop → end() → response finishes → request drains, with no force-close
+				// wait. (A consumer wires this; the seam stays agent-agnostic.) Disconnect
+				// also ends it via bindStreamingAbort.
+				const onStop = (): void => {
+					aborts.handler('stop')
+					sse.end()
+				}
+				server.emitter.on('stop', onStop)
+				// Stream indefinitely until the stream is closed (by the stop handler above
+				// or a client disconnect).
+				for (let n = 0; n < 500 && !sse.closed; n += 1) {
+					sse.write({ event: 'tick', data: String(n) })
+					await waitForDelay(15)
+				}
+				server.emitter.off('stop', onStop)
+				cleanup()
+			},
+		})
+		const handle = track(await startServer(server))
+		// Start consuming so the request is genuinely in flight on the server.
+		const response = await fetch(`${handle.base}/sse`)
+		const reader = readSSEStream(response)
+		await reader.next() // pull at least one event so the handler is mid-stream
+
+		// Stop with an open stream — this must RESOLVE (the stop event ends the stream,
+		// the request drains), well within the drain deadline, never hanging.
+		const before = Date.now()
+		await server.stop()
+		const elapsed = Date.now() - before
+		expect(server.status).toBe('stopped')
+		// Resolved promptly via the clean stop→end path — far under the 2s drain deadline
+		// (which would only matter if the stream had NOT self-terminated).
+		expect(elapsed).toBeLessThan(1_500)
+		// The stop handler observed the stop and ended the stream.
+		expect(aborts.calls.some((call) => call[0] === 'stop')).toBe(true)
+
+		// Drain the (now-ending) client stream so no reader is left dangling.
+		try {
+			for await (const event of reader) void event
+		} catch {
+			// The stream ending under us as the socket closes is expected.
+		}
+		// The handle's afterEach stop() is a no-op now (already stopped) — safe.
+	})
+})
+
+// The static-file helpers — the PURE pieces createStatic composes (AGENTS §5): the
+// SECURITY-CRITICAL traversal guard, the dotfile predicate, the MIME lookup, the Range
+// parser, and the weak-ETag computer. Exercised directly on plain values (no FS, no
+// server) — the over-the-wire serving is proven in middlewares.test.ts.
+
+describe('resolveStaticPath — the traversal guard', () => {
+	const root = resolve('/srv/app/public')
+
+	it('resolves a plain in-root path to its absolute path under root', () => {
+		expect(resolveStaticPath(root, '/app.js')).toBe(resolve(root, 'app.js'))
+		expect(resolveStaticPath(root, '/assets/main.css')).toBe(resolve(root, 'assets/main.css'))
+	})
+
+	it('maps the bare root path to the root directory', () => {
+		expect(resolveStaticPath(root, '/')).toBe(root)
+	})
+
+	it('decodes percent-escapes before resolving', () => {
+		expect(resolveStaticPath(root, '/a%20b.txt')).toBe(resolve(root, 'a b.txt'))
+	})
+
+	it('BLOCKS a literal ../ escape (returns undefined — never resolves outside root)', () => {
+		expect(resolveStaticPath(root, '/../secret.txt')).toBeUndefined()
+		expect(resolveStaticPath(root, '/../../etc/passwd')).toBeUndefined()
+		expect(resolveStaticPath(root, '/assets/../../secret')).toBeUndefined()
+	})
+
+	it('BLOCKS an ENCODED ..%2f escape (the decode happens before normalization)', () => {
+		expect(resolveStaticPath(root, '/%2e%2e/secret')).toBeUndefined()
+		expect(resolveStaticPath(root, '/..%2fsecret')).toBeUndefined()
+		expect(resolveStaticPath(root, '/%2e%2e%2f%2e%2e%2fetc%2fpasswd')).toBeUndefined()
+	})
+
+	it('BLOCKS a NUL-byte poison path', () => {
+		expect(resolveStaticPath(root, '/app.js%00.png')).toBeUndefined()
+	})
+
+	it('rejects a malformed percent-escape rather than throwing (TOTAL)', () => {
+		expect(resolveStaticPath(root, '/%')).toBeUndefined()
+		expect(resolveStaticPath(root, '/%zz')).toBeUndefined()
+	})
+
+	it('does not treat a sibling dir that shares the root prefix as in-root', () => {
+		// `/srv/app/public-secret` starts with the root STRING but is NOT under `root + sep`.
+		const sibling = resolve('/srv/app/public-secret/data')
+		expect(resolveStaticPath(root, '/data')).not.toBe(sibling)
+		expect(resolveStaticPath(root, '/data')).toBe(resolve(root, 'data'))
+	})
+
+	describe('with a prefix', () => {
+		it('strips the prefix and resolves the remainder under root', () => {
+			expect(resolveStaticPath(root, '/assets/app.js', '/assets')).toBe(resolve(root, 'app.js'))
+			expect(resolveStaticPath(root, '/assets', '/assets')).toBe(root)
+		})
+
+		it('falls through (undefined) for a path not under the prefix', () => {
+			expect(resolveStaticPath(root, '/other/app.js', '/assets')).toBeUndefined()
+			// A path that only shares the prefix as a string but is not a path segment boundary.
+			expect(resolveStaticPath(root, '/assetsX/app.js', '/assets')).toBeUndefined()
+		})
+
+		it('still blocks a traversal that climbs out after the prefix', () => {
+			expect(resolveStaticPath(root, '/assets/../../secret', '/assets')).toBeUndefined()
+		})
+	})
+})
+
+describe('isDotfilePath — the dotfile predicate', () => {
+	it('is true when any segment starts with a dot', () => {
+		expect(isDotfilePath('.env')).toBe(true)
+		expect(isDotfilePath('.git/config')).toBe(true)
+		expect(isDotfilePath(`assets${sep}.secret`)).toBe(true)
+		expect(isDotfilePath(`a${sep}.b${sep}c`)).toBe(true)
+	})
+
+	it('is false for ordinary paths (including a dot inside a segment)', () => {
+		expect(isDotfilePath('app.js')).toBe(false)
+		expect(isDotfilePath('assets/main.css')).toBe(false)
+		expect(isDotfilePath('v1.2/app.js')).toBe(false)
+	})
+})
+
+describe('lookupContentType — extension → MIME', () => {
+	it('maps known extensions (case-insensitively) to their type + charset', () => {
+		expect(lookupContentType('/x/index.html')).toBe('text/html; charset=utf-8')
+		expect(lookupContentType('main.CSS')).toBe('text/css; charset=utf-8')
+		expect(lookupContentType('app.js')).toBe('text/javascript; charset=utf-8')
+		expect(lookupContentType('data.json')).toBe('application/json; charset=utf-8')
+		expect(lookupContentType('logo.png')).toBe('image/png')
+		expect(lookupContentType('font.woff2')).toBe('font/woff2')
+	})
+
+	it('falls back to application/octet-stream for an unknown / absent extension', () => {
+		expect(lookupContentType('archive.bin')).toBe('application/octet-stream')
+		expect(lookupContentType('LICENSE')).toBe('application/octet-stream')
+	})
+})
+
+describe('parseRange — the Range header parser (TOTAL)', () => {
+	it('returns undefined for an absent / non-bytes / multi-range header (serve the whole file)', () => {
+		expect(parseRange(undefined, 100)).toBeUndefined()
+		expect(parseRange('items=0-10', 100)).toBeUndefined()
+		expect(parseRange('bytes=0-10, 20-30', 100)).toBeUndefined()
+	})
+
+	it('parses a closed range and clamps the end into the resource', () => {
+		expect(parseRange('bytes=0-9', 100)).toEqual({ satisfiable: true, start: 0, end: 9 })
+		expect(parseRange('bytes=10-19', 100)).toEqual({ satisfiable: true, start: 10, end: 19 })
+		// End past the last byte clamps to size - 1.
+		expect(parseRange('bytes=90-200', 100)).toEqual({ satisfiable: true, start: 90, end: 99 })
+	})
+
+	it('parses an open range (start-) to the end of the resource', () => {
+		expect(parseRange('bytes=50-', 100)).toEqual({ satisfiable: true, start: 50, end: 99 })
+	})
+
+	it('parses a suffix range (-N) as the last N bytes', () => {
+		expect(parseRange('bytes=-20', 100)).toEqual({ satisfiable: true, start: 80, end: 99 })
+		// A suffix larger than the resource clamps the start to 0.
+		expect(parseRange('bytes=-200', 100)).toEqual({ satisfiable: true, start: 0, end: 99 })
+	})
+
+	it('reports an unsatisfiable range (a start at or past the size) → satisfiable:false', () => {
+		expect(parseRange('bytes=100-110', 100)).toEqual({ satisfiable: false })
+		expect(parseRange('bytes=200-', 100)).toEqual({ satisfiable: false })
+		// Any concrete range over a zero-length resource is unsatisfiable.
+		expect(parseRange('bytes=0-0', 0)).toEqual({ satisfiable: false })
+		expect(parseRange('bytes=-5', 0)).toEqual({ satisfiable: false })
+	})
+
+	it('returns undefined for a malformed range rather than throwing', () => {
+		expect(parseRange('bytes=', 100)).toBeUndefined()
+		expect(parseRange('bytes=abc-def', 100)).toBeUndefined()
+		expect(parseRange('bytes=10-5', 100)).toBeUndefined() // end before start
+		expect(parseRange('bytes=-0', 100)).toBeUndefined() // a zero suffix is meaningless
+	})
+
+	it('bytes=0-0 on a non-empty resource is the single FIRST byte {start:0, end:0}', () => {
+		// The smallest closed range — the first byte alone. End clamps to min(0, size-1) = 0.
+		expect(parseRange('bytes=0-0', 100)).toEqual({ satisfiable: true, start: 0, end: 0 })
+	})
+
+	it('bytes=5-2 (end < start) is malformed → undefined', () => {
+		// A closed range whose end precedes its start is malformed (distinct from an unsatisfiable
+		// past-the-end range) — served as the whole resource, never a reversed window.
+		expect(parseRange('bytes=5-2', 100)).toBeUndefined()
+	})
+
+	it('an open bytes=0- against a ZERO-length resource is unsatisfiable', () => {
+		// `start (0) >= size (0)` → unsatisfiable (a 416), not a {0, -1} window. A zero-length resource
+		// has no byte to open-range from.
+		expect(parseRange('bytes=0-', 0)).toEqual({ satisfiable: false })
+	})
+})
+
+describe('computeWeakETag — the weak validator', () => {
+	it('builds a W/"<size>-<mtimeMs>" tag, flooring the mtime', () => {
+		expect(computeWeakETag(1024, 1_700_000_000_000)).toBe('W/"1024-1700000000000"')
+		expect(computeWeakETag(0, 1_700_000_000_123.9)).toBe('W/"0-1700000000123"')
+	})
+
+	it('changes when either the size or the mtime changes', () => {
+		const base = computeWeakETag(100, 1000)
+		expect(computeWeakETag(101, 1000)).not.toBe(base)
+		expect(computeWeakETag(100, 1001)).not.toBe(base)
+	})
+})
+
+describe('computeBodyETag — the content validator (S-e)', () => {
+	const body = Buffer.from('the dynamic response body')
+	// The expected digest, computed with node:crypto directly (cross-check, not a re-implementation).
+	const sha = createHash('sha256').update(body).digest('hex')
+
+	it('wraps a weak validator as W/"<hash>" and a strong one as "<hash>"', () => {
+		expect(computeBodyETag(body, 'sha256', true)).toBe(`W/"${sha}"`)
+		expect(computeBodyETag(body, 'sha256', false)).toBe(`"${sha}"`)
+	})
+
+	it('is content-derived — identical bytes hash identically, different bytes differ', () => {
+		const same = computeBodyETag(Buffer.from('payload'), 'sha256', true)
+		expect(computeBodyETag(Buffer.from('payload'), 'sha256', true)).toBe(same)
+		expect(computeBodyETag(Buffer.from('payloads'), 'sha256', true)).not.toBe(same)
+	})
+
+	it('honors the algorithm (a sha1 tag differs from a sha256 tag)', () => {
+		const sha1 = createHash('sha1').update(body).digest('hex')
+		expect(computeBodyETag(body, 'sha1', true)).toBe(`W/"${sha1}"`)
+		expect(computeBodyETag(body, 'sha1', true)).not.toBe(computeBodyETag(body, 'sha256', true))
+	})
+
+	it('hashes an empty body to a constant (the empty-digest)', () => {
+		const empty = createHash('sha256').update(Buffer.alloc(0)).digest('hex')
+		expect(computeBodyETag(Buffer.alloc(0), 'sha256', true)).toBe(`W/"${empty}"`)
+	})
+})
+
+describe('resolveSecurityHeader — the opt-out value resolver (S-e)', () => {
+	it('returns the default when the option is unset', () => {
+		expect(resolveSecurityHeader(undefined, "default-src 'self'")).toBe("default-src 'self'")
+	})
+
+	it('returns an explicit string override verbatim', () => {
+		expect(resolveSecurityHeader("default-src 'none'", "default-src 'self'")).toBe(
+			"default-src 'none'",
+		)
+	})
+
+	it('returns undefined (omit the header) for false', () => {
+		expect(resolveSecurityHeader(false, "default-src 'self'")).toBeUndefined()
+	})
+
+	it('treats an explicit empty string as a real override (not the default)', () => {
+		// `''` is a deliberate value, distinct from `false` (omit) and `undefined` (default).
+		expect(resolveSecurityHeader('', 'fallback')).toBe('')
+	})
+})
+
+// ── The content-negotiation + compression helpers (S-c) ──────────────────────
+//
+// The ONE shared q-value parser + the coding negotiation + the compressible predicate + the
+// `node:zlib` round-trip — exercised directly on plain values (AGENTS §16). The compress/decompress
+// helpers are cross-checked against `node:zlib`'s own `gzipSync` / `gunzipSync` / `brotliDecompressSync`
+// so the wire is proven (not a self-referential round-trip alone).
+
+describe('parseAcceptHeader — the shared q-value parser', () => {
+	it('parses values + q-weights and sorts by q descending', () => {
+		expect(parseAcceptHeader('text/html, application/json;q=0.9, text/plain;q=0.1')).toEqual([
+			{ value: 'text/html', q: 1 },
+			{ value: 'application/json', q: 0.9 },
+			{ value: 'text/plain', q: 0.1 },
+		])
+	})
+
+	it('lower-cases values, defaults a missing q to 1, and clamps to [0, 1]', () => {
+		expect(parseAcceptHeader('GZIP, BR;q=2.0, deflate;q=-1')).toEqual([
+			{ value: 'gzip', q: 1 },
+			{ value: 'br', q: 1 },
+			{ value: 'deflate', q: 0 },
+		])
+	})
+
+	it('keeps a ;q=0 entry (an explicit rejection) rather than dropping it', () => {
+		const entries = parseAcceptHeader('gzip;q=0, br')
+		expect(entries).toContainEqual({ value: 'gzip', q: 0 })
+		expect(entries[0]).toEqual({ value: 'br', q: 1 })
+	})
+
+	it('is a STABLE sort — equal-q entries keep their header order', () => {
+		// br + gzip both at q=1 → br stays first (the server preference a caller relies on for ties).
+		expect(parseAcceptHeader('br, gzip, deflate').map((entry) => entry.value)).toEqual([
+			'br',
+			'gzip',
+			'deflate',
+		])
+	})
+
+	it('is total on an empty / whitespace header', () => {
+		expect(parseAcceptHeader('')).toEqual([])
+		expect(parseAcceptHeader('  ,  ')).toEqual([])
+	})
+})
+
+describe('negotiateEncoding — coding selection from Accept-Encoding', () => {
+	const offered = ['br', 'gzip', 'deflate'] as const
+
+	it('picks the highest-q offered coding', () => {
+		expect(negotiateEncoding('gzip;q=0.5, br;q=1.0', offered)).toBe('br')
+	})
+
+	it('honors the server order on a tie', () => {
+		expect(negotiateEncoding('gzip, br', offered)).toBe('br')
+	})
+
+	it('honors a bare * wildcard (the first offered coding)', () => {
+		expect(negotiateEncoding('*', offered)).toBe('br')
+	})
+
+	it('skips a ;q=0-rejected coding, even under a * wildcard', () => {
+		expect(negotiateEncoding('br;q=0, *', offered)).toBe('gzip')
+		expect(negotiateEncoding('br;q=0, gzip', offered)).toBe('gzip')
+	})
+
+	it('a named ;q=0 beats an EXPLICIT *;q=1 wildcard (the rejection wins, the chosen coding skips it)', () => {
+		// `gzip;q=0` explicitly rejects gzip; the `*;q=1` would otherwise accept it. The specific
+		// rejection beats the wildcard, so gzip is skipped and the wildcard lands on the next offered
+		// coding (br, the server's first preference among the still-acceptable codings).
+		expect(negotiateEncoding('gzip;q=0, *;q=1', ['gzip', 'br', 'deflate'])).toBe('br')
+	})
+
+	it('returns undefined when none of the offered codings is acceptable', () => {
+		expect(negotiateEncoding('identity', offered)).toBeUndefined()
+		expect(negotiateEncoding('', offered)).toBeUndefined()
+	})
+})
+
+// codingQuality — the per-coding q lookup negotiateEncoding scores each offered coding with.
+// The sharp edge: a NAMED `;q=0` (an explicit rejection) wins over a present `*` wildcard — the
+// named match is consulted FIRST, so the rejection scores 0 even when `*;q=1` would otherwise apply.
+describe('codingQuality — a specific rejection beats the wildcard', () => {
+	it('scores a named ;q=0 as 0 even when a *;q=1 wildcard is present', () => {
+		const entries = parseAcceptHeader('gzip;q=0, *;q=1')
+		// The named `gzip;q=0` is found first → 0 (rejected), NOT the wildcard's 1.
+		expect(codingQuality(entries, 'gzip')).toBe(0)
+		// An UN-named coding falls through to the `*;q=1` wildcard → 1 (acceptable).
+		expect(codingQuality(entries, 'br')).toBe(1)
+	})
+
+	it('scores an un-named coding as 0 when there is no wildcard to cover it', () => {
+		const entries = parseAcceptHeader('gzip')
+		expect(codingQuality(entries, 'gzip')).toBe(1)
+		expect(codingQuality(entries, 'br')).toBe(0) // not named, no `*` → not acceptable
+	})
+})
+
+describe('isCompressibleType — the compressible-Content-Type predicate', () => {
+	it('accepts text/* and the structured + json / + xml suffixes', () => {
+		expect(isCompressibleType('text/html; charset=utf-8')).toBe(true)
+		expect(isCompressibleType('text/css')).toBe(true)
+		expect(isCompressibleType('application/ld+json')).toBe(true)
+		expect(isCompressibleType('image/svg+xml')).toBe(true)
+	})
+
+	it('accepts the explicit compressible application types', () => {
+		expect(isCompressibleType('application/json; charset=utf-8')).toBe(true)
+		expect(isCompressibleType('application/javascript')).toBe(true)
+		expect(isCompressibleType('application/wasm')).toBe(true)
+	})
+
+	it('rejects already-compressed binaries and empty types', () => {
+		expect(isCompressibleType('image/png')).toBe(false)
+		expect(isCompressibleType('video/mp4')).toBe(false)
+		expect(isCompressibleType('application/zip')).toBe(false)
+		expect(isCompressibleType('font/woff2')).toBe(false)
+		expect(isCompressibleType('')).toBe(false)
+	})
+})
+
+describe('compressBody / decompressBody — the node:zlib round-trip', () => {
+	const payload = Buffer.from('the quick brown fox '.repeat(64))
+
+	for (const coding of ['gzip', 'deflate', 'br'] as const) {
+		it(`${coding} compresses smaller and decompresses back to the original`, () => {
+			const compressed = compressBody(payload, coding)
+			expect(compressed.length).toBeLessThan(payload.length) // a repetitive payload shrinks
+			expect(decompressBody(compressed, coding).equals(payload)).toBe(true)
+		})
+	}
+
+	it('produces a real gzip stream node:zlib itself can read', () => {
+		// Cross-check: our gzip output decodes with node:zlib's own gunzipSync (a genuine gzip stream).
+		expect(gunzipSync(compressBody(payload, 'gzip')).equals(payload)).toBe(true)
+		expect(brotliDecompressSync(compressBody(payload, 'br')).equals(payload)).toBe(true)
+	})
+
+	it('decodes a stream node:zlib produced (the wire is the inverse both ways)', () => {
+		expect(decompressBody(gzipSync(payload), 'gzip').equals(payload)).toBe(true)
+	})
+
+	it('identity is a pass-through (no transform)', () => {
+		expect(compressBody(payload, 'identity').equals(payload)).toBe(true)
+		expect(decompressBody(payload, 'identity').equals(payload)).toBe(true)
+	})
+})
+
+describe('requestEncoding — narrowing a Content-Encoding header', () => {
+	it('narrows a single compressed coding', () => {
+		expect(requestEncoding('gzip')).toBe('gzip')
+		expect(requestEncoding(' BR ')).toBe('br')
+	})
+
+	it('is undefined for identity / absent / array / multi-coding', () => {
+		expect(requestEncoding('identity')).toBeUndefined()
+		expect(requestEncoding(undefined)).toBeUndefined()
+		expect(requestEncoding(['gzip'])).toBeUndefined()
+		expect(requestEncoding('gzip, br')).toBeUndefined() // stacked encoding — not unwrapped
+	})
+})
+
+describe('mergeVary — appending a Vary token without duplication', () => {
+	it('returns the value alone when there is no existing Vary', () => {
+		expect(mergeVary('', 'Accept-Encoding')).toBe('Accept-Encoding')
+	})
+
+	it('appends when the token is absent', () => {
+		expect(mergeVary('Origin', 'Accept-Encoding')).toBe('Origin, Accept-Encoding')
+	})
+
+	it('is a no-op (case-insensitive) when the token is already present', () => {
+		expect(mergeVary('accept-encoding', 'Accept-Encoding')).toBe('accept-encoding')
+		expect(mergeVary('Origin, Accept-Encoding', 'Accept-Encoding')).toBe('Origin, Accept-Encoding')
+	})
+
+	it('appends a DISTINCT second token to an existing Accept-Encoding (both present, no dup)', () => {
+		// Existing `Accept-Encoding`, add a distinct `Origin` → both listed, comma-separated, once each.
+		expect(mergeVary('Accept-Encoding', 'Origin')).toBe('Accept-Encoding, Origin')
+	})
+
+	it('does NOT duplicate a token that already exists in a DIFFERENT case', () => {
+		// The existing token is upper-cased; appending its canonical-cased form must NOT re-add it
+		// (the de-dupe lower-cases BOTH sides) — the existing value is returned verbatim.
+		expect(mergeVary('ACCEPT-ENCODING', 'Accept-Encoding')).toBe('ACCEPT-ENCODING')
+		expect(mergeVary('Origin, ACCEPT-ENCODING', 'accept-encoding')).toBe('Origin, ACCEPT-ENCODING')
+	})
+})
+
+describe('flattenOutgoing / contentTypeOf — outgoing header readers', () => {
+	it('flattens to lower-cased keys + single-string values', () => {
+		expect(
+			flattenOutgoing({ 'Content-Type': 'text/html', 'Content-Length': 12, Vary: ['A', 'B'] }),
+		).toEqual({ 'content-type': 'text/html', 'content-length': '12', vary: 'A, B' })
+	})
+
+	it('reads the bare content type (parameters stripped, lower-cased)', () => {
+		expect(contentTypeOf({ 'Content-Type': 'text/event-stream; charset=utf-8' })).toBe(
+			'text/event-stream',
+		)
+		expect(contentTypeOf({})).toBe('')
+	})
+})
+
+describe('multipartBoundary — boundary extraction', () => {
+	it('extracts a bare + a quoted boundary from a multipart content type', () => {
+		expect(multipartBoundary('multipart/form-data; boundary=----abc123')).toBe('----abc123')
+		expect(multipartBoundary('multipart/form-data; boundary="----abc 123"')).toBe('----abc 123')
+		// Case-insensitive type + extra parameters around the boundary.
+		expect(multipartBoundary('Multipart/Form-Data; charset=utf-8; boundary=xyz')).toBe('xyz')
+	})
+
+	it('returns undefined for a non-multipart type, a missing boundary, or a non-string', () => {
+		expect(multipartBoundary('application/json')).toBeUndefined()
+		expect(multipartBoundary('multipart/form-data')).toBeUndefined()
+		expect(multipartBoundary('multipart/form-data; boundary=')).toBeUndefined()
+		expect(multipartBoundary(undefined)).toBeUndefined()
+	})
+
+	it('ignores extra ;-params AFTER the boundary param (the boundary is still extracted)', () => {
+		// A bare boundary stops at the next `;` — trailing params are ignored, not folded into it.
+		expect(multipartBoundary('multipart/form-data; boundary=xyz; charset=utf-8')).toBe('xyz')
+		// A QUOTED boundary followed by trailing params is unwrapped and the params dropped.
+		expect(multipartBoundary('multipart/form-data; boundary="----abc 123"; foo=bar')).toBe(
+			'----abc 123',
+		)
+	})
+})
+
+describe('parsePartHeaders — part header parsing', () => {
+	it('parses a FILE part (name + filename + content type)', () => {
+		const raw = Buffer.from(
+			'Content-Disposition: form-data; name="avatar"; filename="cat.png"\r\nContent-Type: image/png',
+		)
+		expect(parsePartHeaders(raw)).toEqual({
+			name: 'avatar',
+			filename: 'cat.png',
+			type: 'image/png',
+		})
+	})
+
+	it('parses a FIELD part (no filename, no content type)', () => {
+		const raw = Buffer.from('Content-Disposition: form-data; name="title"')
+		expect(parsePartHeaders(raw)).toEqual({
+			name: 'title',
+			filename: undefined,
+			type: undefined,
+		})
+	})
+
+	it('preserves a traversal filename verbatim as metadata (the parser never builds a path from it)', () => {
+		const raw = Buffer.from('Content-Disposition: form-data; name="f"; filename="../../etc/passwd"')
+		expect(parsePartHeaders(raw).filename).toBe('../../etc/passwd')
+	})
+
+	it('reads an empty filename (the empty-string upload) as a file part', () => {
+		const raw = Buffer.from('Content-Disposition: form-data; name="f"; filename=""')
+		expect(parsePartHeaders(raw).filename).toBe('')
+	})
+
+	it('parses a quoted filename containing ; and = INTACT (the quote-bounded value)', () => {
+		// `filename="a;b=c.png"` — the `;` and `=` live INSIDE the quotes; the filename matcher's
+		// quote-bounded class (`[^"]*`) captures the whole thing rather than stopping at the `;`.
+		const raw = Buffer.from(
+			'Content-Disposition: form-data; name="f"; filename="a;b=c.png"\r\nContent-Type: image/png',
+		)
+		expect(parsePartHeaders(raw)).toEqual({ name: 'f', filename: 'a;b=c.png', type: 'image/png' })
+	})
+
+	it('a part with a Content-Type but NO filename is a FIELD (filename undefined)', () => {
+		// A `Content-Type` line WITHOUT a `filename` parameter is still a form FIELD, not a file — the
+		// PRESENCE of a filename (not the content type) is what marks a file part. `type` is read; the
+		// part stays a field because `filename` is absent.
+		const raw = Buffer.from(
+			'Content-Disposition: form-data; name="meta"\r\nContent-Type: application/json',
+		)
+		expect(parsePartHeaders(raw)).toEqual({
+			name: 'meta',
+			filename: undefined,
+			type: 'application/json',
+		})
+	})
+})
+
+describe('matchesMagic / detectMIME — magic-byte sniffing', () => {
+	it('matches a signature with a null wildcard (the WebP RIFF〈size〉WEBP marker)', () => {
+		const webp = Buffer.from([
+			0x52, 0x49, 0x46, 0x46, 0x10, 0x20, 0x30, 0x40, 0x57, 0x45, 0x42, 0x50,
+		])
+		expect(
+			matchesMagic(webp, [0x52, 0x49, 0x46, 0x46, null, null, null, null, 0x57, 0x45, 0x42, 0x50]),
+		).toBe(true)
+		// A mismatch on a fixed (non-wildcard) byte fails.
+		expect(matchesMagic(Buffer.from([0x52, 0x49, 0x46, 0x00]), [0x52, 0x49, 0x46, 0x46])).toBe(
+			false,
+		)
+		// Too short to match.
+		expect(matchesMagic(Buffer.from([0xff]), [0xff, 0xd8, 0xff])).toBe(false)
+	})
+
+	it('detects PNG / JPEG / GIF / PDF from leading bytes, and undefined for text', () => {
+		expect(detectMIME(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(
+			'image/png',
+		)
+		expect(detectMIME(Buffer.from([0xff, 0xd8, 0xff, 0xe0]))).toBe('image/jpeg')
+		expect(detectMIME(Buffer.from('GIF89a...'))).toBe('image/gif')
+		expect(detectMIME(Buffer.from('%PDF-1.7'))).toBe('application/pdf')
+		expect(detectMIME(Buffer.from('just plain text'))).toBeUndefined()
+	})
+
+	it('detectMIME returns undefined for a buffer SHORTER than every signature (the length guard)', () => {
+		// The PNG prefix is the right bytes but only 3 of its 8 — too short for matchesMagic's length
+		// guard, so detectMIME finds no match (a partial header is NOT sniffed as the full type).
+		expect(detectMIME(Buffer.from([0x89, 0x50, 0x4e]))).toBeUndefined()
+		// A single byte matches no signature's full length either.
+		expect(detectMIME(Buffer.from([0xff]))).toBeUndefined()
+		// The empty buffer is shorter than everything → undefined (never throws).
+		expect(detectMIME(Buffer.alloc(0))).toBeUndefined()
+	})
+})
+
+describe('isMultipartBody — the parsed-body boundary guard', () => {
+	it('accepts a { files, fields } record and rejects anything else', () => {
+		expect(isMultipartBody({ files: [], fields: {} })).toBe(true)
+		expect(isMultipartBody({ files: 'x', fields: {} })).toBe(false)
+		expect(isMultipartBody({ files: [] })).toBe(false)
+		expect(isMultipartBody('hello')).toBe(false)
+		expect(isMultipartBody(undefined)).toBe(false)
+	})
+})
+
+// The staged-upload operations are FREE FUNCTIONS over the frozen `UploadedFileInterface` record
+// (no longer methods on a class — the value is plain, immutable data built by `createUploadedFile`).
+// Exercised over REAL temp files (no mock FS — AGENTS §16) staged through `createStaticFixture`. The
+// over-the-wire staging (a random temp name, the path-traversal defense) is proven through
+// `createMultipart` in `middlewares.test.ts`; here each operation is unit-tested against a file we
+// stage ourselves.
+describe('readUploadedFile — read the staged bytes into a Buffer', () => {
+	it('reads back the exact staged bytes', async () => {
+		const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02, 0x03])
+		const fixture = createStaticFixture({ blob: bytes })
+		try {
+			const file = createUploadedFile({
+				field: 'f',
+				name: 'x.bin',
+				size: bytes.length,
+				mime: 'application/octet-stream',
+				validated: false,
+				path: join(fixture.root, 'blob'),
+			})
+			const read = await readUploadedFile(file)
+			expect(Buffer.from(read).equals(bytes)).toBe(true)
+		} finally {
+			fixture.cleanup()
+		}
+	})
+})
+
+describe('streamUploadedFile — stream the staged bytes', () => {
+	it('streams the exact staged bytes', async () => {
+		const bytes = Buffer.from('the quick brown fox')
+		const fixture = createStaticFixture({ blob: bytes })
+		try {
+			const file = createUploadedFile({
+				field: 'f',
+				name: 'x.txt',
+				size: bytes.length,
+				mime: 'text/plain',
+				validated: false,
+				path: join(fixture.root, 'blob'),
+			})
+			const chunks: Buffer[] = []
+			for await (const chunk of streamUploadedFile(file)) {
+				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+			}
+			expect(Buffer.concat(chunks).equals(bytes)).toBe(true)
+		} finally {
+			fixture.cleanup()
+		}
+	})
+})
+
+describe('moveUploadedFile — relocate, returning a NEW frozen record', () => {
+	it('moves the bytes and returns a new record (status `moved`, repointed path) without mutating the original', async () => {
+		const bytes = Buffer.from('payload')
+		const fixture = createStaticFixture({ blob: bytes })
+		try {
+			const source = join(fixture.root, 'blob')
+			const destination = join(fixture.root, 'final.dat')
+			const file = createUploadedFile({
+				field: 'f',
+				name: 'x.dat',
+				size: bytes.length,
+				mime: 'application/octet-stream',
+				validated: false,
+				path: source,
+			})
+			const moved = await moveUploadedFile(file, destination)
+			// The returned record carries the new path + `moved` status; the ORIGINAL is unchanged (the
+			// record is frozen / immutable — the move never mutates it in place).
+			expect(moved.status).toBe('moved')
+			expect(moved.path).toBe(destination)
+			expect(file.status).toBe('staged')
+			expect(file.path).toBe(source)
+			// The destination now holds the bytes; reading through the returned record works (off the new
+			// path). (The EXDEV cross-device fallback — a copy + unlink when `rename` fails across
+			// filesystems — is not reproducible on a single-device CI temp dir, so it is documented +
+			// covered by the structural `'code' in error && error.code === 'EXDEV'` guard in the helper;
+			// a same-device rename is the path exercised here.)
+			expect(readFileSync(destination).equals(bytes)).toBe(true)
+			expect(Buffer.from(await readUploadedFile(moved)).equals(bytes)).toBe(true)
+		} finally {
+			fixture.cleanup()
+		}
+	})
+
+	it('surfaces a real rename fault (a non-existent destination directory)', async () => {
+		const fixture = createStaticFixture({ blob: Buffer.from('x') })
+		try {
+			const source = join(fixture.root, 'blob')
+			const file = createUploadedFile({
+				field: 'f',
+				name: 'x.dat',
+				size: 1,
+				mime: 'application/octet-stream',
+				validated: false,
+				path: source,
+			})
+			await expect(
+				moveUploadedFile(file, join(source, 'no', 'such', 'dir', 'out.dat')),
+			).rejects.toBeInstanceOf(Error)
+		} finally {
+			fixture.cleanup()
+		}
+	})
+})

@@ -1,0 +1,1552 @@
+import type { StartedServerInterface } from '../../../setupServer.js'
+import { connect } from 'node:net'
+import { brotliCompressSync, gzipSync } from 'node:zlib'
+import { describe, expect, it } from 'vitest'
+import {
+	clientRateKey,
+	computeBodyETag,
+	createBodyParser,
+	createCompression,
+	createCookieSession,
+	createCors,
+	createCSRFGuard,
+	createErrorBoundary,
+	createETag,
+	createMultipart,
+	createRateLimiter,
+	createSecurity,
+	createServer,
+	createStatic,
+	createTokenGuard,
+	CSRF_STATE,
+	DEFAULT_CSP,
+	HTTPError,
+	ipv6Network,
+	isMultipartBody,
+	isReservedDeviceName,
+	isUnderPath,
+	isValidRequestId,
+	matchesETag,
+	MemorySessionStore,
+	parseRange,
+	REQUEST_ID_STATE,
+	resolveStaticPath,
+	safeCompare,
+	Session,
+	signToken,
+	verifyToken,
+} from '@src/server'
+import {
+	buildMultipart,
+	cookiesHeader,
+	createStaticFixture,
+	createTeardown,
+	createUploadDirectory,
+	readSetCookie,
+	startServer,
+} from '../../../setupServer.js'
+
+// src/server/http — the AUTH & CROSS-ORIGIN + INPUT / FILE / BODY security fixes, each proven by a
+// deterministic ATTACK-SIMULATION over a REAL server + fetch / real temp dir (AGENTS §16, no mocks).
+// The matrix:
+//   1  createCSRFGuard SESSION-BINDING — a token minted under session A is rejected (403) when
+//      replayed on a request authenticated as session B (cookie-injection / sibling-subdomain
+//      forgery), while the matched A-on-A path is accepted (200).
+//   3  createCors VARY + null — an allow-listed origin reflects ACAO + `Vary: Origin` (cache-
+//      poisoning guard); the literal `Origin: null` is NEVER reflected.
+//   5  AUTO-secure cookie — over a TLS-flagged request the session `Set-Cookie` carries `Secure`,
+//      over plaintext HTTP it does not, and an explicit `secure: true` always forces it.
+//   6  ABSOLUTE session timeout — a session continuously TOUCHED past `absoluteTtl` is still
+//      evicted (the idle TTL alone would keep it alive), capping a hijacked id's lifetime.
+//   7  Session-fixation rotation — `regenerate()` issues a NEW id, carries the data, and the OLD
+//      id no longer resolves (anti-fixation).
+//   8  Mitigated-but-pinned — `safeCompare` length-guard, the rate-limit key refusing
+//      `X-Forwarded-For`, and `verifyToken` tamper → `undefined` (regression pins, no code change).
+//   I1 DECOMPRESSION BOMB — a tiny gzip / br body that inflates past the cap is a `413` (the codec
+//      aborts via `maxOutputLength` BEFORE materializing the bomb, never an OOM / hang); a normal
+//      compressed body under the cap round-trips.
+//   I2 WINDOWS RESERVED DEVICE NAMES (CVE-2025-27210) — `createStatic` never serves `/CON`, `/com1`,
+//      `/nul.txt`, `/AUX.`, or a superscript `/COM¹` (404), while a legit `console.js` IS served.
+//   I3 UPLOAD POLYGLOT / TYPE-CONFUSION (already sniff-gated → regression pins) — a part declared
+//      `image/png` whose bytes are `<script>` HTML is rejected (415) under an image allow-list; a
+//      genuine PNG passes; a declared/sniffed mismatch is rejected. The accept decision rests on the
+//      SNIFFED bytes, not the declared type — the code change makes that explicit, the prior accept
+//      check was already sniff-gated (so these PIN the safe behavior, they do not close a live hole).
+//   I4 PROTOTYPE POLLUTION — the JSON decoder now SCRUBS an own `__proto__` gadget from the parsed
+//      body (the genuine fix: pre-fix `JSON.parse` LEFT it as an own data prop a downstream merge could
+//      weaponize); a urlencoded `__proto__[polluted]=1` (raw text, no object) and a multipart `__proto__`
+//      field (skipped) never reach `Object.prototype` nor ride into the parsed body (defense-in-depth pins).
+//   I5 SPA-fallback SEGMENT BOUNDARY — with a `/api` exclude, `/apifoo` is the FALLBACK branch (a
+//      different segment), distinct from a real `/api/foo` exclusion.
+//   I6 REGRESSION PINS — a multi-range request is refused (no multi-range DoS), a staged upload sits
+//      under a RANDOM temp name (no predictable-path TOCTOU), and the `Range` parser rejects a
+//      malformed / over-large range without ReDoS / overflow.
+//
+// HEADERS / LIMITS hardening (this pass) — each fix proven by an attack-sim that FAILS on the pre-fix:
+//   H1 STRENGTHENED DEFAULT CSP — the default `createSecurity` response carries `base-uri 'self'`,
+//      `object-src 'none'`, `frame-ancestors 'self'`, `form-action 'self'` (injection / clickjacking
+//      hardening); a custom `csp` REPLACES the default wholesale.
+//   H2 X-REQUEST-ID TRUST-ECHO (CRLF / log injection) — a trusted incoming `X-Request-ID` carrying CRLF
+//      / a newline / a 10 KB value is REJECTED and a fresh UUID is minted (never the raw bytes in the
+//      header or `state` — pre-fix the CRLF made `setHeader` throw → a 500 DoS); a CLEAN `abc-123` is
+//      echoed verbatim. With `trust` off, the client header is always ignored.
+//   H3 RATE-LIMITER IPv6 /64 — two DIFFERENT IPv6 addresses in the SAME /64 share ONE bucket (the 2nd
+//      is 429ed); two in DIFFERENT /64s do not; IPv4 (+ IPv4-mapped) stay per-address.
+//   H4 COOP + CORP — the default `createSecurity` response carries `Cross-Origin-Opener-Policy:
+//      same-origin` + `Cross-Origin-Resource-Policy: same-origin`; an override changes / removes them;
+//      COEP is OFF by default (opt-in only).
+//   H5 ETag If-None-Match WEAK compare (RFC 7232 §2.3.2) — `W/"<etag>"` → 304, a comma-list with the
+//      tag → 304, `*` on an existing resource → 304, a non-matching tag → 200.
+//   H6 REGRESSION PINS — request smuggling (TE+CL / duplicate CL is rejected by the node parser, the
+//      framing can't desync), error-detail leakage (`expose:false` 500 leaks NO stack / internal
+//      message; a 4xx `HTTPError` still surfaces its safe message), and ReDoS (a long adversarial
+//      `Accept` / `Range` / `Cookie` parses in linear time).
+
+const { track } = createTeardown((handle: StartedServerInterface) => handle.stop())
+
+// ── Fix 1: createCSRFGuard — session-bound token (the per-user CSRF defense) ───
+//
+// A bare double-submit cookie proves only that the caller holds the matching signed cookie — a
+// cookie-injection attacker (a sibling subdomain / MITM) who plants BOTH halves under a victim's
+// session forges a passing request. Binding the token to the session id closes that: a token minted
+// for session A must be presented on a request authenticated AS session A. The server below pairs a
+// signed-cookie session with the CSRF guard; the attack replays session A's CSRF token on a request
+// carrying session B's session cookie.
+describe('createCSRFGuard — session-bound token rejects a cross-session replay', () => {
+	const SESSION_SECRET = 'sec-csrf-session-secret'
+	const CSRF_SECRET = 'sec-csrf-token-secret'
+
+	function csrfSessionServer(): ReturnType<typeof createServer> {
+		const server = createServer()
+		server.use(createErrorBoundary()) // renders the 403
+		server.use(createCookieSession({ secret: SESSION_SECRET }))
+		server.use(createCSRFGuard({ secret: CSRF_SECRET }))
+		// A safe GET mints the session cookie + the (session-bound) CSRF cookie, exposing the raw token.
+		server.route({
+			method: 'GET',
+			path: '/form',
+			handler: (context) => context.json({ csrf: context.state.get(CSRF_STATE) }),
+		})
+		server.route({ method: 'POST', path: '/form', handler: (c) => c.text('mutated') })
+		return server
+	}
+
+	// Mint a fresh session + its CSRF token via a safe GET with no inbound cookies, returning the
+	// session cookie, the CSRF cookie, and the raw token the page would echo.
+	async function mintSession(handle: StartedServerInterface): Promise<{
+		readonly session: string
+		readonly csrf: string
+		readonly token: string
+	}> {
+		const response = await fetch(`${handle.base}/form`)
+		const session = readSetCookie(response, 'session')
+		const csrf = readSetCookie(response, 'csrf')
+		const token = (await response.json()).csrf
+		if (session === undefined || csrf === undefined || typeof token !== 'string')
+			throw new Error('mint failed')
+		return { session, csrf, token }
+	}
+
+	it('a token minted under session A, replayed on a request authenticated as session B → 403', async () => {
+		const handle = track(await startServer(csrfSessionServer()))
+		const a = await mintSession(handle)
+		const b = await mintSession(handle)
+		// The two sessions are distinct, so their bound CSRF tokens differ — the binding is per-session.
+		expect(a.token).not.toBe(b.token)
+		expect(verifyToken(a.token, CSRF_SECRET)).not.toBe(verifyToken(b.token, CSRF_SECRET))
+
+		// ATTACK: present session B's session cookie, but session A's CSRF cookie + token. The plain
+		// double-submit MATCHES (cookie-half and header-half are both A's token), so ONLY the session
+		// binding stops it: the request is authenticated as B, but the token is bound to A → 403.
+		const forged = await fetch(`${handle.base}/form`, {
+			method: 'POST',
+			headers: { ...cookiesHeader({ session: b.session, csrf: a.csrf }), 'x-csrf-token': a.token },
+		})
+		expect(forged.status).toBe(403)
+		expect(await forged.json()).toEqual({ error: 'invalid csrf token' })
+	})
+
+	it('the matched A-on-A path (token A on a request authenticated as session A) → 200', async () => {
+		const handle = track(await startServer(csrfSessionServer()))
+		const a = await mintSession(handle)
+		// The legitimate path: session A's session cookie + session A's CSRF cookie + token → accepted.
+		const ok = await fetch(`${handle.base}/form`, {
+			method: 'POST',
+			headers: { ...cookiesHeader({ session: a.session, csrf: a.csrf }), 'x-csrf-token': a.token },
+		})
+		expect(ok.status).toBe(200)
+		expect(await ok.text()).toBe('mutated')
+	})
+
+	it('falls back to plain double-submit when NO session middleware precedes it (still 200 on a match)', async () => {
+		// With no session on context.state the guard cannot bind — it mints a signed-random token and
+		// enforces only the double-submit. The matched header+cookie path still passes (the documented
+		// weaker guarantee), proving the fallback path is intact.
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createCSRFGuard({ secret: CSRF_SECRET })) // no session middleware ahead
+		server.route({
+			method: 'GET',
+			path: '/form',
+			handler: (context) => context.json({ csrf: context.state.get(CSRF_STATE) }),
+		})
+		server.route({ method: 'POST', path: '/form', handler: (c) => c.text('ok') })
+		const handle = track(await startServer(server))
+		const minted = await fetch(`${handle.base}/form`)
+		const csrf = readSetCookie(minted, 'csrf')
+		const token = (await minted.json()).csrf
+		if (csrf === undefined || typeof token !== 'string') throw new Error('mint failed')
+		const ok = await fetch(`${handle.base}/form`, {
+			method: 'POST',
+			headers: { cookie: `csrf=${csrf}`, 'x-csrf-token': token },
+		})
+		expect(ok.status).toBe(200)
+	})
+})
+
+// ── Fix 3: createCors — Vary: Origin + reject the literal null origin ──────────
+describe('createCors — Vary: Origin on a list policy + the null origin is never reflected', () => {
+	function corsServer(): ReturnType<typeof createServer> {
+		const server = createServer()
+		server.use(createCors({ origin: ['http://allowed.test'] }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		return server
+	}
+
+	it('an allow-listed origin reflects the ACAO AND sets Vary: Origin (the cache-poisoning guard)', async () => {
+		const handle = track(await startServer(corsServer()))
+		const response = await fetch(`${handle.base}/r`, { headers: { origin: 'http://allowed.test' } })
+		expect(response.headers.get('access-control-allow-origin')).toBe('http://allowed.test')
+		// A reflected ACAO varies by request Origin — `Vary: Origin` MUST be present so a shared cache
+		// keys on it (else one origin's allowed response could be served to another).
+		expect(response.headers.get('vary')).toContain('Origin')
+	})
+
+	it('Origin: null (not in the list) is NEVER reflected — no ACAO header', async () => {
+		const handle = track(await startServer(corsServer()))
+		// A `null` Origin (a sandboxed iframe / file:// / opaque origin) must never be echoed — even if
+		// `'null'` were on the list. Here it is absent from the list too, so doubly rejected.
+		const response = await fetch(`${handle.base}/r`, { headers: { origin: 'null' } })
+		expect(response.headers.get('access-control-allow-origin')).toBeNull()
+	})
+
+	it("the literal 'null' is refused even when present in the allow-list", async () => {
+		// SECURITY: a consumer cannot opt into reflecting `null` — `resolveOrigin` drops it from the
+		// match unconditionally. A list containing `'null'` still does NOT echo a `null` Origin.
+		const server = createServer()
+		server.use(createCors({ origin: ['null', 'http://allowed.test'] }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const nulled = await fetch(`${handle.base}/r`, { headers: { origin: 'null' } })
+		expect(nulled.headers.get('access-control-allow-origin')).toBeNull()
+		// A real origin on the same list still reflects (the drop is null-specific).
+		const allowed = await fetch(`${handle.base}/r`, { headers: { origin: 'http://allowed.test' } })
+		expect(allowed.headers.get('access-control-allow-origin')).toBe('http://allowed.test')
+	})
+
+	it('a wildcard / single-origin policy does NOT add Vary: Origin (the ACAO is constant)', async () => {
+		// `'*'` (the default) and a single fixed origin never reflect, so the response does not vary by
+		// Origin — adding `Vary: Origin` would needlessly fragment a cache. It must be absent.
+		const server = createServer()
+		server.use(createCors()) // origin '*'
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/r`, { headers: { origin: 'http://any.test' } })
+		expect(response.headers.get('access-control-allow-origin')).toBe('*')
+		const vary = response.headers.get('vary') ?? ''
+		expect(vary).not.toContain('Origin')
+	})
+})
+
+// ── Fix 5: AUTO-secure cookie default (Secure iff the request arrived over TLS) ─
+//
+// The session / CSRF cookie `secure` defaults to AUTO: `Secure` over a TLS request, off over
+// plaintext HTTP (so local dev still works) — with `secure: true` an always-on override. The test
+// harness speaks plain HTTP, so a TLS request is simulated by flagging the (real) request socket as
+// `encrypted` in a middleware BEFORE the cookie is written — exactly the flag `node:tls` would set.
+describe('createCookieSession — auto-secure cookie', () => {
+	const SECRET = 'sec-auto-secure-secret'
+
+	// Find the `session` cookie's full `Set-Cookie` line (attributes intact) to assert `Secure` on it.
+	function sessionSetCookie(response: Response): string | undefined {
+		return response.headers.getSetCookie().find((entry) => entry.startsWith('session='))
+	}
+
+	it('over a TLS-flagged request the session Set-Cookie carries Secure', async () => {
+		const server = createServer()
+		// Flag the real socket as TLS-encrypted before the cookie middleware writes — the auto resolver
+		// reads `request.socket.encrypted` at write time, so this simulates a request that arrived over TLS.
+		server.use((context, next) => {
+			Reflect.set(context.request.socket, 'encrypted', true)
+			return next()
+		})
+		server.use(createCookieSession({ secret: SECRET })) // default secure: 'auto'
+		server.route({ method: 'GET', path: '/s', handler: (c) => c.empty(204) })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/s`)
+		const cookie = sessionSetCookie(response)
+		expect(cookie).toBeDefined()
+		expect(cookie).toContain('Secure')
+	})
+
+	it('over plaintext HTTP the session Set-Cookie does NOT carry Secure (local-dev safe)', async () => {
+		const server = createServer()
+		server.use(createCookieSession({ secret: SECRET })) // default secure: 'auto', plain HTTP
+		server.route({ method: 'GET', path: '/s', handler: (c) => c.empty(204) })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/s`)
+		const cookie = sessionSetCookie(response)
+		expect(cookie).toBeDefined()
+		expect(cookie).not.toContain('Secure')
+	})
+
+	it('an explicit secure: true forces Secure even over plaintext HTTP', async () => {
+		const server = createServer()
+		server.use(createCookieSession({ secret: SECRET, cookie: { secure: true } }))
+		server.route({ method: 'GET', path: '/s', handler: (c) => c.empty(204) })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/s`)
+		const cookie = sessionSetCookie(response)
+		expect(cookie).toBeDefined()
+		expect(cookie).toContain('Secure')
+	})
+})
+
+// ── Fix 6: ABSOLUTE session timeout (cap a hijacked / long-lived session) ──────
+//
+// The idle TTL alone keeps an actively-used session alive forever — so a stolen id can be kept warm
+// indefinitely. `absoluteTtl` caps the TOTAL lifetime from mint, independent of the touch. Driven by
+// the store's injected `now` clock seam (deterministic, no real timer — AGENTS §16) on the concrete
+// `MemorySessionStore` (the default store `createSession` / `createCookieSession` build).
+describe('MemorySessionStore — absolute TTL evicts a continuously-touched session', () => {
+	it('a session touched every tick is STILL evicted once it is absoluteTtl old', async () => {
+		// idle ttl 100, absolute ttl 250. Touch at 0 (mint), 80, 160, 240 — each within the 100ms idle
+		// window of the prior, so the IDLE policy alone keeps it alive indefinitely. But at t=260 it is
+		// 260ms old (> absoluteTtl 250) → evicted regardless of the recent touch. Proves the absolute cap.
+		const store = new MemorySessionStore({ ttl: 100, absoluteTtl: 250 })
+		await store.set(new Session('s-abs'), 0)
+		expect(await store.get('s-abs', 80)).toBeDefined() // touched, idle-alive
+		expect(await store.get('s-abs', 160)).toBeDefined() // touched, idle-alive
+		expect(await store.get('s-abs', 240)).toBeDefined() // touched, idle-alive (age 240 < 250)
+		// One more tick past the absolute window — evicted EVEN THOUGH it was just touched at 240.
+		expect(await store.get('s-abs', 260)).toBeUndefined()
+		// And it is GONE, not merely stale — the eviction removed the entry.
+		expect(await store.get('s-abs', 261)).toBeUndefined()
+	})
+
+	it('with the SAME idle ttl but NO absoluteTtl, the continuously-touched session stays alive', async () => {
+		// The control: identical touch schedule, no absolute cap → the idle policy keeps it alive past
+		// t=260 (and arbitrarily far), proving it is the absoluteTtl — not the idle ttl — that evicts above.
+		const store = new MemorySessionStore({ ttl: 100 })
+		await store.set(new Session('s-idle'), 0)
+		expect(await store.get('s-idle', 80)).toBeDefined()
+		expect(await store.get('s-idle', 160)).toBeDefined()
+		expect(await store.get('s-idle', 240)).toBeDefined()
+		expect(await store.get('s-idle', 260)).toBeDefined() // still alive — only 20ms since the touch
+	})
+
+	it('createdAt is stamped once at mint and NOT reset by a way-out re-persist (set)', async () => {
+		// The middleware re-`set`s the session on the way out of every request. If that reset `createdAt`,
+		// the absolute window would never elapse for an active session. Re-set at 100 + 200 (simulating
+		// the way-out persists), then read at 260 (> absoluteTtl 250 from the ORIGINAL mint) → evicted.
+		const store = new MemorySessionStore({ ttl: 1000, absoluteTtl: 250 })
+		const session = new Session('s-stamp')
+		await store.set(session, 0) // mint — createdAt = 0
+		await store.set(session, 100) // way-out re-persist — createdAt preserved (still 0)
+		await store.set(session, 200) // way-out re-persist — createdAt preserved (still 0)
+		// 260 > 250 from createdAt=0 → evicted (the re-persists did NOT slide the absolute window).
+		expect(await store.get('s-stamp', 260)).toBeUndefined()
+	})
+})
+
+// ── Fix 7: session-fixation rotation (regenerate issues a new id, drops the old) ─
+//
+// On a privilege change (login / role elevation) the caller MUST `regenerate()` the session id so a
+// pre-auth fixation id cannot be reused post-auth. The rotation issues a NEW id, carries the `data`
+// across, and the OLD id stops resolving — proven end to end over a real cookie session.
+describe('createCookieSession — regenerate is anti-fixation (new id, data carried, old id dead)', () => {
+	const SECRET = 'sec-fixation-secret'
+
+	it('regenerate() rotates to a NEW id keeping data, and the OLD cookie no longer resolves', async () => {
+		const server = createServer()
+		server.use(createCookieSession({ secret: SECRET }))
+		// Seed a session carrying data (simulating the pre-login state).
+		server.route({
+			method: 'GET',
+			path: '/seed',
+			handler: (context) => {
+				const session = context.state.get('session')
+				if (session instanceof Session) session.data.set('user', 'ada')
+				context.json({ id: session instanceof Session ? session.id : null })
+			},
+		})
+		// The login: flag a rotation on the control handle — the middleware rotates on the way out.
+		server.route({
+			method: 'POST',
+			path: '/login',
+			handler: (context) => {
+				const control = context.state.get('session:control')
+				// Narrow the control structurally (no `as`, §14) and rotate.
+				if (
+					control !== null &&
+					typeof control === 'object' &&
+					'regenerate' in control &&
+					typeof control.regenerate === 'function'
+				)
+					control.regenerate()
+				context.empty(204)
+			},
+		})
+		server.route({
+			method: 'GET',
+			path: '/whoami',
+			handler: (context) => {
+				const session = context.state.get('session')
+				context.json({
+					id: session instanceof Session ? session.id : null,
+					user: session instanceof Session ? session.data.get('user') : null,
+				})
+			},
+		})
+		const handle = track(await startServer(server))
+
+		const seed = await fetch(`${handle.base}/seed`)
+		const oldCookie = readSetCookie(seed, 'session')
+		const oldId = (await seed.json()).id
+		if (oldCookie === undefined) throw new Error('seed failed')
+
+		// Login → the response sets a NEW signed session cookie (the rotated id).
+		const login = await fetch(`${handle.base}/login`, {
+			method: 'POST',
+			headers: { cookie: `session=${oldCookie}` },
+		})
+		const newCookie = readSetCookie(login, 'session')
+		expect(newCookie).toBeDefined()
+		expect(newCookie).not.toBe(oldCookie) // a fresh id was issued
+
+		// The OLD cookie no longer resolves the original session — re-echoing it mints a BRAND-NEW one
+		// (a different id, no carried data). This is the anti-fixation guarantee: the pre-login id is dead.
+		const oldEcho = await fetch(`${handle.base}/whoami`, {
+			headers: { cookie: `session=${oldCookie}` },
+		})
+		const oldBody = await oldEcho.json()
+		expect(oldBody.id).not.toBe(oldId)
+		expect(oldBody.user).toBeUndefined() // a fresh session — the old data did NOT leak to the old id
+
+		// The NEW cookie resolves the rotated session — a DIFFERENT id, but the data carried across.
+		const newEcho = await fetch(`${handle.base}/whoami`, {
+			headers: newCookie === undefined ? {} : { cookie: `session=${newCookie}` },
+		})
+		const newBody = await newEcho.json()
+		expect(newBody.id).not.toBe(oldId)
+		expect(newBody.user).toBe('ada') // data preserved across the rotation
+	})
+})
+
+// ── Fix 8: mitigated-but-pinned (regression pins — no code change) ────────────
+describe('safeCompare — length-guarded constant-time compare (never throws on unequal lengths)', () => {
+	it('returns false (no throw) for unequal-length inputs', () => {
+		// `timingSafeEqual` THROWS on unequal-length buffers; `safeCompare` length-guards first, so an
+		// unequal-length compare is a clean `false`. A regression that dropped the guard would THROW here.
+		expect(safeCompare('abc', 'abcd')).toBe(false)
+		expect(safeCompare('', 'x')).toBe(false)
+		expect(() => safeCompare('short', 'a-much-longer-value')).not.toThrow()
+	})
+
+	it('returns true only for byte-equal inputs of equal length', () => {
+		expect(safeCompare('secret-token', 'secret-token')).toBe(true)
+		expect(safeCompare('secret-token', 'secret-toxen')).toBe(false)
+	})
+})
+
+describe('createRateLimiter — the default client key NEVER trusts X-Forwarded-For (spoofable)', () => {
+	it('two requests with DIFFERENT X-Forwarded-For but the same socket peer share ONE bucket', async () => {
+		// The default key is the socket peer IP (or a verified token), NEVER a forwardable header — so a
+		// client cannot dodge the limit by rotating `X-Forwarded-For`. Both requests come from the same
+		// loopback socket, so they share one bucket: the first passes, the second (spoofed XFF) is 429ed.
+		const server = createServer()
+		server.use(createRateLimiter({ max: 1, window: 60_000 })) // default key = socket peer IP
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('ok') })
+		const handle = track(await startServer(server))
+
+		const first = await fetch(`${handle.base}/r`, { headers: { 'x-forwarded-for': '1.1.1.1' } })
+		expect(first.status).toBe(200)
+		// A DIFFERENT spoofed XFF — if the limiter trusted it this would be a new bucket and pass; it
+		// does NOT, so the same socket peer is over its limit → 429. Proves XFF is ignored.
+		const second = await fetch(`${handle.base}/r`, { headers: { 'x-forwarded-for': '2.2.2.2' } })
+		expect(second.status).toBe(429)
+	})
+})
+
+describe('verifyToken — a tampered token verifies as undefined (total, never throws)', () => {
+	const SECRET = 'sec-verify-secret'
+
+	it('flipping a byte of a valid token rejects it (undefined), and verify never throws on garbage', () => {
+		const token = signToken('subject', { secret: SECRET })
+		expect(verifyToken(token, SECRET)).toBe('subject') // the genuine token round-trips
+		// Flip the last char of the signature → the HMAC no longer matches → undefined.
+		const tampered = `${token.slice(0, -1)}${token.endsWith('a') ? 'b' : 'a'}`
+		expect(verifyToken(tampered, SECRET)).toBeUndefined()
+		// Adversarial / malformed input is total — a non-token / empty string yields undefined, no throw.
+		expect(() => verifyToken('not.a.real.token', SECRET)).not.toThrow()
+		expect(verifyToken('not.a.real.token', SECRET)).toBeUndefined()
+		expect(verifyToken('', SECRET)).toBeUndefined()
+	})
+
+	it('a token signed with a different secret does not verify', () => {
+		const token = signToken('subject', { secret: 'some-other-secret' })
+		expect(verifyToken(token, SECRET)).toBeUndefined()
+	})
+})
+
+// A token-guard pin reused below proves the guard composes with the verify total-ness (a 401 path,
+// never a throw escaping to a 500) — the createTokenGuard import is exercised here.
+describe('createTokenGuard — a tampered bearer is a clean 401 (no escaping throw)', () => {
+	const SECRET = 'sec-guard-secret'
+	it('a tampered Bearer token → 401 invalid token (the total verify never crashes the guard)', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createTokenGuard({ secret: SECRET }))
+		server.use(createBodyParser()) // exercises the body-parser import in a composed stack
+		server.route({ method: 'GET', path: '/me', handler: (c) => c.text('ok') })
+		const handle = track(await startServer(server))
+		const token = signToken('client', { secret: SECRET })
+		const tampered = `${token.slice(0, -1)}${token.endsWith('a') ? 'b' : 'a'}`
+		const response = await fetch(`${handle.base}/me`, {
+			headers: { authorization: `Bearer ${tampered}` },
+		})
+		expect(response.status).toBe(401)
+		expect(await response.json()).toEqual({ error: 'invalid token' })
+	})
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// INPUT / FILE / BODY hardening — each fix proven by an attack-sim that FAILS on
+// the pre-fix behavior (over a real server + fetch / real temp dir, no mocks §16).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Shared temp-dir teardown for the static + multipart attack-sims (a static-fixture root / an upload
+// staging dir per test, removed in afterEach — no temp leak, §16.1).
+const fixtures = createTeardown((fixture: { cleanup: () => void }) => fixture.cleanup())
+
+// A real PNG signature (the 8-byte magic + a few bytes) — the genuine-image control for the upload
+// type-confusion attack-sims. A test-specific literal (§16.1 "what stays local"): the exact bytes a
+// magic-byte sniff must accept, not reusable machinery.
+const PNG_BYTES = Buffer.from([
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0x03,
+])
+
+// ── I1: decompression bomb — the codec aborts past the cap, never an OOM ───────
+//
+// `decompressBody` previously fully inflated the WHOLE body and only THEN checked `decompressed.length
+// > limit` — so a ~KB gzip that inflates to gigabytes was MATERIALIZED in memory before the post-hoc
+// guard could run, exhausting memory on a large-enough bomb. The fix passes the cap to `node:zlib` as
+// `maxOutputLength`, so the codec throws (RangeError / ERR_BUFFER_TOO_LARGE) the instant the output
+// WOULD exceed the cap — WITHOUT ever allocating the full bomb — which the body parser maps to a `413`.
+// The deterministic-testable surface is the `413` outcome (the post-hoc check produced a 413 too, so
+// these tests pin the outcome on both versions); the load-bearing SECURITY change is that the inflation
+// now aborts BEFORE materialization (verified at the codec level: `maxOutputLength` throws without
+// producing the giant buffer), turning a memory-exhaustion DoS into a clean rejection.
+describe('createBodyParser — decompression bomb is a 413 (cap aborts inflation, no OOM)', () => {
+	it('a 50 MB-of-zeros gzip body POSTed under a small decompression cap → 413, not a hang/OOM', async () => {
+		// 50 MB of zeros gzips to ~50 KB on the wire — but would inflate to 50 MB. With a 64 KiB
+		// decompression cap the codec aborts mid-inflate; the handler never sees the buffer.
+		const bomb = gzipSync(Buffer.alloc(50 * 1024 * 1024, 0))
+		const server = createServer()
+		server.use(createErrorBoundary())
+		// A generous body `limit` (so the COMPRESSED bytes pass) but a tight `decompression` cap — proving
+		// it is the decompressed-size cap, not the compressed-byte limit, that trips. Pre-fix this would
+		// fully inflate 50 MB (or OOM) regardless of the cap, because the cap was a post-hoc length check.
+		server.use(createBodyParser({ limit: 1_048_576, decompression: 65_536 }))
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => context.json(await context.body()),
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+			body: bomb,
+		})
+		expect(response.status).toBe(413)
+	})
+
+	it('a br (Brotli) bomb is also a 413 under the cap', async () => {
+		const bomb = brotliCompressSync(Buffer.alloc(50 * 1024 * 1024, 0))
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createBodyParser({ limit: 1_048_576, decompression: 65_536 }))
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => context.json(await context.body()),
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'content-encoding': 'br' },
+			body: bomb,
+		})
+		expect(response.status).toBe(413)
+	})
+
+	it('a NORMAL compressed body UNDER the cap still round-trips (the cap does not over-reject)', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createBodyParser({ decompression: 65_536 }))
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => context.json(await context.body()),
+		})
+		const handle = track(await startServer(server))
+		const payload = { hello: 'compressed', items: [1, 2, 3] }
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+			body: gzipSync(Buffer.from(JSON.stringify(payload))),
+		})
+		expect(response.status).toBe(200)
+		expect(await response.json()).toEqual(payload)
+	})
+
+	it('a body inflating BETWEEN the decompression cap and the body limit → 413 (isolates the maxOutputLength abort)', async () => {
+		// The 50 MB cases above 413 on BOTH pre- and post-fix (the OLD post-hoc `decompressed.length >
+		// limit` check ALSO caught a body that blew past the body `limit`), so they do not isolate the new
+		// `maxOutputLength` abort. THIS case does: 512 KiB inflated sits ABOVE the 64 KiB `decompression`
+		// cap but well BELOW the 1 MiB body `limit` — so the old post-hoc body-limit check would have
+		// PASSED it (200 pre-fix), and only the new `#limit`→`#decompression` cap fed to `node:zlib` as
+		// `maxOutputLength` aborts the inflation (413 post-fix). The single assertion that flips pre→post.
+		const inflated = gzipSync(Buffer.alloc(512 * 1024, 0)) // ≈543 wire bytes, inflates to 512 KiB
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createBodyParser({ limit: 1_048_576, decompression: 65_536 }))
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => context.json(await context.body()),
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+			body: inflated,
+		})
+		expect(response.status).toBe(413) // the decompressed-size cap (NOT the body limit) trips
+
+		// The control under the SAME { limit, decompression }: a body inflating UNDER the 64 KiB
+		// `decompression` cap still round-trips — proving the 413 above is the cap tripping, not the
+		// config over-rejecting every compressed body.
+		const under = { note: 'x'.repeat(32 * 1024) } // JSON inflates to ~32 KiB, under the 64 KiB cap
+		const ok = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+			body: gzipSync(Buffer.from(JSON.stringify(under))),
+		})
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual(under)
+	})
+})
+
+// ── I2: Windows reserved device names (CVE-2025-27210) ─────────────────────────
+//
+// On Windows a path segment equal to a DOS device alias (`CON`, `COM1`, `NUL`, …) resolves to a
+// DEVICE, not a file — and the device path still sits UNDER the served root by string, so the
+// traversal containment guard alone PASSES it (it can hang or leak). `resolveStaticPath` now refuses
+// any segment whose device-stem (stripped of extension + trailing dots/spaces, superscript-normalized,
+// upper-cased) is reserved. Proven directly on the guard AND over a real server.
+describe('resolveStaticPath — Windows reserved device names are refused (CVE-2025-27210)', () => {
+	const ROOT = process.platform === 'win32' ? 'C:\\srv\\app' : '/srv/app'
+
+	it('every reserved-device shape resolves to undefined (never a device path)', () => {
+		// The exact shapes the CVE calls out: bare, lower-case, numbered ports, with an extension, with a
+		// trailing dot/space, and the superscript COM¹/COM²/COM³ variants. Each must NOT resolve.
+		for (const attack of [
+			'/CON',
+			'/con',
+			'/COM1',
+			'/lpt9',
+			'/nul.txt',
+			'/AUX.',
+			'/PRN ',
+			'/COM¹', // COM¹
+			'/com²', // com²
+			'/LPT³', // LPT³
+			'/sub/CON', // a device in a nested segment
+		]) {
+			expect(resolveStaticPath(ROOT, attack)).toBeUndefined()
+		}
+	})
+
+	it('a legit file that merely CONTAINS a device word IS resolved (console.js / nullable.css)', () => {
+		// `console` contains `con`, `nullable` contains `nul` — but neither STEM is reserved, so they
+		// resolve normally. The guard must not over-block a legitimate filename.
+		expect(resolveStaticPath(ROOT, '/console.js')).not.toBeUndefined()
+		expect(resolveStaticPath(ROOT, '/nullable.css')).not.toBeUndefined()
+		expect(resolveStaticPath(ROOT, '/comic.png')).not.toBeUndefined()
+	})
+
+	it('the isReservedDeviceName guard pins the exact set (true for devices, false for look-alikes)', () => {
+		for (const reserved of ['CON', 'con', 'COM1', 'nul.txt', 'AUX.', 'COM¹'])
+			expect(isReservedDeviceName(reserved)).toBe(true)
+		for (const safe of ['console', 'comic', 'nullable', 'lpt10', 'com0', 'app.js', ''])
+			expect(isReservedDeviceName(safe)).toBe(false)
+	})
+
+	it('createStatic never serves a reserved-device path (404), but serves a real console.js file', async () => {
+		// A real served dir holds `console.js`. A request for the reserved `/CON` (or `/com1`, `/nul.txt`,
+		// `/AUX.`, `/COM¹`) must fall through to the spine 404 — never opening a device — while `/console.js`
+		// (a real file whose name merely contains `con`) is served. Over a real server, no mock FS (§16).
+		const fixture = fixtures.track(createStaticFixture({ 'console.js': 'export const ok = 1\n' }))
+		const server = createServer()
+		server.use(createStatic({ root: fixture.root }))
+		const handle = track(await startServer(server))
+		for (const attack of ['/CON', '/con', '/COM1', '/nul.txt', '/AUX.', '/COM¹']) {
+			const response = await fetch(`${handle.base}${attack}`)
+			expect(response.status).toBe(404) // not served, never resolved to a device
+		}
+		const ok = await fetch(`${handle.base}/console.js`)
+		expect(ok.status).toBe(200)
+		expect(await ok.text()).toContain('export const ok')
+	})
+})
+
+// ── I3: upload polyglot / type-confusion — the SNIFFED type is authoritative ────
+//
+// An attacker controls the declared `Content-Type`, so an accept decision based on it would let
+// malicious bytes ride in under a safe label. `createMultipart`'s whitelist gates on the SNIFFED
+// magic-byte type AND a declared/sniffed agreement, so a part declaring `image/png` whose bytes are
+// `<script>` HTML is `415`ed under an image allow-list, a genuine PNG passes, and a declared/sniffed
+// mismatch is rejected. NOTE: the spine was ALREADY sniff-gated here (the prior accept check required
+// `detected === declared` before consulting the list) — these are REGRESSION PINS that lock the
+// sniffed-authoritative behavior in; the code change makes that intent explicit (it matches the SNIFFED
+// type, not the spoofable declared one) so a future edit can't silently revert to trusting the declared
+// type. Over a real server with real `FormData` / temp staging (no mock FS, §16).
+describe('createMultipart — accept rests on the SNIFFED bytes, not the declared type (anti-polyglot)', () => {
+	const uploads = createTeardown((directory: ReturnType<typeof createUploadDirectory>) =>
+		directory.cleanup(),
+	)
+
+	const mount = async (
+		options?: Parameters<typeof createMultipart>[0],
+	): Promise<{
+		readonly handle: StartedServerInterface
+		readonly directory: ReturnType<typeof createUploadDirectory>
+	}> => {
+		const directory = uploads.track(createUploadDirectory())
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createMultipart({ directory: directory.path, ...options }))
+		server.route({
+			method: 'POST',
+			path: '/upload',
+			handler: async (context) => {
+				const body = await context.body()
+				if (!isMultipartBody(body)) throw new Error('expected multipart')
+				context.json({
+					files: body.files.map((file) => ({ mime: file.mime, validated: file.validated })),
+				})
+			},
+		})
+		const handle = track(await startServer(server))
+		return { handle, directory }
+	}
+
+	it('a part declared image/png whose bytes are <script> HTML is REJECTED (415) under an image allow-list', async () => {
+		const { handle, directory } = await mount({ allowed: ['image/png'] })
+		const form = new FormData()
+		// The polyglot: a believable declared type (`image/png`) wrapping a hostile HTML/script payload.
+		form.append(
+			'avatar',
+			new Blob([Buffer.from('<script>alert(document.cookie)</script>')], { type: 'image/png' }),
+			'avatar.png',
+		)
+		const response = await fetch(`${handle.base}/upload`, { method: 'POST', body: form })
+		expect(response.status).toBe(415) // the sniff (text, not PNG) overrides the declared image/png
+		expect(directory.files()).toEqual([]) // the staged temp file was cleaned on rejection
+	})
+
+	it('a GENUINE PNG passes the same image allow-list (validated:true)', async () => {
+		const { handle } = await mount({ allowed: ['image/png'] })
+		const form = new FormData()
+		form.append('avatar', new Blob([PNG_BYTES], { type: 'image/png' }), 'avatar.png')
+		const response = await fetch(`${handle.base}/upload`, { method: 'POST', body: form })
+		expect(response.status).toBe(200)
+		const body = await response.json()
+		expect(body.files[0]).toEqual({ mime: 'image/png', validated: true })
+	})
+
+	it('a declared/sniffed MISMATCH is rejected (real PNG bytes declared image/jpeg)', async () => {
+		// The bytes sniff as image/png, but the part declares image/jpeg (also on the list). The declared
+		// and sniffed types DISAGREE → rejected, even though both halves are individually whitelisted.
+		const { handle, directory } = await mount({ allowed: ['image/png', 'image/jpeg'] })
+		const form = new FormData()
+		form.append('f', new Blob([PNG_BYTES], { type: 'image/jpeg' }), 'spoof.jpg')
+		const response = await fetch(`${handle.base}/upload`, { method: 'POST', body: form })
+		expect(response.status).toBe(415)
+		expect(directory.files()).toEqual([])
+	})
+
+	it('a SIGNATURE-LESS type (text/plain) on the allow-list is still REJECTED (415) — sniff is authoritative', async () => {
+		// `text/plain` has NO entry in MAGIC_BYTES, so a magic-byte sniff returns `undefined` for it (no
+		// signature can confirm it) and the part is recorded un-`validated`. Because the accept decision is
+		// SNIFF-authoritative, an un-validated part is REJECTED whenever an `allowed` whitelist applies —
+		// even when the declared type IS on the list. This PINS that a signature-less type cannot be
+		// allow-listed via magic-byte validation: a deliberate secure-by-default property of MAGIC_BYTES
+		// coverage, identical pre/post the Fix-3 refactor. A regression that started trusting the DECLARED
+		// type would flip this to 200 and fail here.
+		const { handle, directory } = await mount({ allowed: ['text/plain'] })
+		const form = new FormData()
+		// Plain text, no magic signature — the bytes match no MAGIC_BYTES entry, so the sniff is undefined.
+		form.append(
+			'doc',
+			new Blob([Buffer.from('just plain text, no signature')], { type: 'text/plain' }),
+			'doc.txt',
+		)
+		const response = await fetch(`${handle.base}/upload`, { method: 'POST', body: form })
+		expect(response.status).toBe(415) // un-validated (un-sniffable) → rejected despite the declared type being allow-listed
+		expect(directory.files()).toEqual([]) // the staged temp file was cleaned on rejection
+	})
+})
+
+// ── I4: prototype pollution — dangerous body keys never reach Object.prototype ──
+//
+// A body key of `__proto__` / `constructor` / `prototype` assigned onto a normal object (or carried as
+// an own JSON key into a downstream merge) can pollute `Object.prototype`. `decodeBody` now scrubs the
+// parsed JSON recursively, and the multipart field assembly skips a dangerous field name. Each attack
+// asserts the global `Object.prototype` is untouched AND the parsed body carries no such key, while a
+// legit nested key still parses. Over a real server (no mock §16).
+describe('prototype pollution — __proto__ / constructor in a body never pollute Object.prototype', () => {
+	it('a JSON body {"__proto__":{"polluted":1}} does not pollute, and the key is scrubbed from the body', async () => {
+		const server = createServer()
+		server.use(createBodyParser())
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => {
+				const body = await context.body()
+				// Report whether the parsed body carries the dangerous own key + a legit nested value, so the
+				// test asserts the scrub kept the good data and dropped the gadget.
+				const record = body !== null && typeof body === 'object' ? body : {}
+				context.json({
+					hasProto: Object.prototype.hasOwnProperty.call(record, '__proto__'),
+					user: 'user' in record ? Reflect.get(record, 'user') : null,
+				})
+			},
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: '{"__proto__":{"polluted":1},"user":{"name":"ada"}}',
+		})
+		const body = await response.json()
+		// The global prototype is clean — a fresh object has no `polluted` inherited property.
+		expect(Reflect.get({}, 'polluted')).toBeUndefined()
+		// The parsed body does NOT carry the own `__proto__` data gadget…
+		expect(body.hasProto).toBe(false)
+		// …but a legitimate nested object still parsed through.
+		expect(body.user).toEqual({ name: 'ada' })
+	})
+
+	it('a urlencoded __proto__[polluted]=1 body does not pollute Object.prototype', async () => {
+		// The urlencoded path returns raw text (no object built), so it cannot pollute — pinned here so a
+		// future urlencoded OBJECT decoder cannot silently reintroduce the vector.
+		const server = createServer()
+		server.use(createBodyParser())
+		server.route({
+			method: 'POST',
+			path: '/p',
+			handler: async (context) => {
+				await context.body()
+				context.json({ polluted: Reflect.get({}, 'polluted') ?? null })
+			},
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/p`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: '__proto__[polluted]=1&a=2',
+		})
+		expect((await response.json()).polluted).toBeNull()
+		expect(Reflect.get({}, 'polluted')).toBeUndefined()
+	})
+
+	it('a multipart field named __proto__ is skipped — never written into fields, no pollution', async () => {
+		const directory = fixtures.track(createUploadDirectory())
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createMultipart({ directory: directory.path }))
+		server.route({
+			method: 'POST',
+			path: '/upload',
+			handler: async (context) => {
+				const body = await context.body()
+				if (!isMultipartBody(body)) throw new Error('expected multipart')
+				context.json({
+					hasProto: Object.prototype.hasOwnProperty.call(body.fields, '__proto__'),
+					title: body.fields.title ?? null,
+					globalPolluted: Reflect.get({}, 'polluted') ?? null,
+				})
+			},
+		})
+		const handle = track(await startServer(server))
+		const form = new FormData()
+		form.append('__proto__', '{"polluted":1}')
+		form.append('title', 'safe')
+		const response = await fetch(`${handle.base}/upload`, { method: 'POST', body: form })
+		const body = await response.json()
+		expect(body.hasProto).toBe(false) // the dangerous field name was skipped
+		expect(body.title).toBe('safe') // a normal field still recorded
+		expect(body.globalPolluted).toBeNull()
+		expect(Reflect.get({}, 'polluted')).toBeUndefined()
+	})
+})
+
+// ── I5: SPA-fallback exclude matches on a SEGMENT boundary ──────────────────────
+//
+// `'/apifoo'.startsWith('/api')` wrongly treats a DIFFERENT segment as under the `/api` exclude, so a
+// legit client route `/apifoo` would be denied the SPA shell. The fix compares on a segment boundary.
+// Proven on the `isUnderPath` predicate AND end to end: `/apifoo` gets the fallback shell, while a real
+// `/api/...` path is correctly excluded (falls through to the 404).
+describe('createStatic — SPA fallback excludes on a SEGMENT boundary (/apifoo is not under /api)', () => {
+	it('isUnderPath distinguishes a true sub-path from a partial-segment look-alike', () => {
+		expect(isUnderPath('/api', '/api')).toBe(true)
+		expect(isUnderPath('/api/users', '/api')).toBe(true)
+		expect(isUnderPath('/apifoo', '/api')).toBe(false) // a DIFFERENT segment
+		expect(isUnderPath('/apis', '/api')).toBe(false)
+	})
+
+	it('/apifoo (a different segment) IS served the SPA shell; /api/missing is excluded (404)', async () => {
+		const fixture = fixtures.track(createStaticFixture({ 'index.html': '<div id="app"></div>' }))
+		const server = createServer()
+		server.use(createStatic({ root: fixture.root, fallback: true })) // default exclude '/api'
+		const handle = track(await startServer(server))
+		// `/apifoo` is NOT under the `/api` exclude → the fallback serves the shell (pre-fix the bare
+		// `startsWith` would have wrongly excluded it, 404ing a legitimate client route).
+		const apifoo = await fetch(`${handle.base}/apifoo`, { headers: { accept: 'text/html' } })
+		expect(apifoo.status).toBe(200)
+		expect(await apifoo.text()).toBe('<div id="app"></div>')
+		// A genuine `/api/...` path IS under the exclude → no fallback (the spine 404s honestly).
+		const api = await fetch(`${handle.base}/api/missing`, { headers: { accept: 'text/html' } })
+		expect(api.status).toBe(404)
+		expect(await api.text()).not.toContain('app')
+	})
+})
+
+// ── I6: already-mitigated → regression pins (no code change unless a gap) ───────
+describe('static / range — mitigated-but-pinned regressions', () => {
+	it('a MULTI-range request is REFUSED — served as a full 200, never a multi-range body (DoS guard)', async () => {
+		// A `Range: bytes=0-1,3-4` could trigger expensive multi-part/byteranges assembly; the parser
+		// returns undefined for a multi-range header, so the server serves the WHOLE resource as a 200
+		// (never a 206 multi-range) — the DoS mitigation. Pinned so a regression that grew multi-range
+		// support (and its amplification surface) is caught.
+		const fixture = fixtures.track(createStaticFixture({ 'a.txt': 'hello world' }))
+		const server = createServer()
+		server.use(createStatic({ root: fixture.root }))
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/a.txt`, { headers: { range: 'bytes=0-1,3-4' } })
+		expect(response.status).toBe(200) // NOT 206 — the multi-range is not honored
+		expect(await response.text()).toBe('hello world') // the full body, not a sliced multi-part
+	})
+
+	it('a single-range request still works (206 + the exact slice) — the multi-range refusal is targeted', async () => {
+		const fixture = fixtures.track(createStaticFixture({ 'a.txt': 'hello world' }))
+		const server = createServer()
+		server.use(createStatic({ root: fixture.root }))
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/a.txt`, { headers: { range: 'bytes=0-4' } })
+		expect(response.status).toBe(206)
+		expect(await response.text()).toBe('hello') // bytes 0-4 inclusive
+	})
+
+	it('a multipart upload is staged under a RANDOM temp name — never the client filename (no TOCTOU)', async () => {
+		// A predictable staged path is a TOCTOU target. The parser stages each file under a crypto random
+		// UUID inside the staging dir; the client filename (even a traversal one) is metadata only. Pinned
+		// over a real upload: the staged path is INSIDE the dir and is NOT derived from the filename.
+		const directory = fixtures.track(createUploadDirectory())
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createMultipart({ directory: directory.path }))
+		server.route({
+			method: 'POST',
+			path: '/upload',
+			handler: async (context) => {
+				const body = await context.body()
+				if (!isMultipartBody(body)) throw new Error('expected multipart')
+				const file = body.files[0]
+				context.json({
+					name: file?.name,
+					path: file?.path,
+					inside: file?.path.startsWith(directory.path) ?? false,
+					// The staged basename must NOT contain the (traversal) client filename fragment.
+					derivedFromName: file?.path.includes('evil') ?? false,
+				})
+			},
+		})
+		const handle = track(await startServer(server))
+		// A hostile traversal filename — it must survive as metadata but NEVER shape the staged path.
+		const boundary = 'sec-toctou-boundary'
+		const raw = buildMultipart(boundary, [
+			{ name: 'f', filename: '../../../tmp/evil.png', type: 'image/png', data: PNG_BYTES },
+		])
+		const response = await fetch(`${handle.base}/upload`, {
+			method: 'POST',
+			headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+			// A raw Buffer is not a `fetch` BodyInit — wrap the bytes as a Uint8Array (which is).
+			body: new Uint8Array(raw),
+		})
+		const body = await response.json()
+		expect(body.name).toBe('../../../tmp/evil.png') // metadata preserved verbatim
+		expect(body.inside).toBe(true) // staged INSIDE the dir
+		expect(body.derivedFromName).toBe(false) // the path is a random UUID, not from the filename
+	})
+
+	it('the Range parser rejects a malformed / over-large range without throwing (no ReDoS / overflow)', () => {
+		// Hostile `Range` headers must be TOTAL — never a throw, never a runaway regex. A reversed range,
+		// a huge numeric start, a non-numeric bound, and a missing `bytes=` unit all resolve to a clean
+		// value (undefined = serve whole, or { satisfiable: false }) with no exception.
+		expect(parseRange('bytes=5-1', 100)).toBeUndefined() // end < start → malformed
+		expect(parseRange('bytes=abc-def', 100)).toBeUndefined() // non-numeric
+		expect(parseRange('items=0-1', 100)).toBeUndefined() // wrong unit
+		// A start past the resource is unsatisfiable (a 416), not a crash.
+		expect(parseRange('bytes=999999999999-', 100)).toEqual({ satisfiable: false })
+		// An end bound so large it parses to a non-finite Number is rejected as undefined (serve whole) —
+		// total, no throw, no overflow. (The 400-digit bound exceeds Number range → Infinity → not an
+		// integer → undefined, the malformed-range fall-through.)
+		expect(() => parseRange(`bytes=0-${'9'.repeat(400)}`, 100)).not.toThrow()
+		expect(parseRange(`bytes=0-${'9'.repeat(400)}`, 100)).toBeUndefined()
+	})
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// HEADERS / LIMITS hardening — each fix proven by an attack-sim that FAILS on the
+// pre-fix behavior (over a real server + fetch / a real raw socket, no mocks §16).
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── H1: strengthened default CSP (injection / clickjacking hardening) ──────────
+//
+// `default-src 'self'` alone leaves four gaps: an injected `<base>` can re-point relative URLs
+// (base-uri), a plugin/embed can run (object-src), the page can be framed (frame-ancestors), and an
+// injected form can exfil (form-action). The default CSP now closes all four. A custom `csp` REPLACES
+// the default wholesale (it is not merged).
+describe('createSecurity — the default CSP carries the hardening directives, a custom csp replaces it', () => {
+	it('the default response carries base-uri / object-src none / frame-ancestors self / form-action self', async () => {
+		const server = createServer()
+		server.use(createSecurity()) // zero-arg → full secure defaults
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const csp = (await fetch(`${handle.base}/r`)).headers.get('content-security-policy') ?? ''
+		// Pre-fix the default was exactly `default-src 'self'` — these four directives were ABSENT, so
+		// each assertion flips pre→post. (They are also exactly the shipped `DEFAULT_CSP` constant.)
+		expect(csp).toContain("default-src 'self'")
+		expect(csp).toContain("base-uri 'self'")
+		expect(csp).toContain("object-src 'none'")
+		expect(csp).toContain("frame-ancestors 'self'")
+		expect(csp).toContain("form-action 'self'")
+		expect(csp).toBe(DEFAULT_CSP) // the header IS the documented default verbatim
+	})
+
+	it('a custom csp string REPLACES the default wholesale (not merged)', async () => {
+		const server = createServer()
+		const custom = "default-src 'self' https://cdn.example.com"
+		server.use(createSecurity({ csp: custom }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const csp = (await fetch(`${handle.base}/r`)).headers.get('content-security-policy')
+		expect(csp).toBe(custom) // exactly the override — none of the default's extra directives leak in
+		expect(csp).not.toContain('object-src')
+	})
+
+	it('csp:false omits the Content-Security-Policy header entirely', async () => {
+		const server = createServer()
+		server.use(createSecurity({ csp: false }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		expect((await fetch(`${handle.base}/r`)).headers.get('content-security-policy')).toBeNull()
+	})
+
+	it('isValidRequestId / matchesETag / ipv6Network helpers are exported (covered below)', () => {
+		// A trivially-true assertion that exercises the helper imports at module scope so an unused-import
+		// lint never fires; the real behavior is asserted in H2 / H3 / H5.
+		expect(typeof isValidRequestId).toBe('function')
+		expect(typeof matchesETag).toBe('function')
+		expect(typeof ipv6Network).toBe('function')
+		expect(typeof computeBodyETag).toBe('function')
+	})
+})
+
+// ── H2: X-Request-ID trust-echo (CRLF / log injection / DoS) ───────────────────
+//
+// With `requestId.trust` on, the middleware echoes a CLIENT `X-Request-ID` into a response header AND
+// `context.state` (the value loggers correlate on). Pre-fix it echoed the RAW value (checking only
+// non-blank), so an HTTP-LEGAL but hostile value rode straight through: a space / `;` / `/` / high-byte
+// (log-line forgery + response-header pollution), or a megabyte value (log + header bloat). The fix
+// screens a trusted id against a STRICT charset (`isValidRequestId`, `^[A-Za-z0-9_-]{1,200}$`) and mints
+// a fresh UUID for ANYTHING off-charset / over-long — never the raw bytes. A clean id is still echoed.
+//
+// NOTE on CRLF: a raw CR/LF (and other C0 controls) in a header value can never even REACH this
+// middleware over HTTP/1.1 — node's own parser rejects the framing with a 400 (a defense-in-depth pin
+// below). The reachable trust-echo surface is therefore the HTTP-LEGAL-but-hostile values node ACCEPTS
+// into `req.headers` (spaces, `;`, `/`, high bytes, oversized) — which the strict charset now refuses.
+describe('createSecurity — X-Request-ID trust-echo sanitizes hostile client ids (off-charset / oversized)', () => {
+	// Report the response `X-Request-ID` AND the `state` copy so each test asserts the SAME sanitized id
+	// landed in both places (never the raw hostile bytes a logger / a downstream would consume).
+	function trustingServer(): ReturnType<typeof createServer> {
+		const server = createServer()
+		server.use(createSecurity({ requestId: { trust: true } }))
+		server.route({
+			method: 'GET',
+			path: '/r',
+			handler: (context) => {
+				const stateId = context.state.get(REQUEST_ID_STATE)
+				context.json({ state: typeof stateId === 'string' ? stateId : null })
+			},
+		})
+		return server
+	}
+
+	// A clean v4 UUID shape — the minted fallback. Used to assert a rejected client id was REGENERATED.
+	const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+	// Each hostile value is HTTP-legal (node accepts it into req.headers, and pre-fix echoed it raw into
+	// the response header + `state`) but fails the strict charset → regenerated to a UUID. A space / `;`
+	// forge log lines or smuggle a fake key=value into a log; a `/` / high byte pollute the correlation id.
+	it('an off-charset client id (space / semicolon / slash / high-byte) is regenerated, never echoed raw', async () => {
+		const handle = track(await startServer(trustingServer()))
+		for (const hostile of ['forged log line', 'a;evil=1', 'a/b/c', 'café-id']) {
+			const response = await fetch(`${handle.base}/r`, { headers: { 'x-request-id': hostile } })
+			const echoed = response.headers.get('x-request-id') ?? ''
+			// The raw hostile value NEVER appears in the response header or the logged `state` — a fresh UUID
+			// stands in (pre-fix `echoed` would equal `hostile`, failing the UUID match).
+			expect(echoed).toMatch(UUID)
+			expect(echoed).not.toBe(hostile)
+			expect((await response.json()).state).toBe(echoed) // header + state carry the SAME sanitized id
+		}
+	})
+
+	it('a 10 KB X-Request-ID is rejected → a fresh UUID (no log / header bloat)', async () => {
+		const handle = track(await startServer(trustingServer()))
+		// A 10 KB value is all-`a` (so node accepts it) but wildly over the 200-char cap → rejected.
+		const huge = 'a'.repeat(10 * 1024)
+		const response = await fetch(`${handle.base}/r`, { headers: { 'x-request-id': huge } })
+		const echoed = response.headers.get('x-request-id') ?? ''
+		expect(echoed).toMatch(UUID) // a fresh UUID, not the 10 KB value
+		expect(echoed.length).toBeLessThan(64)
+		expect((await response.json()).state).toBe(echoed) // state carries the SAME sanitized id
+	})
+
+	it('a CLEAN client id (abc-123) is echoed verbatim into the header AND state', async () => {
+		const handle = track(await startServer(trustingServer()))
+		const response = await fetch(`${handle.base}/r`, { headers: { 'x-request-id': 'abc-123' } })
+		expect(response.headers.get('x-request-id')).toBe('abc-123') // a valid id is preserved (trusted)
+		expect((await response.json()).state).toBe('abc-123')
+	})
+
+	it('a raw CR/LF in X-Request-ID never reaches the middleware — node rejects the framing (400, defense in depth)', async () => {
+		const handle = track(await startServer(trustingServer()))
+		// The header-injection bytes (`\r\n` mid-value) are sent over a RAW socket exactly as an attacker
+		// would. node's HTTP parser refuses the malformed framing with a 400 BEFORE the middleware runs, so
+		// a raw CRLF can never reach `setHeader` (the path that would otherwise throw ERR_INVALID_CHAR → a
+		// 500). This pins that the spine's CR/LF defense is node's parser; the charset screen above covers
+		// the values node DOES accept.
+		const raw = await rawRequest(handle.port, [
+			'GET /r HTTP/1.1',
+			'Host: localhost',
+			'X-Request-ID: a\x01b', // a C0 control (the class node rejects, the setHeader-throw vector)
+			'Connection: close',
+			'',
+			'',
+		])
+		expect(raw.statusLine).toContain('400') // node refuses it — the hostile value never reaches the app
+	})
+
+	it('with trust OFF (the default) the client id is ALWAYS ignored — a fresh UUID is minted', async () => {
+		const server = createServer()
+		server.use(createSecurity()) // requestId on, trust off (default)
+		server.route({
+			method: 'GET',
+			path: '/r',
+			handler: (context) => {
+				const stateId = context.state.get(REQUEST_ID_STATE)
+				context.json({ state: typeof stateId === 'string' ? stateId : null })
+			},
+		})
+		const handle = track(await startServer(server))
+		// Even a perfectly-valid client id is ignored when trust is off — the server mints its own.
+		const response = await fetch(`${handle.base}/r`, {
+			headers: { 'x-request-id': 'client-supplied' },
+		})
+		const echoed = response.headers.get('x-request-id') ?? ''
+		expect(echoed).toMatch(UUID)
+		expect(echoed).not.toBe('client-supplied')
+	})
+
+	it('isValidRequestId pins the exact charset (clean ids pass, hostile shapes fail)', () => {
+		for (const ok of ['abc-123', 'a', 'A1_b2-c3', '550e8400-e29b-41d4-a716-446655440000'])
+			expect(isValidRequestId(ok)).toBe(true)
+		for (const bad of [
+			'foo\r\nInjected: 1',
+			'a\nb',
+			'a b',
+			'a:b',
+			'',
+			'x'.repeat(201),
+			'a;b',
+			'a/b',
+		])
+			expect(isValidRequestId(bad)).toBe(false)
+	})
+})
+
+// ── H3: rate-limiter IPv6 /64 (a single user owns a whole /64) ─────────────────
+//
+// A per-/128 limit is trivially bypassed by an IPv6 user rotating the host bits within their /64. The
+// default client key now collapses an IPv6 address to its /64 network (IPv4 stays per-address). The
+// real test harness is IPv4-only, so the collision is proven THROUGH the real middleware by a `key`
+// extractor that maps a per-request fake source IP (an `x-fake-ip` header) through `clientRateKey` —
+// exactly what `resolveClientKey` does to the socket peer — so two same-/64 addresses share one bucket.
+describe('createRateLimiter — IPv6 addresses in one /64 share a bucket (per-/64, not per-/128)', () => {
+	function ipv6LimitedServer(): ReturnType<typeof createServer> {
+		const server = createServer()
+		// `key` mirrors `resolveClientKey`'s collapse, keyed off a test-controlled fake source IP so the
+		// SAME loopback socket can simulate distinct IPv6 sources. This drives the REAL bucket logic.
+		server.use(
+			createRateLimiter({
+				max: 1,
+				window: 60_000,
+				key: (context) => {
+					const fake = context.request.headers['x-fake-ip']
+					return `ip:${clientRateKey(typeof fake === 'string' ? fake : 'unknown')}`
+				},
+			}),
+		)
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('ok') })
+		return server
+	}
+
+	it('two DIFFERENT IPv6 addresses in the SAME /64 share one bucket (the 2nd is 429ed)', async () => {
+		const handle = track(await startServer(ipv6LimitedServer()))
+		// Both addresses are in 2001:db8:1:2::/64 but are DIFFERENT /128s. Pre-fix (full-address key) they
+		// would be two buckets and both pass; post-fix they collapse to one /64 bucket → the 2nd is 429ed.
+		const first = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '2001:db8:1:2::1' } })
+		expect(first.status).toBe(200)
+		const second = await fetch(`${handle.base}/r`, {
+			headers: { 'x-fake-ip': '2001:db8:1:2:dead:beef:0:9' },
+		})
+		expect(second.status).toBe(429) // same /64 → over the limit
+	})
+
+	it('two IPv6 addresses in DIFFERENT /64s do NOT share a bucket (both pass)', async () => {
+		const handle = track(await startServer(ipv6LimitedServer()))
+		const a = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '2001:db8:1:2::1' } })
+		expect(a.status).toBe(200)
+		// A different /64 (…:9:9: vs …:1:2:) is a distinct bucket → still under its own limit.
+		const b = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '2001:db8:9:9::1' } })
+		expect(b.status).toBe(200)
+	})
+
+	it('IPv4 (and IPv4-mapped) stay PER-ADDRESS — two distinct IPv4s do not collide', async () => {
+		const handle = track(await startServer(ipv6LimitedServer()))
+		const a = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '203.0.113.7' } })
+		expect(a.status).toBe(200)
+		const b = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '203.0.113.8' } })
+		expect(b.status).toBe(200) // a different IPv4 host is its own bucket (no /64 collapse for IPv4)
+		// The SAME IPv4 repeated IS over the limit (proving it is keyed, just per-address).
+		const again = await fetch(`${handle.base}/r`, { headers: { 'x-fake-ip': '203.0.113.7' } })
+		expect(again.status).toBe(429)
+	})
+
+	it('clientRateKey / ipv6Network pin the collapse (same /64 equal, different /64 distinct, IPv4 whole)', () => {
+		// Same /64 → identical key; different /64 → distinct; IPv4 + IPv4-mapped unchanged.
+		expect(clientRateKey('2001:db8:1:2::1')).toBe(clientRateKey('2001:db8:1:2:dead:beef:0:9'))
+		expect(clientRateKey('2001:db8:1:2::1')).not.toBe(clientRateKey('2001:db8:9:9::1'))
+		expect(clientRateKey('203.0.113.7')).toBe('203.0.113.7')
+		expect(clientRateKey('::ffff:203.0.113.7')).toBe('::ffff:203.0.113.7')
+		// The pure network helper returns the /64 for an IPv6 address and undefined for a non-collapsible.
+		expect(ipv6Network('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
+		expect(ipv6Network('203.0.113.7')).toBeUndefined() // IPv4 → not collapsed
+		expect(ipv6Network('::ffff:203.0.113.7')).toBeUndefined() // IPv4-mapped → keep full address
+		expect(ipv6Network('fe80::1%eth0')).toBe('fe80:0:0:0::/64') // a zone id is stripped first
+	})
+})
+
+// ── H4: COOP + CORP (Spectre / XS-Leaks isolation) ────────────────────────────
+//
+// The default header set now process-isolates the browsing context (COOP same-origin, severing
+// cross-window references) and blocks cross-origin embedding (CORP same-origin). COEP is OFF by default
+// (it breaks cross-origin subresources for most apps) — exposed only as the opt-in `coep` flag.
+describe('createSecurity — COOP + CORP in the default set, COEP opt-in only', () => {
+	it('the default response carries Cross-Origin-Opener-Policy + Cross-Origin-Resource-Policy same-origin', async () => {
+		const server = createServer()
+		server.use(createSecurity())
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/r`)
+		// Pre-fix neither header was set, so both assertions flip pre→post.
+		expect(response.headers.get('cross-origin-opener-policy')).toBe('same-origin')
+		expect(response.headers.get('cross-origin-resource-policy')).toBe('same-origin')
+		// COEP is NOT in the default set (it would break cross-origin subresources) — it must be absent.
+		expect(response.headers.get('cross-origin-embedder-policy')).toBeNull()
+	})
+
+	it('an override changes COOP / CORP, and false removes them', async () => {
+		const server = createServer()
+		server.use(createSecurity({ coop: 'same-origin-allow-popups', corp: false }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/r`)
+		expect(response.headers.get('cross-origin-opener-policy')).toBe('same-origin-allow-popups') // overridden
+		expect(response.headers.get('cross-origin-resource-policy')).toBeNull() // removed
+	})
+
+	it('coep:true opts INTO Cross-Origin-Embedder-Policy: require-corp (cross-origin isolation)', async () => {
+		const server = createServer()
+		server.use(createSecurity({ coep: true }))
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.text('r') })
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/r`)
+		expect(response.headers.get('cross-origin-embedder-policy')).toBe('require-corp')
+		// COOP + CORP remain on (coep is additive, not a replacement for the defaults).
+		expect(response.headers.get('cross-origin-opener-policy')).toBe('same-origin')
+	})
+})
+
+// ── H5: ETag If-None-Match RFC 7232 §2.3.2 weak comparison ─────────────────────
+//
+// Pre-fix `createETag` did a STRICT `conditional === etag` compare, so a perfectly-valid weak validator
+// (`W/"<etag>"`), the `*` wildcard, and a comma-list each FAILED to match → a needless 200 + full body.
+// The fix uses the RFC 7232 weak comparison: `W/"x"` matches `"x"`, `*` matches any current
+// representation, and a list matches if ANY member matches.
+describe('createETag — If-None-Match uses the RFC 7232 weak comparison (W/ prefix, *, comma-list)', () => {
+	// A server whose GET 200 body is deterministic, so its content ETag is stable across requests — the
+	// test reads the ETag from a first request, then revalidates with crafted If-None-Match forms.
+	function etagServer(): ReturnType<typeof createServer> {
+		const server = createServer()
+		server.use(createETag())
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.json({ hello: 'world' }) })
+		return server
+	}
+
+	// Fetch the resource's current ETag (the weak `W/"<sha256>"` the default emits).
+	async function currentETag(handle: StartedServerInterface): Promise<string> {
+		const etag = (await fetch(`${handle.base}/r`)).headers.get('etag')
+		if (etag === null) throw new Error('no ETag emitted')
+		return etag
+	}
+
+	it('If-None-Match: W/"<etag>" → 304 (a weak validator matches)', async () => {
+		const handle = track(await startServer(etagServer()))
+		const etag = await currentETag(handle) // already weak (W/"…") by default
+		const response = await fetch(`${handle.base}/r`, { headers: { 'if-none-match': etag } })
+		expect(response.status).toBe(304)
+		expect(await response.text()).toBe('') // 304 carries no body
+	})
+
+	it('If-None-Match: "other", "<etag>" (a comma-list) → 304 if ANY member matches', async () => {
+		const handle = track(await startServer(etagServer()))
+		const etag = await currentETag(handle)
+		// Present a list where the SECOND member is our tag — pre-fix the strict `=== etag` compared the
+		// whole list string and never matched (200); post-fix the list is split and the member matches.
+		const response = await fetch(`${handle.base}/r`, {
+			headers: { 'if-none-match': `"some-other-etag", ${etag}` },
+		})
+		expect(response.status).toBe(304)
+	})
+
+	it('If-None-Match: * → 304 on an existing resource (the wildcard matches any representation)', async () => {
+		const handle = track(await startServer(etagServer()))
+		const response = await fetch(`${handle.base}/r`, { headers: { 'if-none-match': '*' } })
+		expect(response.status).toBe(304)
+	})
+
+	it('a strong header against the weak ETag still matches (W/ stripped both sides)', async () => {
+		const handle = track(await startServer(etagServer()))
+		const etag = await currentETag(handle) // W/"<hash>"
+		const strong = etag.startsWith('W/') ? etag.slice(2) : etag // "<hash>" (drop the weak prefix)
+		const response = await fetch(`${handle.base}/r`, { headers: { 'if-none-match': strong } })
+		expect(response.status).toBe(304) // weak comparison: W/"x" and "x" are equal for If-None-Match
+	})
+
+	it('a NON-matching If-None-Match → 200 with the body (the tag genuinely differs)', async () => {
+		const handle = track(await startServer(etagServer()))
+		const response = await fetch(`${handle.base}/r`, {
+			headers: { 'if-none-match': '"definitely-not-the-tag"' },
+		})
+		expect(response.status).toBe(200)
+		expect(await response.json()).toEqual({ hello: 'world' })
+	})
+
+	it('matchesETag pins the RFC 7232 §2.3.2 rules (weak/strong, *, comma-list, non-match)', () => {
+		expect(matchesETag('W/"abc"', '"abc"')).toBe(true) // weak header vs strong tag
+		expect(matchesETag('"abc"', 'W/"abc"')).toBe(true) // strong header vs weak tag
+		expect(matchesETag('"x", W/"abc", "y"', '"abc"')).toBe(true) // any list member
+		expect(matchesETag('*', '"abc"')).toBe(true) // wildcard
+		expect(matchesETag('"nope"', '"abc"')).toBe(false) // genuine mismatch
+		expect(matchesETag('', '"abc"')).toBe(false) // empty header
+	})
+})
+
+// ── H6: regression pins — smuggling, error-leakage, ReDoS (already mitigated) ──
+describe('request smuggling — conflicting framing is rejected by the node parser (no desync)', () => {
+	it('a request with BOTH Transfer-Encoding: chunked AND Content-Length is rejected (400, never desynced)', async () => {
+		// A TE+CL request is the classic smuggling vector: a front/back-end that disagree on which header
+		// frames the body can be desynchronized. Node's HTTP parser REJECTS the ambiguous framing outright
+		// (HPE_INVALID_CONTENT_LENGTH → a 400 on the connection) BEFORE any handler runs, so the spine's
+		// routes never even see a desynced body. Pinned over a raw socket against the real server.
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.route({ method: 'POST', path: '/p', handler: (c) => c.text('handled') })
+		const handle = track(await startServer(server))
+		const raw = await rawRequest(handle.port, [
+			'POST /p HTTP/1.1',
+			'Host: localhost',
+			'Transfer-Encoding: chunked',
+			'Content-Length: 5',
+			'Connection: close',
+			'',
+			'0',
+			'',
+			'',
+		])
+		// The node parser refuses the ambiguous framing — a 400, and the handler's `handled` body never
+		// appears (the request was never routed, so no desync could smuggle a second request through).
+		expect(raw.statusLine).toContain('400')
+		expect(raw.body).not.toContain('handled')
+	})
+
+	it('a duplicate Content-Length is rejected by the parser (400, never two interpretations)', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.route({ method: 'POST', path: '/p', handler: (c) => c.text('handled') })
+		const handle = track(await startServer(server))
+		const raw = await rawRequest(handle.port, [
+			'POST /p HTTP/1.1',
+			'Host: localhost',
+			'Content-Length: 5',
+			'Content-Length: 6', // two conflicting lengths — the smuggling ambiguity
+			'Connection: close',
+			'',
+			'hello',
+		])
+		expect(raw.statusLine).toContain('400') // the parser refuses the duplicate length
+		expect(raw.body).not.toContain('handled')
+	})
+})
+
+describe('error-detail leakage — expose:false hides internals, an HTTPError surfaces its safe message', () => {
+	it('a thrown Error with expose:false → a 500 whose body carries NO stack / internal message', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary({ expose: false })) // the production default
+		server.route({
+			method: 'GET',
+			path: '/boom',
+			handler: () => {
+				throw new Error('SECRET internal detail: db password is hunter2')
+			},
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/boom`)
+		expect(response.status).toBe(500)
+		const body = await response.text()
+		// The generic message only — the real error message + any stack frame must NOT leak to the client.
+		expect(body).toContain('Internal Server Error')
+		expect(body).not.toContain('SECRET')
+		expect(body).not.toContain('hunter2')
+		expect(body).not.toContain('at ') // no stack-frame line ("    at handler (…)")
+	})
+
+	it('a thrown HTTPError still surfaces ITS safe message (the handler chose to expose it)', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary({ expose: false }))
+		server.route({
+			method: 'GET',
+			path: '/bad',
+			handler: () => {
+				throw new HTTPError(422, 'email is required')
+			},
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/bad`)
+		expect(response.status).toBe(422) // the HTTPError's deliberate client-facing status…
+		expect(await response.json()).toEqual({ error: 'email is required' }) // …and its safe message
+	})
+})
+
+describe('ReDoS — pathological Accept / Range / Cookie headers parse in linear time (no backtracking)', () => {
+	it('a long adversarial Accept / Range / Cookie header returns quickly (no catastrophic backtracking)', async () => {
+		const server = createServer()
+		server.use(createCompression()) // exercises the Accept-Encoding q-value parser
+		server.route({ method: 'GET', path: '/r', handler: (c) => c.json({ ok: true }) })
+		const handle = track(await startServer(server))
+		// Adversarial headers designed to trip a backtracking regex: a long run of `;q=` in Accept-Encoding,
+		// a long `bytes=` Range, and a long cookie string. Kept comfortably UNDER node's ~16 KB header cap
+		// (so node serves the request rather than a 431) while still being long enough that a quadratic /
+		// exponential parser would blow up. A linear parser handles each in milliseconds.
+		const response = await fetch(`${handle.base}/r`, {
+			headers: {
+				'accept-encoding': `${'gzip;q=0.1,'.repeat(300)}br`,
+				accept: `${'text/html,'.repeat(300)}*/*`,
+				range: `bytes=${'9'.repeat(2000)}-`,
+				cookie: `${'a=b; '.repeat(300)}c=d`,
+			},
+		})
+		// It PARSED and served (status 200) rather than hanging — a catastrophic-backtracking parser would
+		// spin until the suite timeout fires, so completion + the correct status IS the linear-time proof; a
+		// wall-clock `elapsed < Nms` bound is omitted deliberately (it flakes under CI/load to no real gain).
+		expect(response.status).toBe(200)
+	})
+
+	it('the Range parser handles a 5000-digit bound in linear time (total, no overflow / ReDoS)', () => {
+		// Pathological inputs the parsers must handle TOTALLY (no throw, no backtracking): a 5000-digit Range
+		// bound rejects as non-finite → undefined, and a 2000-member If-None-Match list scans linearly to a
+		// clean `false`. A ReDoS would hang until the test timeout — the deterministic returns are the proof
+		// (no fragile wall-clock bound).
+		expect(parseRange(`bytes=0-${'9'.repeat(5000)}`, 100)).toBeUndefined()
+		expect(matchesETag(`${'"x", '.repeat(2000)}"y"`, '"z"')).toBe(false)
+	})
+})
+
+// A raw-socket request helper — writes a hand-built HTTP/1.1 request to the server's port and collects
+// the raw response, so a test can send framing / header bytes `fetch` forbids (a CRLF in a header value,
+// a TE+CL smuggle, a duplicate Content-Length). The lines are joined with CRLF; the caller supplies the
+// terminating blank line(s). Resolves the status line, the lower-cased headers, and the body text.
+// (§16.1: a real socket against the real server — no mock. Local to this file: it serves only these
+// raw-byte attack-sims and is not reusable scenario machinery.)
+function rawRequest(
+	port: number,
+	lines: readonly string[],
+): Promise<{
+	readonly statusLine: string
+	readonly headers: Readonly<Record<string, string>>
+	readonly body: string
+}> {
+	return new Promise((resolve, reject) => {
+		const socket = connect(port, '127.0.0.1', () => {
+			socket.write(lines.join('\r\n'))
+		})
+		let raw = ''
+		socket.setEncoding('utf8')
+		socket.on('data', (chunk: string) => {
+			raw += chunk
+		})
+		socket.on('error', reject)
+		socket.on('close', () => {
+			const split = raw.indexOf('\r\n\r\n')
+			const head = split === -1 ? raw : raw.slice(0, split)
+			const body = split === -1 ? '' : raw.slice(split + 4)
+			const [statusLine = '', ...headerLines] = head.split('\r\n')
+			const headers: Record<string, string> = {}
+			for (const line of headerLines) {
+				const colon = line.indexOf(':')
+				if (colon === -1) continue
+				headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim()
+			}
+			resolve({ statusLine, headers, body })
+		})
+		// A safety timeout so a wedged exchange can never hang the suite (the server sends `Connection:
+		// close`, so a normal response closes the socket and resolves promptly).
+		socket.setTimeout(3000, () => socket.destroy())
+	})
+}

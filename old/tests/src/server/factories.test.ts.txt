@@ -1,0 +1,83 @@
+import type { StartedServerInterface } from '../../../setupServer.js'
+import { describe, expect, it } from 'vitest'
+import {
+	createBodyParser,
+	createCors,
+	createErrorBoundary,
+	createServer,
+	createUploadedFile,
+} from '@src/server'
+import { createTeardown, startServer } from '../../../setupServer.js'
+
+// src/server/http/factories.ts — createServer (the entity factory) + the
+// createMemorySessionStore store factory + createUploadedFile (the frozen staged-upload
+// record factory), proven over a REAL server + fetch (AGENTS §16). The middleware
+// factories (createBodyParser / createErrorBoundary / createCors / createTokenGuard /
+// createRateLimiter / createSession) live in middlewares.ts and are proven in
+// middlewares.test.ts; here createServer is exercised by the composed stack (it threads
+// the error-boundary → cors → body-parser → handler onion end to end). The
+// createMemorySessionStore store factory is exercised through createSession's pluggable
+// `store` in middlewares.test.ts; createUploadedFile's `stream` / `read` / `move` free-
+// function operations are proven in helpers.test.ts.
+
+const { track } = createTeardown((handle: StartedServerInterface) => handle.stop())
+
+describe('createServer — the composed example', () => {
+	it('runs the error-boundary → cors → body-parser → handler stack end to end', async () => {
+		const server = createServer()
+		server.use(createErrorBoundary())
+		server.use(createCors())
+		server.use(createBodyParser())
+		server.route({
+			method: 'POST',
+			path: '/echo',
+			handler: async (context) => context.json(await context.body()),
+		})
+		const handle = track(await startServer(server))
+		const response = await fetch(`${handle.base}/echo`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ a: 1, b: [2, 3] }),
+		})
+		expect(response.headers.get('access-control-allow-origin')).toBe('*')
+		expect(await response.json()).toEqual({ a: 1, b: [2, 3] })
+	})
+})
+
+describe('createUploadedFile — the frozen staged-upload record', () => {
+	it('builds a frozen record, defaulting status to `staged`', () => {
+		const file = createUploadedFile({
+			field: 'avatar',
+			name: 'cat.png',
+			size: 5,
+			mime: 'image/png',
+			validated: true,
+			path: '/tmp/xyz',
+		})
+		expect(file).toEqual({
+			field: 'avatar',
+			name: 'cat.png',
+			size: 5,
+			mime: 'image/png',
+			validated: true,
+			status: 'staged',
+			path: '/tmp/xyz',
+		})
+		// Immutable — `Object.freeze` makes a write a no-op (strict-mode throw in the module),
+		// so the value can be shared without defensive copying.
+		expect(Object.isFrozen(file)).toBe(true)
+	})
+
+	it('honors an explicit status', () => {
+		const file = createUploadedFile({
+			field: 'f',
+			name: 'x.bin',
+			size: 1,
+			mime: 'application/octet-stream',
+			validated: false,
+			status: 'moved',
+			path: '/tmp/abc',
+		})
+		expect(file.status).toBe('moved')
+	})
+})
