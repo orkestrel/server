@@ -1,447 +1,603 @@
-# PROPOSAL — `@orkestrel/server`
+# PROPOSAL — `@orkestrel/middleware`
 
-A typed, enterprise-grade HTTP server that **consumes** `@orkestrel/router`: an
-environment-agnostic core (the middleware seam, the shared request/response
-substrate, the error vocabulary) and a deliberately node-bound server face (the
-lifecycle, the listener, the upgrade seam). The middleware architecture is
-designed here, now, so the future `@orkestrel/middleware` package drops onto a
-frozen seam with nothing to retrofit.
+The batteries package for the `@orkestrel/server` middleware seam: every policy
+middleware the server deliberately does not ship — boundary, telemetry,
+compression, security headers, CORS, deadlines, trusted-proxy client facts,
+ETag, bearer auth, rate limiting, body parsing, sessions, CSRF, static files,
+multipart uploads — as `options => MiddlewareHandler<TState>` factories over
+the shipped seam and substrate.
 
-> **Status: awaiting approval.** `old/` (the author's original server and its
-> design doc) is reference material for this proposal and is deleted when the
-> rebuild lands. Nothing in `old/` ships.
+> **Status: awaiting approval.** This document lives in the server repo until
+> the `orkestrel/middleware` repo exists, then moves there. It is also the
+> **spec of record**: the original middleware implementations (the old server's
+> `middlewares.ts` era) were deleted with `old/` after the server rebuild, so
+> every behavior, invariant, and test pin this package must preserve is written
+> out here in full — building it never requires consulting deleted sources.
 
 ---
 
-## 1. What the old server got right — and why it still must be rebuilt
+## 1. The inheritance — what is already waiting
 
-The old implementation (`old/http.md` + sources + 4,200 lines of behavioral
-tests) is _good_: a correct lifecycle state machine with an event-driven drain,
-a disciplined Koa onion, and a security posture that is genuinely rare —
-session-bound CSRF, cookie-injection guards, zip-bomb-capped decompression,
-sniff-authoritative uploads, IPv6 `/64` rate keys, reserved-device-name
-traversal defense, constant-time token verification. Those behaviors are the
-crown jewels and this proposal preserves every one (§8).
+`@orkestrel/server` shipped with this package's foundation frozen:
 
-It must be rebuilt anyway, for one structural reason: **it is welded to
-`node:http`'s mutable vocabulary.** Handlers write into a `ServerResponse`
-through context responders; compression exists only via a `writeHead/write/end`
-monkey-patch; cookies race "must land before send"; and the route registry
-duplicates what `@orkestrel/router` now owns. In the new world handlers
-**return fetch `Response`s** — and on that single inversion, most of the old
-plumbing evaporates:
+- **The seam** (`@orkestrel/server`, all node-free): `MiddlewareHandler<TState>`,
+  `MiddlewareContext<TState>` (`url` / `method` / `state` / cached `body()`),
+  `NextFunction`, `ConnectionInfo`, `compose`. Returning onion — short-circuit
+  by returning a `Response` without calling `next`; post-process by decorating
+  `await next()`; transform by calling `next(newRequest)`; a second `next()`
+  rejects.
+- **The substrate** (same barrel): cookie machinery (`parseCookies`,
+  `serializeCookie`, `writeSignedCookie`/`readSignedCookie`, `clearCookie`,
+  `resolveSecure`, injection-hardened), WebCrypto tokens (`signToken`/
+  `verifyToken`/`normalizeSecret` — rotation, HMAC-covered expiry, total
+  verify), negotiation (`parseAcceptHeader`, `negotiateEncoding`,
+  `isCompressibleType`, the `Negotiator` entity), conditionals
+  (`computeBodyETag`, `matchesETag`, `unwrapETag`, `parseRange`), security
+  primitives (`resolveOrigin`, `mergeVary`, `resolveSecurityHeader`,
+  `isValidRequestId`, `clientRateKey`, `ipv6Network`), SSE, and `readBody`
+  (limits + transparent request decompression + zip-bomb cap + prototype
+  scrub) behind the context's exactly-once `body()`.
+- **The error vocabulary**: `HTTPError`, `ContentTooLargeError`, `isHTTPError`.
+  (`MultipartError` was explicitly deferred to this package.)
+- **The boundary division of labor**: the `Server` owns crash-proofing
+  (setup-phase guard, silent 400 on malformed requests, 500 + `report` +
+  `error` emit on faults, socket-destroy last resort). This package's
+  `createBoundary` is the _richer, earlier_ renderer a consumer may mount —
+  the server guard beneath it never becomes unreachable.
+- **Structural ordering freedom**: auto-OPTIONS/auto-HEAD/405 live _inside_
+  `Dispatcher.handle`, which is `compose`'s terminal — any middleware that
+  short-circuits (a CORS preflight 204, a rate-limit 429) preempts them by
+  construction. CORS needs only membership in the array, not a fragile slot.
 
-| Old machinery                                              | Fate under fetch vocabulary                                                           |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `RouteManager`/`Route`/`RouteGroup`, auto-HEAD/OPTIONS/405 | **Dies** — `@orkestrel/router`'s `Dispatcher` owns all of it                          |
-| `RouteHandlerContext` + `json/text/empty/error` responders | **Dies** — handlers return `Response`; params/url come from `RouteContext`            |
-| `bufferResponse` monkey-patch + its 6-helper entourage     | **Dies** — a returned `Response` is directly readable                                 |
-| "Set-Cookie must write before send" transport gymnastics   | **Dies** — a returned `Response` is always post-processable                           |
-| Old `parseURL`/`requestMethod`/`sendJSON…`/adapter         | **Dies** — the router's `buildRequest`/`sendResponse`/`parseMethod` own it            |
-| Server's own last-resort 500 duplicating the adapter's     | **Dies** — exactly one transport last-resort (the adapter's), one app boundary (§5.3) |
-| Lifecycle, drain, upgrade fan-out, close semantics         | **Survives** — correctly node-bound (§4)                                              |
-| Every pure security/protocol helper                        | **Survives verbatim** — into core (§3)                                                |
+The substrate audit found **zero server-package additions required**: every
+gap a battery has (response-side compression, session stores, the multipart
+state machine, static-file serving, rate-window bookkeeping) is genuinely this
+package's own, composed from the shipped exports plus web/node standards.
 
 ## 2. Design philosophy
 
-- **The server consumes the router.** Routing, matching, dispatch, auto-HEAD/
-  OPTIONS/405 live in `@orkestrel/router`. This package never re-implements a
-  matcher, a route registry, or a dispatch outcome — the reincarnation of the
-  old "framework hiding in a router" failure is a named kill-list item.
-- **Core-first, honestly audited.** The core-eligibility question was researched
-  subsystem-by-subsystem (§3/§4). The verdict vindicates the push: once the
-  vocabulary is fetch-standard, almost all middleware _logic_ is
-  environment-agnostic. The server face keeps only what is physically
-  node-bound — and §4 states the pushback case for each item kept there.
-- **Middleware is a seam here, batteries elsewhere.** This package ships the
-  middleware _contract_ (types + composition + the shared substrate helpers)
-  and zero policy middleware. The batteries — CORS, compression, sessions,
-  CSRF, tokens, rate limiting, security headers, ETag, static, multipart — are
-  the future `@orkestrel/middleware` package's charter, fully rostered in
-  Appendix A so nothing is unaccounted for.
-- **Contract is the backbone.** `@orkestrel/contract` guards every construction
-  boundary and every untrusted input: option bags validated at `createServer`
-  (guards over function-bearing members, `recordOf`-style shapes where data-only),
-  `parseJSON` + prototype scrub on bodies, total `is*` narrowing on every
-  header/cookie/token read. Hot paths stay guard-free per the line convention.
-- **Siblings everywhere they honestly fit.** `emitter` (§13 lifecycle events),
-  `abort` (stop signal, composed per-request), `timeout` (the drain deadline —
-  its first natural consumer), `router` (everything routing). `budget` belongs
-  to the middleware package's rate limiter, not here.
+- **Factories over the frozen seam.** Every battery is
+  `create{Noun}(options) => MiddlewareHandler<TState>` — construction-time
+  guards (contract), zero per-request allocation beyond necessity, no battery
+  ever writes to the transport directly (throw `HTTPError` or return a
+  `Response`; rendering is the boundary's and the server's job).
+- **Typed state slices, not stringly keys.** Each stateful battery publishes a
+  slice interface (`BearerState`, `SessionState`, `IdentifierState`,
+  `ClientState`) with a **fixed property name**; the consumer intersects the
+  slices they mount into their `TState`. The old design's `key?: string`
+  options are dropped — a configurable key cannot be honestly typed, and the
+  slice property IS the contract. Likewise the old session `onMissing?:
+(ctx) => void` hook is dropped — its default wrote through a context
+  responder (`context.empty(404)`) that the shipped seam deliberately does not
+  have; `require` now renders a fixed 404 via `HTTPError`. (Both recorded as
+  deliberate breaks from the old option surfaces.)
+- **§4 modernization of the old names.** Single-word members and factory nouns
+  throughout: `createBearer` (was createTokenGuard), `createLimiter` (was
+  createRateLimiter), `createCSRF` (was createCSRFGuard), `createBody` (was
+  createBodyParser), `ttl`/`lifetime` (was ttl/absoluteTtl), `cache` (was
+  maxAge on static), `identifier` (was requestId). The full mapping is in each
+  battery's spec; behavior is name-for-name preserved.
+- **Pure face by default, node face only when physical.** Thirteen batteries
+  are fetch/string-pure and run on any runtime that has `Request`/`Response`.
+  Only `createStatic` (`node:fs`) and `createMultipart` (`node:fs`/`os`) are
+  node-bound, plus the node compression fallback.
+- **Contract is the backbone.** Every option bag guarded at construction
+  (`isFunction`, `isFiniteNumber`, `isString`, shape guards on nested bags);
+  every untrusted read narrowed total (`isValidRequestId`, cookie parsing,
+  token verify); hot paths guard-free per the line convention.
+- **Ordering is doctrine, not folklore.** §5 defines the canonical onion and
+  states _why each position is load-bearing_, verbatim from the old
+  composition tests — it ships in the guide as a contract, not a suggestion.
 
 ### Non-goals
 
-Templating; ORM/DB; DI containers; validation DSLs (contract exists);
-file-based routing; WebSocket protocol (RFC 6455 stays a consumer of the
-upgrade seam); sessions/auth/CORS/compression/static/multipart as _shipped
-middleware_ (they are the middleware package's, per Appendix A); health
-endpoints (an app route — the server exposes the drain/readiness _state_ an
-app reads); a second error-policy channel.
+A logger implementation (`createTelemetry` is a seam that calls your sink);
+health/readiness endpoints (an app route over the server's drain state);
+method-override and trailing-slash (router concerns); WebSocket (a consumer of
+the server's upgrade seam); templating/ORM/DI/validation DSLs; distributed
+rate-limit stores (the `clock`/store seams admit them; none ships);
+a database session store (the `SessionStoreInterface` seam is preserved for
+it; no database sibling exists yet).
 
-## 3. Architecture and the core-eligibility split
+## 3. Architecture and package shape
 
 ```
-src/core/    middleware seam (types + compose), error vocabulary, and the
-             shared substrate: cookies, tokens (WebCrypto), negotiation,
-             SSE, body reading (limits + decompression + scrub), security
-             primitives, Negotiator — all fetch/string-pure
-src/server/  the node face: Server lifecycle entity, node:http binding via
-             the router's adapter helpers, upgrade seam, connection-fact
-             injection, discoverPort
+src/core/    types.ts (options + state slices), constants.ts (defaults),
+             errors.ts, helpers.ts (pure helpers: window math, transports,
+             feature detection), middlewares.ts (the 13 pure batteries),
+             Session.ts, MemorySessionStore.ts, factories.ts (createSession
+             companions), index.ts
+src/server/  middlewares.ts (createStatic, createMultipart, and the node-
+             backed compression variant guaranteeing br/zstd via node:zlib
+             where CompressionStream lacks them), errors.ts
+             (MultipartError), helpers.ts (resolveStaticPath,
+             isReservedDeviceName, isDotfilePath, detectMIME, temp staging,
+             uploaded-file ops), types.ts, index.ts
 ```
 
-The browser face is **trimmed** (configs, vite project, `setupBrowser.ts`, the
-`./browser` export): a browser cannot host an HTTP server, and no honest
-browser surface exists. Config ground truth follows the router precedent:
-core inherits node types, so `Request`/`Response`/`Headers`/`ReadableStream`/
-`CompressionStream`/`crypto.subtle` are all typed in core (this is also the
-recorded exception to AGENTS §17.7's stricter prose — the configs and the
-router precedent govern).
+Template: the `server`/`router` dual-face precedent verbatim — ESM core at the
+`.` export, vite-bundled CJS node face at `./server`, `configs/src/*` pairs,
+the same scripts block, guides + parity suite.
 
-**Core-eligible (the vindicated list).** Middleware composition; CORS origin
-resolution + `Vary` merging; content negotiation (`parseAcceptHeader` family +
-`Negotiator`); cookie parse/serialize/signed machinery; token sign/verify;
-ETag compute/compare; `Range` parsing; security-header resolution +
-request-id validation; rate-window math + `ipv6Network`/`clientRateKey`
-collapse; session lifecycle logic (the machinery, not the shipped middleware);
-SSE serialization + the `Response`-returning stream helper; body collection
-with byte limits, transparent request decompression, and the zip-bomb cap;
-`HTTPError` vocabulary. All fetch/string-pure, all future-middleware substrate.
+Dependencies: `@orkestrel/server` as **peerDependency** (+ dev) — the seam and
+substrate are imported, never bundled; `@orkestrel/contract` and
+`@orkestrel/budget` as regular dependencies (guards; the limiter's tally);
+`@orkestrel/abort` + `@orkestrel/timeout` as regular dependencies
+(`createDeadline`); `@orkestrel/router` as devDependency only (the
+integration capstone — no battery touches the Dispatcher).
 
-**Three honest costs of core-first, accepted:**
+## 4. The catalog
 
-1. **WebCrypto is async.** `signToken`/`verifyToken` move from sync
-   `node:crypto` HMAC to `crypto.subtle` — so they, the signed-cookie
-   read/write, and any session transport become async. The middleware chain is
-   already async and absorbs it; `subtle.verify` is constant-time internally,
-   so the old `safeCompare` is _retired_, not ported. (The salvage reviewer
-   argued for keeping sync `node:crypto`; overruled — the author's core-first
-   mandate wins, and the async cost lands only on construction-adjacent paths.)
-2. **`CompressionStream` has no brotli.** gzip/deflate are web-standard;
-   `br` parity is the middleware package's decision (a `node:zlib` variant in
-   its node entry, or wait for the pending Node `CompressionStream` brotli).
-   Recorded here so the substrate choice is deliberate.
-3. **No `maxOutputLength` on `DecompressionStream`.** The zip-bomb cap is
-   re-expressed as a byte-counting `TransformStream` that aborts the pipe the
-   moment output exceeds the cap — same fail-before-materialize property the
-   old `node:zlib` cap had; the old bomb tests pin it.
+Each battery: signature, options (defaults), semantics, invariants (the
+acceptance bar — every one was a pinned test in the old suite), ordering.
 
-## 4. The server face — the pushback case, item by item
+### 4.1 `createBoundary` — pure, no state
 
-The author asked for rigor before conceding anything to the server face. What
-stays, and why it genuinely cannot move:
+`(options?: { expose?: boolean; report?: (error: unknown) => void }) => MiddlewareHandler<TState>`
 
-- **The listener + lifecycle.** `node:http.createServer`, `listen`,
-  `closeIdleConnections`/`closeAllConnections`, ephemeral-port resolution —
-  no fetch-standard equivalent exists. The `Server` entity (§5.3) is the one
-  irreducibly node-bound orchestrator. (On fetch-native runtimes — Bun/Deno/
-  workers — consumers skip this face entirely: `compose(middleware, dispatcher)`
-  from core IS the fetch handler. That is the proof the split is honest.)
-- **The upgrade seam.** A protocol upgrade hands over a raw `Duplex` socket —
-  it escapes the `Request → Response` model by definition. Fan-out semantics
-  survive verbatim (first-claimer-wins, throw = decline + `error` event,
-  unclaimed = destroy).
-- **Connection facts.** Peer IP (rate keys) and the TLS flag (auto-`Secure`
-  cookies) exist only on the socket. They are injected once, at the adapter
-  boundary, into typed per-request state (§5.2) — so the _middleware_ that
-  consume them stay core-pure.
-- **Static files and multipart staging** are `node:fs`-bound forever — but they
-  are batteries, so they live in the middleware package's node entry
-  (Appendix A), not here. The server face stays three concerns big.
+Outermost catch (bar compression/telemetry). On a downstream throw:
+`HTTPError` → its status + its message (always surfaced — the handler's
+deliberate signal); `ContentTooLargeError` → 413; anything else → 500 with a
+generic body unless `expose: true` (then `error.message`, never a stack).
+`report` is fire-and-forget; its own throw is swallowed. Richer than the
+server's built-in guard (which stays beneath as crash-proofing).
+**Invariants:** `expose: false` leaks nothing; HTTPError messages always
+surface; report throw cannot alter the response.
 
-## 5. Public API
+### 4.2 `createTelemetry` — pure, no state _(new; open decision 3)_
 
-### 5.1 The middleware seam (core — the frozen contract)
+`(options: { record: (entry: TelemetryEntry) => void }) => MiddlewareHandler<TState>`
+
+The access-log/timing _seam_, not a logger: wraps the whole onion, calls
+`record({ method, pathname, status, duration })` after the response settles
+(and with the mapped status when the boundary rendered an error). `record`'s
+throw is swallowed. Truly outermost so the duration is honest.
+
+### 4.3 `createCompression` — pure (+ node fallback)
+
+`(options?: { threshold?: number; encodings?: readonly Encoding[]; filter?: (request: Request, response: Response) => boolean }) => MiddlewareHandler<TState>`
+
+Defaults: `threshold: 1024`; `encodings: ['br', 'gzip', 'deflate']` filtered
+at construction by **feature detection** — codings the runtime's
+`CompressionStream` supports (the "no brotli" cost recorded in the server
+proposal is dated: the spec now lists brotli/zstd; node ships them in
+`node:zlib`, and the node face exports a variant that guarantees `br` via
+`node:zlib` where `CompressionStream` lacks it).
+
+Post-processes `await next()`: negotiate via the shared `negotiateEncoding`
+(server order breaks ties, `*` honored, explicit `;q=0` rejects); compress iff
+the buffered body ≥ `threshold` AND `isCompressibleType(contentType)` AND
+`filter` (default true) allows. On compress: set `Content-Encoding`, merge
+`Vary: Accept-Encoding`, correct `Content-Length`. **Skip untouched:** below
+threshold, incompressible type, already `Content-Encoding`-ed, `identity`/no
+`Accept-Encoding`, HEAD, 204/304, and **streaming bypass** — `text/event-stream`
+and any response the `filter` predicate declines are passed through without
+buffering (in fetch vocabulary, buffering an SSE `Response` would hang; the
+content-type sentinel plus `filter` is the honest bypass).
+**BREACH posture (documented in the guide):** never compress responses that
+reflect secrets alongside attacker-controlled input; this package's CSRF
+token travels in cookie + header, not the body, which sidesteps the classic
+vector — `filter` is the per-route opt-out for consumers who put secrets in
+bodies. **Invariants:** gzip verified on the wire; 304 revalidation passes
+through it; error bodies compress (it sits outside the boundary); SSE never
+buffered.
+
+### 4.4 `createSecurity` — pure, stashes `IdentifierState` `{ identifier: string }`
+
+`(options?: SecurityOptions) => MiddlewareHandler<TState>`
+
+Set-headers-then-`next()`. `X-Content-Type-Options: nosniff` unconditional.
+Everything else via `resolveSecurityHeader` (`false` → omit, string →
+override wholesale, unset → default):
+
+| Option        | Default                                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------------------- |
+| `frame`       | `'DENY'`                                                                                             |
+| `csp`         | `default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'` |
+| `referrer`    | `strict-origin-when-cross-origin`                                                                    |
+| `permissions` | `camera=(), microphone=(), geolocation=()`                                                           |
+| `coop`        | `same-origin`                                                                                        |
+| `corp`        | `same-origin`                                                                                        |
+| `cluster`     | `?1` (Origin-Agent-Cluster — _new_, helmet/OWASP baseline)                                           |
+| `coep`        | **off**; `true` → `require-corp` (opt-in — breaks cross-origin subresources)                         |
+| `hsts`        | **off**; `true` → `max-age=31536000; includeSubDomains` (opt-in — destructive if misconfigured)      |
+| `identifier`  | **on**: `{ trust?: boolean }` \| `false`                                                             |
+
+`identifier` mints `crypto.randomUUID()`, sets `X-Request-ID`, stashes the
+slice. `trust: true` echoes an incoming id only if it passes
+`isValidRequestId` (`/^[A-Za-z0-9_-]{1,200}$/`); anything off-charset,
+oversize, or CRLF-bearing is replaced with a fresh mint, never echoed.
+**Invariants:** custom `csp` string replaces wholesale (never merges);
+`csp: false` omits; hostile request-ids never echo. The defaults are the old
+implementation's, aligned with current OWASP guidance (Permissions-Policy and
+Referrer-Policy were already defaults — the old Appendix A under-described
+them); where they differ from helmet (`frame: 'DENY'` vs `SAMEORIGIN`,
+`referrer: strict-origin-when-cross-origin` vs `no-referrer`) the old,
+stricter-or-equal value is kept deliberately.
+
+### 4.5 `createCors` — pure, no state
+
+`(options?: { origin?: string | readonly string[]; methods?: readonly string[]; headers?: readonly string[] }) => MiddlewareHandler<TState>`
+
+Defaults: `origin: '*'`; `methods: GET/POST/PUT/PATCH/DELETE/OPTIONS`;
+`headers: Content-Type, Authorization`. Resolves `Access-Control-Allow-Origin`
+via `resolveOrigin`, then continues; answers preflights (OPTIONS +
+`Access-Control-Request-Method`) itself with 204 + the advertised
+methods/headers — which structurally preempts the Dispatcher's auto-OPTIONS.
+**Crown jewels:** on the allow-list (reflect) path, merge `Vary: Origin`
+(cache-poisoning guard; wildcard/single-origin adds no Vary); the literal
+`Origin: null` is **never** reflected, even if `'null'` is allow-listed.
+
+### 4.6 `createDeadline` — pure, no state _(new; open decision 3)_
+
+`(options: { ms: number; status?: number }) => MiddlewareHandler<TState>`
+
+The application-level per-request deadline (the server's `timeouts.*` are
+socket-level). Arms `createTimeout({ ms })` from `@orkestrel/timeout`, links
+its signal to the request's via `@orkestrel/abort`'s `linkSignal`, and passes
+the reconstructed `Request` downstream so handlers observe the deadline as an
+abort. If the deadline fires first: return `status` (default **503**) with
+`Retry-After` omitted (the consumer's proxy owns 504 semantics). The
+downstream promise is not orphaned — its eventual settle is awaited-and-
+discarded so a late throw cannot become an unhandled rejection. Sits inside
+the boundary (a downstream `AbortError` maps cleanly).
+
+### 4.7 `createForwarded` — pure, stashes `ClientState` `{ client: { ip?: string } }` _(new; open decision 3)_
+
+`(options: { proxies: number } | { trusted: readonly string[] }) => MiddlewareHandler<TState>`
+
+The trusted-proxy resolver — the single most load-bearing roster gap. The
+server injects the _socket_ peer as `ConnectionInfo.ip` and never trusts
+`X-Forwarded-For`; deployments behind proxies previously had to hand-roll XFF
+parsing in their `state` function (the enterprise footgun). This battery makes
+trust **explicit configuration**: walk `X-Forwarded-For` (and RFC 7239
+`Forwarded`) right-to-left, skipping exactly `proxies` trusted hops or every
+hop matching the `trusted` CIDR list, and stash the first untrusted address as
+`client.ip` (falling back to the socket peer). Downstream consumers
+(`createLimiter`'s default key, session security, telemetry) prefer
+`ClientState` when present. **Invariant preserved:** without this battery
+mounted, XFF remains completely untrusted — nothing implicit anywhere.
+
+### 4.8 `createETag` — pure, no state
+
+`(options?: { weak?: boolean }) => MiddlewareHandler<TState>`
+
+Acts only on `GET` responses with status 200 and a buffered body (streaming /
+`text/event-stream` passes through untouched; a response that already carries
+`ETag` is respected, never re-hashed). Hashes via `computeBodyETag` (WebCrypto
+digest), default weak (`W/"…"`, `weak: false` → strong). If `If-None-Match`
+matches (`matchesETag` — RFC 7232 weak comparison: `*` matches anything,
+comma-lists match on any member, `W/` stripped both sides) → 304 with no
+body; else set `ETag` and return the body. **Ordering (load-bearing):** inner
+of compression — the hash is computed over the _uncompressed_ representation
+so revalidation survives re-encoding. **Invariants:** the full RFC 7232
+match matrix (weak/strong/list/`*`) pins.
+
+### 4.9 `createBearer` — pure, stashes `BearerState` `{ token: string }` _(was createTokenGuard)_
+
+`(options: { secret: TokenSecret; header?: string; scheme?: string }) => MiddlewareHandler<TState>`
+
+Defaults: `header: 'authorization'`, `scheme: 'Bearer'` (case-insensitive;
+`''` means the whole header value is the raw token). Extract → `verifyToken`
+(total, async, rotation-aware, HMAC-covered expiry). Valid → stash the
+verified value, continue. Missing → `HTTPError(401, 'missing token')`;
+invalid/expired/tampered → `HTTPError(401, 'invalid token')` — thrown, never
+written (the boundary renders). **Invariants:** verify is total — garbage,
+flipped bytes, wrong secrets, expired payloads all yield a clean 401, never a
+crash; rotation accepts any listed secret, signs with the first.
+
+### 4.10 `createLimiter` — pure, reads `BearerState`/`ClientState`/`ConnectionInfo` _(was createRateLimiter)_
+
+`(options: { max: number; window: number; capacity?: number; key?: (context) => string; message?: string; clock?: () => number; policy?: boolean }) => MiddlewareHandler<TState>`
+
+Defaults: `capacity: 10_000`, `message: 'rate limit exceeded'`,
+`clock: Date.now`, `policy: false`. Per key: one `@orkestrel/budget`
+`createBudget({ max, consume: () => 1 })` plus the window's reset instant
+(budget has no clock — the middleware owns all window math against the
+injected `clock`, the distributed-store seam). **Check-before-consume**:
+read `exhausted` synchronously, deny the `max+1`th request first — exactly
+`max` admitted per window. **Lazy fixed window**: the first request after a
+key's window elapsed `clear()`s that same budget and re-arms `resetAt` — no
+background timers. **Capacity LRU**: a brand-new key at capacity evicts the
+oldest. Over-limit **short-circuits** (no throw, no `next()`): 429 +
+`Retry-After` (whole seconds to reset, floored at 1) + `message`; with
+`policy: true` also the draft `RateLimit`/`RateLimit-Policy` structured
+fields (opt-in — the IETF draft is not yet frozen).
+**Default key derivation:** `BearerState.token` → `token:<value>`; else
+`ClientState.client.ip` (when `createForwarded` is mounted) else
+`ConnectionInfo.ip` → `ip:<clientRateKey(ip)>` — IPv6 collapsed to `/64` via
+`ipv6Network`, IPv4 and IPv4-mapped kept whole, zones stripped. **Never**
+reads `X-Forwarded-For` itself. **Invariants:** same-socket different-XFF
+share one bucket; same-/64 IPv6 shares one bucket, different /64s do not;
+check-before-consume admits exactly `max`; all window math reads `clock`.
+
+### 4.11 `createBody` — pure, no state _(was createBodyParser)_
+
+`(options?: { limit?: number; decompression?: number }) => MiddlewareHandler<TState>`
+
+Defaults: `limit: 1_048_576`; `decompression` defaults to **`limit`** ("limit
+means limit" — note the bare substrate `body()` fallback cap is the separate
+16 MiB `DEFAULT_DECOMPRESSED_LIMIT`; mounting this battery makes the caps
+explicit and equal by default). Drives the context's single cached `body()`
+**eagerly** with its limits — it does not collect separately, so the
+exactly-once stream guarantee holds with or without it. Mapping: over-limit
+(compressed wire bytes past `limit` OR decompressed bytes past
+`decompression`) → **413**; corrupt compressed body → **400** (client fault);
+malformed JSON resolves `undefined` from the substrate — this battery maps it
+to **400**. Prototype-pollution scrub is the substrate's (`scrubPrototype` at
+every depth). **Invariants:** the zip-bomb matrix — 50 MB-of-zeros under a
+small cap → 413 without materializing; the between-cap-and-limit isolation
+case; `__proto__` bodies never pollute.
+
+### 4.12 `createSession` — pure, stashes `SessionState` `{ session: SessionInterface; control: SessionControlInterface }`
+
+`(options: SessionOptions<S>) => MiddlewareHandler<TState>`
 
 ```ts
-// The composition context — plain data, one per request, shared by every
-// middleware AND (as `state`) by the route handlers behind the dispatcher.
-interface MiddlewareContext<TState> {
-	readonly url: URL
-	readonly method: string // the raw verb (the Dispatcher narrows)
-	readonly state: TState // THE shared bag — also dispatcher.handle's state
-	body(): Promise<unknown> // lazy, cached, limit+decompression+scrub (§5.4)
-}
-
-type NextFunction = (request?: Request) => Promise<Response>
-// call → downstream runs (optionally with a substituted Request);
-// don't call → short-circuit with your own Response;
-// second call → rejects (the double-next guard, preserved)
-
-type MiddlewareHandler<TState> = (
-	request: Request,
-	context: MiddlewareContext<TState>,
-	next: NextFunction,
-) => Response | Promise<Response>
-
-function compose<TState>(
-	middleware: readonly MiddlewareHandler<TState>[],
-	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
-): (request: Request, context: MiddlewareContext<TState>) => Promise<Response>
-```
-
-Decisions embedded here, with rationale:
-
-- **Returning onion** (`next(): Promise<Response>`) — the shape that composes
-  as pure functions when `Response` is the currency (h3 v2 precedent). A
-  middleware transforms the request (via `next(newRequest)` or `state`), the
-  response (after `await next()`), or short-circuits (rate-limit 429, CORS
-  preflight 204) — no mutable framework object anywhere.
-- **One `TState`, not per-middleware type accumulation.** Hono-style
-  `<SIn, SOut>` accumulation was evaluated and rejected: it demands deep
-  generic gymnastics, and the router's `Dispatcher.handle(request, state)` is
-  already a single-`TState` seam. Instead, each middleware package battery
-  publishes a **state-slice interface** (`TokenState`, `SessionState`,
-  `RequestIdState`…) and the consumer intersects the slices they mount into
-  their `TState`. Typed, honest, zero magic — and the ordering idioms
-  (token guard stashes → rate limiter keys off it) work exactly as before,
-  now type-visibly.
-- **The bag IS the router's state.** `compose`'s terminal is
-  `(request, context) => dispatcher.handle(request, context.state)` — so route
-  handlers read the same object middleware wrote, as `RouteContext.state`,
-  with no second plumbing.
-- **What a separate middleware package peer-depends on** is exactly:
-  `MiddlewareHandler`, `NextFunction`, `MiddlewareContext`, the state-slice
-  convention, the error vocabulary (§5.5), and the substrate helpers (§5.4).
-  Nothing node-typed is reachable from any of them.
-
-### 5.2 Connection facts (the adapter-injected slice)
-
-```ts
-interface ConnectionInfo {
-	readonly ip?: string // socket peer address (spoof-proof rate keys)
-	readonly encrypted: boolean // TLS flag (derives Secure cookies when `secure` is omitted)
+interface SessionOptions<S> {
+	readonly transport: SessionTransport // cookieTransport(...) | headerTransport(...) | yours
+	readonly store?: SessionStoreInterface<S> // default createMemoryStore({ ttl, lifetime })
+	readonly ttl?: number // idle ms
+	readonly lifetime?: number // absolute ms from mint (was absoluteTtl)
+	readonly create?: (id: string) => S // default new Session(id)
+	readonly mint?: (context) => boolean | Promise<boolean> // default always (auto-session)
+	readonly require?: boolean // default false
+	readonly ends?: boolean // DELETE with a valid id ends the session → 204 (was deleteEnds)
+	readonly clock?: () => number
 }
 ```
 
-The server face builds each request's `TState` via the consumer's
-`state: (connection: ConnectionInfo) => TState` option — so `X-Forwarded-For`
-is _never_ implicitly trusted (a deployment behind a trusted proxy derives its
-own client key in its `state` function or middleware; the old suite's
-XFF-ignored test is preserved).
+One factory replaces the old createSession/createCookieSession pair;
+transports are helper factories: `cookieTransport({ name?, secret, cookie? })`
+(default `name: 'session'`; value is `signToken(id)` — a signed cookie;
+tampered/absent reads as no session; `Max-Age` derived from `ttl`;
+cookie defaults `path: '/'`, `HttpOnly`, `SameSite=Lax`, `secure` omitted =
+derived from the connection per the shipped `resolveSecure`) and
+`headerTransport({ header? })` (default `'session-id'`).
 
-### 5.3 The `Server` entity (server face)
+**Per-request lifecycle:** `transport.read` (total) → valid stored session →
+stash + continue; `ends` + `DELETE` with valid id → `store.delete` → 204;
+no session + `mint()` true → mint `randomUUID()`, `create`, `store.set`,
+`transport.write`, stash, continue; else `require` ? 404 : continue
+sessionless. On the way out, a resolved session is re-`store.set` (durable
+stores round-trip data). **Control handle** (`control` on the slice):
+`regenerate()` — anti-fixation: new id, data carried over, old id deleted,
+transport rewritten (privilege changes MUST call it); `destroy()` —
+`store.delete` + `transport.clear`; destroy supersedes regenerate; transport
+writes happen synchronously at call time, store I/O defers to the way out.
+Required companions ship with it: the `Session` entity, `transferSessionData`
+(the regenerate data-carry), and the `isSession`/`isSessionControl` guards.
+**Store contract** (`SessionStoreInterface<S>`: `get`/`set`/`delete` with a
+trailing `now` clock seam): `MemorySessionStore` ships — lazy idle eviction
+(`now - lastSeen >= ttl`), **absolute lifetime** (`now - createdAt >=
+lifetime` evicts even continuously-touched sessions; `createdAt` stamped once
+at first set and preserved across way-out re-persists), no background timers.
+**Invariants:** the OWASP pair (idle AND absolute timeout); regenerate rotates
+the id keeping data while the old id stops resolving; `createdAt` survives
+touches; cookie transport inherits the full injection-hardening matrix
+(`__Host-` spoof rejection, Domain/Path throws, SameSite=None forces Secure,
+Secure derived from TLS when omitted).
 
-```ts
-type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'stopped'
+### 4.13 `createCSRF` — pure, reads `SessionState`, stashes `CSRFState` `{ csrf: string }` _(was createCSRFGuard)_
 
-type ServerEventMap = {
-	readonly start: readonly [port: number]
-	readonly request: readonly [method: string, pathname: string]
-	readonly upgrade: readonly [request: IncomingMessage, handled: boolean]
-	readonly error: readonly [error: unknown]
-	readonly stop: readonly []
-	readonly drain: readonly [pending: number]
-}
+`(options: { secret: TokenSecret; cookie?: string; header?: string; field?: string; safe?: readonly string[] }) => MiddlewareHandler<TState>`
 
-interface ServerOptions<TState> {
-	readonly dispatcher: DispatcherInterface<TState> // bring the router; the seam
-	readonly state: (connection: ConnectionInfo) => TState
-	readonly middleware?: readonly MiddlewareHandler<TState>[]
-	readonly host?: string
-	readonly port?: number // omitted/0 ⇒ ephemeral (the default)
-	readonly drain?: number // graceful-stop deadline ms (via @orkestrel/timeout)
-	readonly limit?: number // default body-read byte cap (§5.4)
-	readonly expose?: boolean // boundary: leak non-HTTPError messages? default false
-	readonly report?: (error: unknown) => void // boundary sink; its throw is swallowed
-	readonly timeouts?: {
-		readonly request?: number
-		readonly headers?: number
-		readonly keepalive?: number
-	}
-	readonly on?: EmitterHooks<ServerEventMap>
-	readonly error?: EmitterErrorHandler
-}
+Defaults: `cookie: 'csrf'`, `header: 'x-csrf-token'`, `field: '_csrf'`,
+`safe: ['GET', 'HEAD', 'OPTIONS']`. Safe method → mint, set the **signed**
+cookie (`SameSite=Strict`, `HttpOnly: false` so client JS can read it,
+`Secure` derived), expose the raw token on the slice, continue. Mutating
+method → read the submitted token (header, else body `field` — body parser
+must sit ahead for form posts), read the signed cookie, verify both; missing
+either or mismatch → `HTTPError(403, 'invalid csrf token')`. No server store.
+**Crown jewel — session binding** (current OWASP doctrine: naive double-submit
+is insecure; the signed, session-bound variant is the pattern): with a session
+ahead, the minted token is `signToken(sessionId)` — a mutating request's
+recovered bound id must equal _its own_ session id, so a token minted under
+session A replayed on session B is 403 even with matching halves. Without a
+session, falls back to signed-random double-submit, documented weaker.
+**Invariants:** the A-token-on-B-session 403 pin; A-on-A 200; sessionless
+match still 200.
 
-interface ServerInterface<TState> {
-	readonly id: string
-	readonly status: ServerStatus
-	readonly port: number | undefined
-	readonly dispatcher: DispatcherInterface<TState> // readonly introspection
-	readonly emitter: EmitterInterface<ServerEventMap>
-	use(middleware: MiddlewareHandler<TState>): void
-	use(middleware: readonly MiddlewareHandler<TState>[]): void
-	upgrade(handler: UpgradeHandler): void
-	start(): Promise<number>
-	stop(): Promise<void>
-	destroy(): Promise<void>
-}
+### 4.14 `createStatic` — node face
+
+`(options: { root: string; prefix?: string; index?: string; dotfiles?: 'ignore' | 'deny' | 'allow'; cache?: number; etag?: boolean; fallback?: boolean | { exclude?: string } }) => MiddlewareHandler<TState>`
+
+Defaults: `index: 'index.html'`, `dotfiles: 'ignore'`, `etag: true`,
+`fallback` off (`true` → `exclude: '/api'`). Serves GET/HEAD only; misses
+call `next()` (non-terminal). Streams via `fs.createReadStream` (a mid-stream
+read error destroys the response, never the process), typed via the extension
+map (default `application/octet-stream`), `Cache-Control: max-age=<cache>`,
+weak file ETag `W/"<size>-<floor(mtimeMs)>"` honoring `If-None-Match` → 304,
+`Accept-Ranges: bytes` with full Range support: single `bytes=` ranges only
+(closed/open/suffix, clamped inclusive) → 206 + `Content-Range`;
+wholly-unsatisfiable → 416; **multi-range and malformed → full 200** (refused,
+total, linear-time even on 5000-digit bounds).
+**The traversal guard (exact algorithm, order load-bearing):** strip `prefix`
+on a segment boundary (`/apifoo` is not under `/api`) → `decodeURIComponent`
+(malformed % → refuse, no throw) → reject NUL → make **relative first** (so a
+leading `..` survives `normalize` as a climbing segment) → `normalize` →
+refuse any **Windows reserved-device segment** (CVE-2025-27210: superscript
+digits normalized first, trailing dots/spaces stripped, stem-before-first-dot
+uppercased against CON/PRN/AUX/NUL/COM1-9/LPT1-9 — `NUL.json` refused,
+`nullable.css` served) → `resolve(root, relative)` and require the result
+under `root`. Reversing relative-strip and normalize masks the escape; the
+screen is explicit, never delegated to `path` normalization. **Dotfiles:**
+any relative segment starting `.` → policy (`ignore` falls through, `deny`
+403s, `allow` serves). **SPA fallback:** an unresolved, extension-less GET
+accepting `text/html` outside `exclude` serves `index` (the client router
+owns the route).
+
+### 4.15 `createMultipart` — node face
+
+`(options?: { limits?: { file?: number; files?: number; field?: number; fields?: number; total?: number }; allowed?: readonly string[]; directory?: string }) => MiddlewareHandler<TState>`
+
+Defaults: `file: 10_485_760`, `files: 10`, `field: 65_536`, `fields: 100`,
+`total: 52_428_800`, `directory: os.tmpdir()`. Non-multipart requests pass
+through untouched. **Streams `request.body` through a boundary state
+machine — never `formData()`** (buffering the whole body would defeat every
+mid-stream defense): each limit trips the moment it is exceeded — reading
+stops, every already-staged temp file is deleted, `MultipartError(413, …,
+'limit')`. Files stage to `join(directory, randomUUID())` — the client
+filename is metadata only, never a path component (traversal by filename is
+impossible by construction); the staged path is recorded _before_ the first
+byte lands (a breach cleans partials); back-pressure respected; on any
+failure the write stream is destroyed and the fd closed before rethrow;
+client disconnect mid-upload triggers the same fail-closed cleanup.
+**Sniff-authoritative typing:** the first bytes are matched against the
+magic-byte table (jpeg/png/gif/webp/pdf/zip); with an `allowed` list, a part
+is accepted only if the _detected_ type is listed AND matches the declared
+type — a declared `image/png` whose bytes are HTML is 415, a signature-less
+declared type on the list is still 415 (sniffing cannot validate it), and
+`allowed: []` accepts nothing; without a list, `mime` + `validated` are
+recorded and nothing is type-rejected. Fields named `__proto__`/
+`constructor`/`prototype` are skipped. Malformed structure (missing/
+unterminated boundary, nameless part, oversized header block) →
+`MultipartError(400, …, 'malformed')`. Parsed `{ files, fields }` seeds
+`context.body()`; handlers narrow with `isMultipartBody`.
+**Companions that move here:** `MultipartError` + `isMultipartError` +
+`MultipartReason` (`'limit' | 'malformed' | 'rejected'` → 413/400/415),
+`UploadedFileInterface` (frozen records: field/name/size/mime/validated/
+status/path), `createUploadedFile`, and the post-parse ops
+`streamUploadedFile` / `readUploadedFile` / `moveUploadedFile` (rename with
+EXDEV copy+unlink fallback).
+
+## 5. The ordering doctrine (ships in the guide as contract)
+
+```
+createTelemetry      outermost — honest wall-clock, sees the mapped status
+createCompression    outside the boundary — error bodies compress too
+createBoundary       the renderer — everything below may throw HTTPError
+createDeadline       inside the boundary — its abort maps cleanly
+createSecurity       every response gets headers, even errors below… (see note)
+createCors           claims preflights before the dispatcher's auto-OPTIONS
+createForwarded      client facts resolved before anything keys off them
+createETag           inner of compression — hash the uncompressed body
+createBearer         stashes the identity the limiter keys off
+createLimiter        cheap denial before body work
+createBody           body read before sessions/CSRF need fields
+createSession        before CSRF — binding requires it
+createCSRF           after session (binding), after body (form field)
+createStatic         last — misses fall through to the dispatcher terminal
 ```
 
-Semantics (old lifecycle preserved, re-based):
+Load-bearing positions, with the failure each prevents: compression outside
+the boundary (else error bodies ship uncompressed — the old composition test
+pins compression #1, boundary #2); ETag inner of compression (else the hash
+covers compressed bytes and revalidation breaks on re-encoding); CORS
+anywhere before the terminal (its 204 short-circuit preempts auto-OPTIONS
+structurally); bearer before limiter (the `token:` key idiom); body before
+session/CSRF (async `mint` and the `_csrf` field read the cached body);
+session before CSRF (binding). One honest divergence from the old placement:
+the old guidance put security headers _near the top_ so even error responses
+carried them; the canonical order above places `createSecurity` inside the
+boundary, so error `Response`s **returned** by handlers still get headers,
+but errors the boundary **renders from a throw** do not. Consumers who want
+headers on every response, thrown errors included, mount security above the
+boundary — the guide documents both orders and this tradeoff plainly.
 
-- **Status machine + restart** exactly as the old `Server.ts`: fresh stop-`Abort`
-  per run (a restarted server is not born aborted); `start` from `listening`
-  rejects; `stop`/`destroy` idempotent; `EADDRINUSE` rejects with no silent
-  ephemeral fallback.
-- **Per request**: track in-flight (finish on response completion or close) →
-  build `Request` via the router's `buildRequest` (client disconnect already
-  aborts `request.signal`; the server _additionally_ links its stop signal in
-  via `@orkestrel/abort`'s `linkSignal`, closing the old design's latent gap
-  where handlers could not observe `stop()`) → run the composed onion →
-  terminal `dispatcher.handle(request, state)` → `sendResponse`. The router's
-  adapter helpers are consumed, never duplicated.
-- **The built-in boundary is lifecycle machinery, not policy**: the Server
-  wraps the composed chain once — a thrown `HTTPError` renders as its status +
-  message; any other throw renders 500 (message hidden unless `expose`),
-  `report` invoked, `error` emitted. Exactly one app-error seam; the adapter's
-  bare-500 remains the transport last resort beneath it. The middleware
-  package may still ship a richer boundary that short-circuits earlier.
-- **Graceful drain**: on `stop()`, refuse new connections, fire the stop abort,
-  arm `createTimeout({ ms: drain })` from `@orkestrel/timeout`, wake-park on
-  the in-flight counter, emit `drain` with the pending count, force-close only
-  if the deadline fired (else close gracefully, always dropping idle
-  keep-alive sockets so close never hangs).
-- **Enterprise knobs**: `timeouts.request/headers/keepalive` map onto
-  `node:http`'s `requestTimeout`/`headersTimeout`/`keepAliveTimeout`
-  (headers > keepalive guarded at construction — the Slowloris footgun).
-- **Upgrade seam**: verbatim old semantics, node face only.
-- `discoverPort` survives as a server-face helper.
+## 6. Security invariants — the acceptance bar
 
-### 5.4 The shared substrate (core helpers — future-middleware fuel)
+Every item below was a pinned test in the old suite and must be re-pinned
+here (this section is the checklist the reviewer audits):
 
-All pure, all exported, all guarded total (§14), all salvaged with their
-security properties intact: cookie machinery (`parseCookies`,
-`serializeCookie`, `isCookieName`, `isCookieAttribute`, `decodeCookieValue`,
-signed read/write, `clearCookie` re-expressed over `Headers`), token machinery
-(`signToken`/`verifyToken`/`normalizeSecret` — WebCrypto async, rotation +
-HMAC-covered expiry preserved), negotiation (`parseAcceptHeader`,
-`negotiateEncoding`, `codingQuality`, `isCompressibleType`, the `Negotiator`
-entity with `format` returning a `Response`), conditional-request helpers
-(`computeBodyETag` — WebCrypto digest, `matchesETag`, `unwrapETag`,
-`parseRange`), security primitives (`resolveSecurityHeader`,
-`isValidRequestId`, `resolveOrigin`, `mergeVary`, `clientRateKey`,
-`ipv6Network`, `resolveSecure`), SSE (`serializeEvent` + an `openStream`-style
-helper returning `{ response, write, comment, end, closed }` over a
-`ReadableStream` `Response`), and the body pipeline: `readBody(request,
-{ limit, decompression })` — collect capped, transparently decompress
-(gzip/deflate via `DecompressionStream` behind the byte-cap TransformStream),
-decode by content type, `scrubPrototype`/`isDangerousKey` on JSON — surfaced
-to middleware and handlers as the context's cached `body()` so the stream is
-read exactly once (the old clause-4 guarantee, kept).
+1. **CORS**: `Vary: Origin` on reflect, never on wildcard; literal `null`
+   never reflected even when allow-listed.
+2. **Headers**: hostile request-ids (off-charset/oversize/CRLF) never echoed;
+   CSP replaces wholesale; nosniff unconditional.
+3. **Bearer**: verify total on garbage/tamper/expiry/rotation — 401, never a
+   crash; constant-time via `subtle.verify`.
+4. **Limiter**: XFF cannot split buckets (same socket = one bucket); IPv6
+   `/64` collapse; check-before-consume exactness; LRU cannot be used to
+   reset a hot key (eviction is oldest-inserted, a re-created key starts a
+   fresh window honestly).
+5. **Body**: zip-bomb 413 before materializing (including the
+   between-cap-and-limit case); corrupt stream 400 not 413; `__proto__`
+   scrubbed at depth.
+6. **Session**: idle AND absolute timeout both enforced (absolute evicts
+   continuously-touched sessions; `createdAt` stamped once); regenerate
+   rotates id keeping data, old id dead; signed cookie transport inherits the
+   full injection matrix; Secure derived from TLS when omitted.
+7. **CSRF**: session-bound — A's token on B's session 403s even with matching
+   double-submit halves; sessionless fallback works but is documented weaker.
+8. **Static**: the traversal matrix (encoded dots, absolute leaks, prefix
+   segment boundaries), reserved device names (`NUL.json` 404, `nullable.css`
+   200), dotfiles policy, multi-range refused whole, SPA fallback respects
+   `exclude`.
+9. **Multipart**: declared-vs-sniffed mismatch 415; signature-less type on an
+   allow-list 415; temp names random (traversal filenames stay metadata);
+   every limit trips mid-stream with staged files cleaned; disconnect
+   fail-closed.
+10. **Boundary**: `expose: false` leaks nothing; HTTPError messages surface;
+    report throw swallowed.
 
-### 5.5 Errors (core)
+## 7. Sibling integration
 
-`HTTPError` (status + optional context), `ContentTooLargeError` (413),
-`isHTTPError` — verbatim salvage, zero node coupling. (`MultipartError`
-migrates to the middleware package with its owner.)
+| Package               | Where                                                                                           |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `@orkestrel/server`   | peerDependency — the seam, the substrate, the error vocabulary; never bundled, never duplicated |
+| `@orkestrel/contract` | construction guards on every option bag; total narrows on every untrusted read                  |
+| `@orkestrel/budget`   | the limiter's per-key tally (check-before-consume over `exhausted`/`consume`/`clear`)           |
+| `@orkestrel/abort`    | `createDeadline`'s `linkSignal` (deadline observable by handlers)                               |
+| `@orkestrel/timeout`  | `createDeadline`'s timer                                                                        |
+| `@orkestrel/router`   | devDependency — the integration capstone only; no battery touches the Dispatcher                |
+| `@orkestrel/guide`    | parity: one `middleware.md` concept row spanning both faces                                     |
 
-## 6. Sibling integration
+## 8. Testing strategy
 
-| Package               | Where                                                                                                                                                                                                                           |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@orkestrel/router`   | The dispatcher option + `buildRequest`/`sendResponse`/`parseMethod` reuse; route handlers are router handlers, untouched                                                                                                        |
-| `@orkestrel/contract` | Construction guards on every option bag (functions via `isFunction`, numbers via `isFiniteNumber`/bounds, strings via `isString`); `parseJSON` inside `readBody`; total narrows on every untrusted read — the mandated backbone |
-| `@orkestrel/emitter`  | The `Server`'s §13 emitter (`ServerEventMap`); hooks + listener-error option                                                                                                                                                    |
-| `@orkestrel/abort`    | The stop signal; `linkSignal(requestSignal, stopSignal)` per request                                                                                                                                                            |
-| `@orkestrel/timeout`  | The drain deadline (`createTimeout({ ms })`) — first sibling consumer                                                                                                                                                           |
-| `@orkestrel/budget`   | NOT a dependency here — documented as the middleware package's rate-limit tally                                                                                                                                                 |
-| `@orkestrel/guide`    | Parity: one `server.md` concept row spanning `src/core` + `src/server`                                                                                                                                                          |
+- **Per-battery units** (pure face, env-agnostic setup: a `next` recorder, a
+  `MiddlewareContext` factory, a request builder): every default, every
+  option, every skip condition, every invariant in §6 — the old security
+  suite's middleware pins ported 1:1 onto the new option names.
+- **Composition suite** (ports the old `composition.test`): the §5 canonical
+  onion end-to-end — gzip on the wire, 304 through compression, error bodies
+  compressed, preflight preempting auto-OPTIONS, the bearer→limiter key
+  idiom, session→CSRF binding, body→CSRF field reads.
+- **Node-face suites**: static (temp-dir fixtures — the traversal/reserved/
+  dotfile/Range matrices over real files), multipart (real streamed bodies —
+  limits mid-stream, cleanup on abort, sniff matrix over real magic bytes).
+- **Clock/determinism**: limiter and session suites drive injected `clock`
+  exclusively — zero wall-clock sleeps.
+- **Integration capstone**: one real `Server` + `Dispatcher` + the canonical
+  onion over a socket — request in, every layer's fingerprint out.
+- **Guides parity**: `middleware.md` spanning both faces, standard suite.
 
-## 7. What `@orkestrel/middleware` will find waiting (the accounting)
+## 9. Implementation plan
 
-The frozen seam (§5.1), the state-slice convention, the substrate (§5.4), the
-error vocabulary (§5.5), `ConnectionInfo` in state (§5.2) — plus Appendix A's
-complete roster mapping every old battery to its layer, its state slice, its
-salvage source, and the invariants it must preserve. The middleware package
-peer-depends on `@orkestrel/server` for types and substrate, ships
-`options => MiddlewareHandler<TState>` factories, and splits pure batteries
-from node-bound ones (static/multipart) via its own exports.
+| Unit | Owns                                                         | Content                                                                              |
+| ---- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| U0   | repo identity                                                | template → `@orkestrel/middleware`, dual-face configs, deps per §3, lockfile         |
+| U1   | `src/core/types.ts`, `constants.ts`, `errors.ts`             | option bags, state slices, transports/store interfaces, defaults, telemetry entry    |
+| U2   | `src/core/helpers.ts`, `Session.ts`, `MemorySessionStore.ts` | window math, transports, session machinery, feature detection                        |
+| U3   | `src/core/middlewares.ts` + `factories.ts` + barrel          | the 13 pure batteries                                                                |
+| U4   | `src/server/**`                                              | `createStatic`, `createMultipart`, `MultipartError`, traversal/sniff/staging helpers |
+| U5   | `tests/**` (pure)                                            | per-battery units + composition suite + clock determinism                            |
+| U6   | `tests/**` (node) + capstone                                 | static/multipart matrices, the socket capstone                                       |
+| U7   | `guides/**`, parity                                          | `middleware.md` (ordering doctrine as contract), manifest, dependency mirrors        |
+| U8   | —                                                            | verifier sweep; checker + opus reviewers (§6 is the audit checklist); push           |
 
-## 8. Security invariants preserved (the crown jewels)
+Serial U0→U1→U2→U3; U4 ∥ U5 after U3; U6 ∥ U7 after U4/U5; U8 last. Same
+disjoint-ownership, deviation-report, independent-verification discipline as
+the router and server builds.
 
-Every one of these survives with a pinned test (source: the old security
-suite): CORS `Vary: Origin` on the reflect path + literal `Origin: null` never
-reflected; cookie-name token validation (no whitespace-padded `__Host-`
-spoofing) + `Domain`/`Path` injection throws + `SameSite=None` forces
-`Secure` + auto-`Secure` from the TLS connection fact; token verification
-total (malformed/tampered/expired/empty-rotation → `undefined`) + HMAC-covered
-expiry + rotation lists + constant-time comparison (via `subtle.verify`);
-zip-bomb abort-before-materialize incl. the between-cap-and-limit isolation
-case; prototype-pollution scrub on every parsed body; request-id strict
-charset (CRLF/log-injection/oversize rejected, UUID fallback); IPv6 `/64`
-collapse; XFF never implicitly trusted; ReDoS-linear Accept/Range/Cookie
-parsers; upgrade-handler throw isolation (no process crash, no socket leak);
-`expose: false` leaks nothing, `HTTPError` messages always surface. The
-middleware-owned jewels (CSRF session-binding, traversal + reserved-device
-containment, sniff-authoritative uploads, absoluteTtl, regenerate
-anti-fixation) are recorded in Appendix A as that package's acceptance bar.
+## 10. Open decisions (approval requested)
 
-## 9. Testing strategy
-
-- **Lifecycle acceptance (ported from the old `Server.test`)**: the status
-  matrix, restart-fresh-abort, EADDRINUSE honesty, host/port binds, ephemeral
-  default, `discoverPort`, graceful-vs-forced drain (slow finishes; hung
-  force-closes at deadline), 20-parallel-none-dropped, emit-safety, and the
-  full upgrade matrix — real sockets, no mocks.
-- **Seam tests**: compose ordering (outer-first), double-next rejection,
-  short-circuit, request substitution, response transformation, state
-  threading through to a route handler via `dispatcher.handle`, boundary
-  mapping (HTTPError/other/expose/report), stop-signal observability inside a
-  handler.
-- **Substrate tests**: port every surviving pure-helper pin 1:1 from the old
-  helpers/security suites (cookie injection matrix, token totality + rotation
-  - expiry tamper, zip bomb, scrub, negotiation q-matrix, ETag RFC 7232
-    matrix, Range totality, request-id charset, `ipv6Network`) — plus WebCrypto
-    async signatures and `expectTypeOf` suites for the middleware generics.
-- **One thin integration capstone**: `buildRequest → onion → dispatcher.handle
-→ sendResponse` round-trip over a real socket (routing outcomes themselves
-  are the router's tests — not re-pinned here).
-- **Guides parity**: `server.md` spanning both faces, standard drop-in suite.
-
-## 10. Implementation plan
-
-| Unit | Owns                                                                                    | Content                                                                                                                                     |
-| ---- | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| U0   | `package.json`, configs trim                                                            | add `@orkestrel/timeout`; remove browser face (configs/vite project/`setupBrowser.ts`/`./browser` export); lockfile                         |
-| U1   | `src/core/types.ts`, `constants.ts`, `errors.ts`                                        | full seam + substrate type surface; HTTPError vocabulary                                                                                    |
-| U2   | `src/core/helpers.ts`                                                                   | the substrate: cookies, tokens (WebCrypto), negotiation, ETag/Range, security primitives, SSE, `readBody` + zip-bomb TransformStream, scrub |
-| U3   | `src/core/Negotiator.ts`, `compose` (helpers or own module), `factories.ts`, `index.ts` | entity + composition + barrel                                                                                                               |
-| U4   | `src/server/**`                                                                         | `Server` entity over the router adapter, upgrade seam, `ConnectionInfo` injection, `discoverPort`, tuning knobs                             |
-| U5   | `tests/**`                                                                              | the four suites of §9 (lifecycle/seam/substrate/capstone)                                                                                   |
-| U6   | `guides/**`, parity                                                                     | `server.md` (one guide, kind-organized tables per the router precedent), manifest row, parity green                                         |
-| U7   | —                                                                                       | delete `old/`; verifier sweep; checker + opus reviewers; push                                                                               |
-
-Serial U0→U1→U2→U3→U4; U5 ∥ U6 after U4; U7 last. Same disjoint-ownership,
-deviation-report, independent-verification discipline as the router build.
-
-## 11. Open decisions (approval requested)
-
-1. **The middleware seam shape** (§5.1) — returning onion, single-`TState`
-   with published state slices, the bag doubling as the router's state.
-   This freezes the `@orkestrel/middleware` contract; approve deliberately.
-2. **Batteries all move to the middleware package** — this server ships zero
-   policy middleware (built-in boundary is lifecycle machinery, not
-   middleware). Alternative: bundle 2-3 starters (CORS, security headers)
-   here. Recommendation: as proposed — clean charters.
-3. **WebCrypto-async tokens** (accepting the async ripple; retiring
-   `safeCompare`). Alternative: sync `node:crypto` in the server face,
-   sacrificing core-first for tokens. Recommendation: as proposed.
-4. **`dispatcher` as a required option** (bring-your-own router) vs the server
-   constructing one from `routes`. Recommendation: required option — the
-   composition seam stays explicit, and the dispatcher remains independently
-   testable/introspectable.
-5. **`old/` deletion** in U7, per your standing instruction.
-
----
-
-## Appendix A — the `@orkestrel/middleware` roster (accounted for, not built)
-
-| Battery                                 | Layer                                   | State slice                         | Salvage source / invariants to preserve                                                                                                                                                                       |
-| --------------------------------------- | --------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createBoundary` (richer than built-in) | pure                                    | —                                   | old `createErrorBoundary`; expose/report semantics                                                                                                                                                            |
-| `createCors`                            | pure                                    | —                                   | `resolveOrigin`/`mergeVary`; **Vary on reflect, `null` never reflected**; must claim preflights BEFORE the dispatcher's auto-OPTIONS (ordering is load-bearing)                                               |
-| `createSecurity`                        | pure                                    | `RequestIdState`                    | hardened CSP defaults, COOP/CORP, opt-in COEP/HSTS; request-id charset                                                                                                                                        |
-| `createCompression`                     | pure (gzip/deflate) + node entry (`br`) | —                                   | negotiation via substrate; streaming/SSE bypass; skip HEAD/204/304/already-encoded                                                                                                                            |
-| `createETag`                            | pure                                    | —                                   | RFC 7232 weak comparison; GET+200 only; inner-of-compression composition                                                                                                                                      |
-| `createTokenGuard`                      | pure                                    | `TokenState`                        | 401 mapping; stash for the rate-limit key idiom                                                                                                                                                               |
-| `createRateLimiter`                     | pure                                    | reads `TokenState`/`ConnectionInfo` | `@orkestrel/budget` per key; check-before-consume; clock seam; capacity LRU; IPv6 `/64`; 429 + Retry-After short-circuit                                                                                      |
-| `createSession` / `createCookieSession` | pure                                    | `SessionState`                      | store seam (memory store ships; DB store deferred — no database sibling), transport seam (async reads — WebCrypto), control handle, **absoluteTtl**, regenerate anti-fixation                                 |
-| `createCSRFGuard`                       | pure                                    | reads `SessionState`                | **session-bound double-submit**; sessionless fallback documented weaker                                                                                                                                       |
-| `createBodyParser`                      | pure                                    | —                                   | drives the substrate `readBody` eagerly with its limit; 413/400 mapping                                                                                                                                       |
-| `createStatic`                          | node                                    | —                                   | traversal guard verbatim (decode → strip → resolve-under-root), reserved device names (CVE-2025-27210), dotfiles policy, SPA segment-boundary fallback, Range/206/416, weak file ETags                        |
-| `createMultipart`                       | node                                    | —                                   | streams `request.body` (NEVER `formData()` — it defeats the mid-stream DoS defense); random temp names; fail-closed cleanup on `request.signal`; sniff-authoritative magic bytes; `MultipartError` moves here |
-
-Ordering idioms to document in that package: boundary outermost → security →
-CORS (claims preflights) → compression → ETag (inner of compression) → token
-guard → rate limiter → body parser → sessions → CSRF.
+1. **The roster split into fifteen batteries** as cataloged — the original
+   twelve, with request-id folded inside `createSecurity` (as the old design
+   had it) rather than a separate battery.
+2. **The §4 modernization renames** (`createBearer`, `createLimiter`,
+   `createCSRF`, `createBody`, `ttl`/`lifetime`, `cache`, `identifier`) and
+   the **typed fixed state slices replacing `key?: string` options**.
+3. **The three new batteries**: `createForwarded` (explicit proxy trust — the
+   researched enterprise gap), `createDeadline` (app-level deadline, the
+   natural abort+timeout consumer), `createTelemetry` (timing seam, not a
+   logger). Each is cut cleanly if you'd rather stay at twelve.
+4. **`createSession` unification** — one factory + `cookieTransport`/
+   `headerTransport` helpers, replacing the old createSession/
+   createCookieSession pair.
+5. **Compression posture** — feature-detected `br`/`zstd` in the pure face
+   with a node-`zlib`-backed variant in the node face; BREACH documented with
+   `filter` as the opt-out.
+6. **Draft `RateLimit` header fields** behind `policy: false` (opt-in until
+   the IETF draft freezes); `Retry-After` always ships.
+7. **Repo timing** — this proposal moves to `orkestrel/middleware` when you
+   create it; nothing here blocks on that.
