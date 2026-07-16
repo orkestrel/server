@@ -1,7 +1,7 @@
 // The consumer-side guides-parity drop-in (PROPOSAL §6): runs `@orkestrel/guide`'s
-// checks against this repo's own `guides/README.md` manifest — one row (Router)
-// spanning the core/browser/server faces as a multi-dir `GuideModule` (AGENTS §22 —
-// one guide per package).
+// checks against this repo's own `guides/README.md` manifest — one row (Server)
+// over the single published `src/server` module (AGENTS §22 — one guide per
+// package).
 
 import { describe, expect, it } from 'vitest'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -22,7 +22,7 @@ import {
 
 const ROOT = fileURLToPath(new URL('../../../', import.meta.url))
 const WALK_DIRS = ['src', 'guides', 'tests']
-const SELF_SPECIFIERS = ['@orkestrel/server', '@src/core', '@src/server']
+const SELF_SPECIFIERS = ['@orkestrel/server', '@src/server']
 
 function walk(dir: string, acc: Record<string, string>): void {
 	for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
@@ -48,13 +48,10 @@ function readText(relative: string): string {
 
 const manifest = parseManifest(readText('guides/README.md'), 'guides')
 
-// Cross-face imports are real in this multi-face package (a listener.md fence imports
-// `createDispatcher` from `@src/core`, a navigator.md fence imports core registry types) —
-// so the fence-import check resolves each specifier to ITS OWN face's exports rather than
-// only the current manifest entry's, per the specifier → module map below.
+// This is now a single-surface package (§21 — no backwards-compat shims): every
+// self-specifier resolves to the one published `src/server` module.
 const SPECIFIER_MODULES: Readonly<Record<string, string>> = {
-	'@orkestrel/server': 'src/core',
-	'@src/core': 'src/core',
+	'@orkestrel/server': 'src/server',
 	'@src/server': 'src/server',
 }
 const specifierSources = new Map<string, ReturnType<typeof createSource>>()

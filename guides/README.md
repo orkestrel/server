@@ -5,15 +5,14 @@ directory (AGENTS §22).
 
 ## By concept
 
-| Concept | Spec                             | Source                                                   | Tests                                                                            |
-| ------- | -------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Server  | [`src/server.md`](src/server.md) | [`src/core`](../src/core), [`src/server`](../src/server) | [`tests/src/core`](../tests/src/core), [`tests/src/server`](../tests/src/server) |
+| Concept | Spec                             | Source                        | Tests                                     |
+| ------- | -------------------------------- | ----------------------------- | ----------------------------------------- |
+| Server  | [`src/server.md`](src/server.md) | [`src/server`](../src/server) | [`tests/src/server`](../tests/src/server) |
 
 ## By directory
 
 | Directory    | Guide                            |
 | ------------ | -------------------------------- |
-| `src/core`   | [`src/server.md`](src/server.md) |
 | `src/server` | [`src/server.md`](src/server.md) |
 
 ## Dependency reference

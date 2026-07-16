@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import type { MiddlewareContext } from '../../../src/core/types.js'
-import { Negotiator } from '../../../src/core/Negotiator.js'
-import { HTTPError } from '../../../src/core/errors.js'
+import type { MiddlewareContext } from '@src/server'
+import { HTTPError, Negotiator } from '@src/server'
 
-// §16 mirror of `src/core/Negotiator.ts` — the content-negotiation matrix
+// §16 mirror of `src/server/Negotiator.ts` — the content-negotiation matrix
 // (media-type precedence, wildcard, q-ties broken by server order, `406`
 // path, `format` dispatch).
 

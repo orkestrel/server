@@ -1,12 +1,43 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { ServerInterface } from '@src/server'
+import type { NegotiatorInterface, ServerInterface } from '@src/server'
 import { createDispatcher } from '@orkestrel/router'
-import { createServer } from '@src/server'
-import { Server } from '@src/server'
+import { createNegotiator, createServer, Negotiator, Server } from '@src/server'
 
-// §16 mirror of `src/server/factories.ts` — `createServer` round-trip
-// (instance satisfies the interface), option threading, and construction
-// guards firing through the factory (mirrors tests/src/core/factories.test.ts).
+// §16 mirror of `src/server/factories.ts` — `createNegotiator` round-trip
+// (instance satisfies the interface) plus its return-type assertion, and
+// `createServer` round-trip (instance satisfies the interface), option
+// threading, and construction guards firing through the factory.
+
+describe('createNegotiator — round-trip', () => {
+	it('returns a Negotiator instance implementing NegotiatorInterface', () => {
+		const negotiator = createNegotiator()
+		expect(negotiator).toBeInstanceOf(Negotiator)
+		const check: NegotiatorInterface = negotiator
+		expect(check).toBe(negotiator)
+	})
+
+	it('is independently usable — negotiate/encoding/language/format all work', async () => {
+		const negotiator = createNegotiator()
+		expect(negotiator.negotiate('text/html', ['text/html'])).toBe('text/html')
+		expect(negotiator.encoding('gzip', ['gzip'])).toBe('gzip')
+		expect(negotiator.language('en', ['en'])).toBe('en')
+		const response = await negotiator.format(
+			new Request('http://localhost/', { headers: { accept: 'text/plain' } }),
+			{
+				url: new URL('http://localhost/'),
+				method: 'GET',
+				state: undefined,
+				body: async () => undefined,
+			},
+			{ 'text/plain': () => new Response('ok') },
+		)
+		await expect(response.text()).resolves.toBe('ok')
+	})
+
+	it('returns NegotiatorInterface — a factory return type assertion', () => {
+		expectTypeOf(createNegotiator()).toEqualTypeOf<NegotiatorInterface>()
+	})
+})
 
 describe('createServer — round-trip', () => {
 	it('returns a Server instance implementing ServerInterface, idle and not yet started', () => {

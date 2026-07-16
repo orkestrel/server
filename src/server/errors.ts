@@ -36,7 +36,7 @@ import { HTTP_ERROR_BRAND } from './constants.js'
  *
  * @example
  * ```ts
- * import { HTTPError } from '@src/core'
+ * import { HTTPError } from '@src/server'
  *
  * const handler = async (request: Request): Promise<Response> => {
  * 	const user = await find(new URL(request.url).searchParams.get('id'))
@@ -73,7 +73,7 @@ export class HTTPError extends Error {
  *
  * @example
  * ```ts
- * import { ContentTooLargeError, isHTTPError } from '@src/core'
+ * import { ContentTooLargeError, isHTTPError } from '@src/server'
  *
  * try {
  * 	await readBody(request, { limit: 1024 })
@@ -108,7 +108,7 @@ export class ContentTooLargeError extends HTTPError {
  *
  * @example
  * ```ts
- * import { isHTTPError } from '@src/core'
+ * import { isHTTPError } from '@src/server'
  *
  * try {
  * 	await handle(request)

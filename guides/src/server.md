@@ -1,26 +1,25 @@
 # Server
 
-> This package's ONE guide, covering both faces (AGENTS §22 — one guide per
-> package): the pure, environment-agnostic core — the middleware seam
-> (`compose`, `MiddlewareContext`/`NextFunction`/`MiddlewareHandler`), the
-> `HTTPError` vocabulary, and the shared substrate (cookies, WebCrypto tokens,
-> content negotiation via `Negotiator`, ETag/Range, security primitives, SSE,
-> and the body pipeline) — and the deliberately node-bound server face: the
-> `Server` lifecycle entity binding `node:http` via `@orkestrel/router`'s
-> adapter helpers, the upgrade seam, connection-fact injection, and
-> `discoverPort`. The server **consumes** `@orkestrel/router` — routing,
-> matching, and dispatch are that package's, never re-implemented here (AGENTS
-> §21 "mechanism, never policy"). Source: [`src/core`](../../src/core),
-> [`src/server`](../../src/server). Surfaced through the `@orkestrel/server`
-> barrel (aliased `@src/core` / `@src/server` inside this repo).
+> This package's ONE guide (AGENTS §22 — one guide per package), covering its
+> single published surface: the middleware seam (`compose`,
+> `MiddlewareContext`/`NextFunction`/`MiddlewareHandler`), the `HTTPError`
+> vocabulary, the shared substrate (cookies, WebCrypto tokens, content
+> negotiation via `Negotiator`, ETag/Range, security primitives, SSE, and the
+> body pipeline), and the deliberately node-bound `Server` lifecycle entity
+> binding `node:http` via `@orkestrel/router`'s adapter helpers, the upgrade
+> seam, connection-fact injection, and `discoverPort`. The server
+> **consumes** `@orkestrel/router` — routing, matching, and dispatch are that
+> package's, never re-implemented here (AGENTS §21 "mechanism, never
+> policy"). Source: [`src/server`](../../src/server). Surfaced through the
+> `@orkestrel/server` barrel (aliased `@src/server` inside this repo).
 
 ## Surface
 
 Bring your own `@orkestrel/router` dispatcher, mount middleware, and start:
 
 ```ts
+import type { MiddlewareHandler } from '@src/server'
 import { createServer } from '@src/server'
-import type { MiddlewareHandler } from '@src/core'
 import { createDispatcher } from '@orkestrel/router'
 
 interface State {
@@ -205,7 +204,7 @@ resolves the actually-bound port; `stop` gracefully drains then closes;
 
 ## Contract
 
-These invariants hold across `src/core` / `src/server` ↔ `server.md`.
+These invariants hold across `src/server` ↔ `server.md`.
 
 1. **DOC ↔ SOURCE bijection.** Every `function` / `class` / `interface` /
    `type` / `const` row in the `## Surface` tables is a real export of its
@@ -337,8 +336,8 @@ stopping → stopped`; `start()` from `listening`/`starting`/`stopping`
 ### Quickstart: dispatcher, middleware, lifecycle
 
 ```ts
+import type { MiddlewareHandler } from '@src/server'
 import { createServer } from '@src/server'
-import type { MiddlewareHandler } from '@src/core'
 import { createDispatcher } from '@orkestrel/router'
 
 interface State {
@@ -372,8 +371,8 @@ dispatcher's own auto-`OPTIONS` responder ever sees it — mount it earliest in
 the array, ahead of anything that would short-circuit later.
 
 ```ts
+import type { MiddlewareHandler } from '@src/server'
 import { createServer } from '@src/server'
-import type { MiddlewareHandler } from '@src/core'
 import { createDispatcher } from '@orkestrel/router'
 
 interface State {
@@ -403,7 +402,7 @@ intersects the slices it mounts into one `TState` — no per-middleware generic
 accumulation.
 
 ```ts
-import type { MiddlewareHandler } from '@src/core'
+import type { MiddlewareHandler } from '@src/server'
 
 interface TokenState {
 	readonly userId?: string
@@ -419,7 +418,7 @@ const withUser: MiddlewareHandler<State> = async (_request, context, next) => ne
 ### SSE route
 
 ```ts
-import { openStream } from '@src/core'
+import { openStream } from '@src/server'
 
 function streamHandler(): Response {
 	const stream = openStream()
@@ -465,6 +464,7 @@ server.upgrade((_request, socket, _head) => {
 ### Substrate direct use — tokens, cookies, negotiation
 
 ```ts
+import type { MiddlewareContext } from '@src/server'
 import {
 	createNegotiator,
 	decodeTokenPayload,
@@ -473,8 +473,7 @@ import {
 	signToken,
 	verifyToken,
 	writeSignedCookie,
-} from '@src/core'
-import type { MiddlewareContext } from '@src/core'
+} from '@src/server'
 
 declare const context: MiddlewareContext<Record<string, never>>
 
@@ -524,27 +523,27 @@ await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression 
 
 ## Tests
 
-- [`tests/src/core/helpers.test.ts`](../../tests/src/core/helpers.test.ts) —
+- [`tests/src/server/helpers.test.ts`](../../tests/src/server/helpers.test.ts) —
   `compose` (outer-first ordering, double-`next` rejection, short-circuit,
   request substitution, response transformation), cookie parse/serialize/
-  attribute-injection guards, `resolveSecure`, `appendCookie`/`clearCookie`.
-- [`tests/src/core/Negotiator.test.ts`](../../tests/src/core/Negotiator.test.ts) —
+  attribute-injection guards, `resolveSecure`, `appendCookie`/`clearCookie`,
+  `isAddressInfo` narrowing, and `discoverPort` (default, preferred, and
+  taken-preferred-falls-back cases).
+- [`tests/src/server/Negotiator.test.ts`](../../tests/src/server/Negotiator.test.ts) —
   `negotiate`/`encoding`/`language`/`format`: exact vs subtype-wildcard vs
   any-range precedence, `;q=0` rejection semantics, q-tie server-order
   break, `format`'s 406 fallback and handler dispatch.
-- [`tests/src/core/errors.test.ts`](../../tests/src/core/errors.test.ts) —
+- [`tests/src/server/errors.test.ts`](../../tests/src/server/errors.test.ts) —
   `HTTPError`/`ContentTooLargeError` shape and `isHTTPError` narrowing.
-- [`tests/src/core/factories.test.ts`](../../tests/src/core/factories.test.ts) —
-  `createNegotiator` round-trip and factory return-type assertion.
+- [`tests/src/server/factories.test.ts`](../../tests/src/server/factories.test.ts) —
+  `createNegotiator` round-trip + factory return-type assertion, and
+  `createServer` round-trip, option threading, and construction guards.
 - [`tests/src/server/Server.test.ts`](../../tests/src/server/Server.test.ts) —
   the status matrix, restart-fresh-abort, `EADDRINUSE` honesty, host/port
   binds, ephemeral default, graceful-vs-forced drain, 20-parallel-none-
   dropped, connection facts threaded into state, `context.body()` caching,
   boundary mapping (`HTTPError`/other/`expose`), and the stop-signal-reaches-
   handlers case.
-- [`tests/src/server/helpers.test.ts`](../../tests/src/server/helpers.test.ts) —
-  `isAddressInfo` narrowing and `discoverPort` (default, preferred, and
-  taken-preferred-falls-back cases).
 
 ## See also
 

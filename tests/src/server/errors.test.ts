@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { HTTP_ERROR_BRAND } from '../../../src/core/constants.js'
-import { ContentTooLargeError, HTTPError, isHTTPError } from '../../../src/core/errors.js'
+import { ContentTooLargeError, HTTP_ERROR_BRAND, HTTPError, isHTTPError } from '@src/server'
 
 describe('HTTPError', () => {
 	it('carries the status and message', () => {

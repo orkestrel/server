@@ -3,10 +3,11 @@ import type { Duplex } from 'node:stream'
 import type { AbortInterface } from '@orkestrel/abort'
 import type { TimeoutInterface } from '@orkestrel/timeout'
 import type { EmitterInterface } from '@orkestrel/emitter'
-import type { MiddlewareContext, MiddlewareHandler } from '@src/core'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
 	ConnectionStateFunction,
+	MiddlewareContext,
+	MiddlewareHandler,
 	ServerEventMap,
 	ServerInterface,
 	ServerOptions,
@@ -14,24 +15,18 @@ import type {
 	UpgradeHandler,
 } from './types.js'
 import { createServer as createHTTPServer } from 'node:http'
-import {
-	compose,
-	DEFAULT_BODY_LIMIT,
-	DEFAULT_DRAIN_MS,
-	HTTPError,
-	isHTTPError,
-	readBody,
-} from '@src/core'
 import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
 import { isFiniteNumber, isFunction } from '@orkestrel/contract'
-import { isAddressInfo } from './helpers.js'
+import { compose, isAddressInfo, readBody } from './helpers.js'
+import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
+import { HTTPError, isHTTPError } from './errors.js'
 
 /**
- * The HTTP server facade — an observable `node:http` lifecycle composing the
- * `@src/core` middleware onion around a consumed `@orkestrel/router`
+ * The HTTP server facade — an observable `node:http` lifecycle composing this
+ * module's own middleware onion around a consumed `@orkestrel/router`
  * dispatcher.
  *
  * @typeParam TState - The consumer's opaque per-request state type
