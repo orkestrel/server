@@ -85,7 +85,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #drain: number
 	readonly #limit: number
 	readonly #expose: boolean
-	readonly #report: ((error: unknown) => void) | undefined
+	readonly #report: ((error: unknown, request?: { method: string; url: URL }) => void) | undefined
 	readonly #timeouts: {
 		readonly request?: number
 		readonly headers?: number
@@ -256,11 +256,17 @@ export class Server<TState> implements ServerInterface<TState> {
 			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
 			return
 		}
+		// Hoisted above the inner try (not block-scoped inside it) so the catch
+		// below can attach real request context to the `error` emit / `report`
+		// sink — and so `response` can be emitted with the same facts on either
+		// the success or the error path.
+		const method = raw.method
+		const url = new URL(raw.url)
+		const start = performance.now()
 		try {
 			const linked = linkSignal(raw.signal, this.#abort.signal)
 			const request = new Request(raw, { signal: linked })
-			const url = new URL(request.url)
-			this.#emitter.emit('request', request.method, url.pathname)
+			this.#emitter.emit('request', method, url.pathname)
 			const connection = {
 				ip: message.socket.remoteAddress,
 				encrypted: isEncryptedSocket(message.socket),
@@ -268,7 +274,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			let cached: Promise<unknown> | undefined
 			const context: MiddlewareContext<TState> = {
 				url,
-				method: request.method,
+				method,
 				state: this.#state(connection),
 				body: () => {
 					cached ??= readBody(request, { limit: this.#limit })
@@ -280,19 +286,31 @@ export class Server<TState> implements ServerInterface<TState> {
 			)
 			const result = await runner(request, context)
 			await this.#respond(result, response)
+			this.#emitter.emit('response', {
+				method,
+				pathname: url.pathname,
+				status: result.status,
+				ms: Math.round(performance.now() - start),
+			})
 		} catch (error) {
 			const mapped = this.#boundary(error)
 			if (!isHTTPError(error)) {
-				this.#emitter.emit('error', error)
+				this.#emitter.emit('error', error, { method, url })
 				if (this.#report !== undefined) {
 					try {
-						this.#report(error)
+						this.#report(error, { method, url })
 					} catch {
 						// Swallowed — reporting can never crash the response.
 					}
 				}
 			}
 			await this.#respond(mapped, response)
+			this.#emitter.emit('response', {
+				method,
+				pathname: url.pathname,
+				status: mapped.status,
+				ms: Math.round(performance.now() - start),
+			})
 		}
 	}
 

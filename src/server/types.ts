@@ -36,18 +36,32 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
  * - `upgrade` — a raw protocol-upgrade fan-out settled; carries the original
  *   `IncomingMessage` and whether a registered {@link UpgradeHandler} claimed it.
  * - `error` — a server-level fault: an escaping throw past the built-in
- *   boundary, an upgrade handler's throw, or a listen failure.
+ *   boundary, an upgrade handler's throw, or a listen failure. Carries the
+ *   originating request's method + parsed `url` when the fault happened on
+ *   the per-request path; `undefined` for an upgrade-handler throw (no fetch
+ *   `Request` exists on that path — only a raw `IncomingMessage`) or a listen
+ *   failure.
  * - `stop` — `stop()` began (status just moved to `'stopping'`).
  * - `drain` — the graceful drain settled (deadline hit or all finished);
  *   carries the still-pending request count (`0` on a clean drain).
+ * - `response` — fired after the response has been sent, for every request
+ *   that reaches the middleware pipeline (the success path and the
+ *   outer-boundary error path); carries the method, parsed pathname, final
+ *   status, and elapsed time in milliseconds. A request rejected at the
+ *   `buildRequest` INNER boundary (a plain `400`, e.g. a malformed `Host`
+ *   header) emits no `response` — no parsed `Request` exists yet to derive
+ *   its facts from.
  */
 export type ServerEventMap = {
 	readonly start: readonly [port: number]
 	readonly request: readonly [method: string, pathname: string]
 	readonly upgrade: readonly [request: IncomingMessage, handled: boolean]
-	readonly error: readonly [error: unknown]
+	readonly error: readonly [error: unknown, request?: { method: string; url: URL }]
 	readonly stop: readonly []
 	readonly drain: readonly [pending: number]
+	readonly response: readonly [
+		event: { method: string; pathname: string; status: number; ms: number },
+	]
 }
 
 /**
@@ -110,8 +124,10 @@ export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TS
  *   500 response body (an `HTTPError`'s own message is always client-facing).
  *   Defaults to `false`.
  * @param report - A fire-and-forget sink the built-in boundary hands every
- *   caught error to (logging / metrics); its own throw is swallowed so
- *   reporting can never crash the response.
+ *   caught error to (logging / metrics), along with the originating
+ *   request's method + parsed `url` when one is available (absent on an
+ *   upgrade-path fault); its own throw is swallowed so reporting can never
+ *   crash the response.
  * @param timeouts - `node:http` tuning knobs: `request` (max time to fully
  *   receive + respond, `requestTimeout`), `headers` (max time to receive the
  *   request headers, `headersTimeout`), `keepalive` (idle keep-alive socket
@@ -131,7 +147,7 @@ export interface ServerOptions<TState> {
 	readonly drain?: number
 	readonly limit?: number
 	readonly expose?: boolean
-	readonly report?: (error: unknown) => void
+	readonly report?: (error: unknown, request?: { method: string; url: URL }) => void
 	readonly timeouts?: {
 		readonly request?: number
 		readonly headers?: number

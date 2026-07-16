@@ -534,6 +534,102 @@ describe('Server — lifecycle + emit safety', () => {
 	})
 })
 
+describe('Server — response event', () => {
+	it('fires exactly once per request with method/pathname/status and a non-negative ms, on success', async () => {
+		const responses = createRecorder<
+			readonly [
+				{
+					readonly method: string
+					readonly pathname: string
+					readonly status: number
+					readonly ms: number
+				},
+			]
+		>()
+		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const response = await fetch(`http://127.0.0.1:${port}/ping`)
+		expect(response.status).toBe(200)
+		expect(responses.count).toBe(1)
+		const event = responses.calls[0]?.[0]
+		expect(event?.method).toBe('GET')
+		expect(event?.pathname).toBe('/ping')
+		expect(event?.status).toBe(200)
+		expect(event?.ms).toBeGreaterThanOrEqual(0)
+	})
+
+	it('fires exactly once per request on the error/boundary path too, with the mapped status', async () => {
+		const responses = createRecorder<
+			readonly [
+				{
+					readonly method: string
+					readonly pathname: string
+					readonly status: number
+					readonly ms: number
+				},
+			]
+		>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/boom',
+			handler: () => {
+				throw new Error('boundary boom')
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined }))
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const response = await fetch(`http://127.0.0.1:${port}/boom`)
+		expect(response.status).toBe(500)
+		expect(responses.count).toBe(1)
+		const event = responses.calls[0]?.[0]
+		expect(event?.method).toBe('GET')
+		expect(event?.pathname).toBe('/boom')
+		expect(event?.status).toBe(500)
+		expect(event?.ms).toBeGreaterThanOrEqual(0)
+	})
+})
+
+describe('Server — error/report request context', () => {
+	it('a non-HTTPError throw carries { method, url } to both the error event and the report sink', async () => {
+		const errors =
+			createRecorder<
+				readonly [unknown, { readonly method: string; readonly url: URL } | undefined]
+			>()
+		const reports =
+			createRecorder<
+				readonly [unknown, { readonly method: string; readonly url: URL } | undefined]
+			>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/boom',
+			handler: () => {
+				throw new Error('context boom')
+			},
+		})
+		const server = track(
+			createServer({ dispatcher, state: () => undefined, report: reports.handler }),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const response = await fetch(`http://127.0.0.1:${port}/boom`)
+		expect(response.status).toBe(500)
+		expect(errors.count).toBe(1)
+		expect(reports.count).toBe(1)
+		const errorRequest = errors.calls[0]?.[1]
+		expect(errorRequest?.method).toBe('GET')
+		expect(errorRequest?.url).toBeInstanceOf(URL)
+		expect(errorRequest?.url.pathname).toBe('/boom')
+		const reportRequest = reports.calls[0]?.[1]
+		expect(reportRequest?.method).toBe('GET')
+		expect(reportRequest?.url).toBeInstanceOf(URL)
+		expect(reportRequest?.url.pathname).toBe('/boom')
+	})
+})
+
 describe('Server — upgrade seam', () => {
 	it('fans a raw upgrade out to a handler that claims the socket', async () => {
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
