@@ -11,6 +11,21 @@ import type { Encoding } from './types.js'
 /** Default graceful-stop deadline (ms) the server gives in-flight requests on `stop()`. */
 export const DEFAULT_DRAIN_MS = 10_000
 
+/**
+ * The `Symbol.for`-keyed brand `HTTPError` carries so `isHTTPError` recognizes
+ * an instance thrown by ANOTHER copy of this package (the dual-package
+ * hazard — a version-skewed or workspace-linked duplicate install), where
+ * `instanceof` alone fails because the two copies' `HTTPError` constructors
+ * are distinct objects.
+ *
+ * @remarks
+ * `Symbol.for` interns the symbol on the GLOBAL symbol registry, so every
+ * copy of this package that evaluates this key resolves the SAME symbol
+ * instance — unlike a locally-scoped `Symbol()`, which would mint a fresh,
+ * unequal symbol per copy and defeat the whole point of a cross-copy brand.
+ */
+export const HTTP_ERROR_BRAND = Symbol.for('@orkestrel/server.HTTPError')
+
 /** Default maximum request body size (bytes) `readBody` accepts before a 413. */
 export const DEFAULT_BODY_LIMIT = 1_048_576
 

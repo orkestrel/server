@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { HTTP_ERROR_BRAND } from '../../../src/core/constants.js'
 import { ContentTooLargeError, HTTPError, isHTTPError } from '../../../src/core/errors.js'
 
 describe('HTTPError', () => {
@@ -54,5 +55,30 @@ describe('isHTTPError', () => {
 		expect(isHTTPError(null)).toBe(false)
 		expect(isHTTPError('HTTPError')).toBe(false)
 		expect(isHTTPError({ status: 404, message: 'not found' })).toBe(false)
+	})
+
+	it('rejects a status carried WITHOUT the cross-copy brand', () => {
+		const lookAlike = new Error('not found')
+		Object.assign(lookAlike, { status: 404 })
+		expect(isHTTPError(lookAlike)).toBe(false)
+	})
+
+	it('narrows a structurally-complete instance from a foreign package copy', () => {
+		// Simulates the dual-package hazard: an object carrying the
+		// `Symbol.for`-interned brand but NOT constructed by THIS copy's
+		// `HTTPError` (so `instanceof` would fail across copies).
+		const foreign: unknown = Object.assign(
+			{},
+			{ [HTTP_ERROR_BRAND]: true, status: 401, message: 'unauthorized' },
+		)
+		expect(isHTTPError(foreign)).toBe(true)
+	})
+
+	it('narrows a foreign-copy clone of an HTTPError subclass', () => {
+		const foreignSubclass: unknown = Object.assign(
+			{},
+			{ [HTTP_ERROR_BRAND]: true, status: 413, message: 'too large', name: 'ContentTooLargeError' },
+		)
+		expect(isHTTPError(foreignSubclass)).toBe(true)
 	})
 })
