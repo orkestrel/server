@@ -1,6 +1,6 @@
 {
 	"name": "@orkestrel/server",
-	"version": "0.0.5",
+	"version": "0.0.6",
 	"description": "A typed HTTP server for the @orkestrel line — composes the @orkestrel/router dispatcher behind a managed lifecycle. Part of the @orkestrel line.",
 	"keywords": [
 		"fetch",
@@ -64,7 +64,7 @@
 	},
 	"dependencies": {
 		"@orkestrel/abort": "^0.0.2",
-		"@orkestrel/contract": "^0.0.2",
+		"@orkestrel/contract": "^0.0.3",
 		"@orkestrel/emitter": "^0.0.2",
 		"@orkestrel/router": "^0.0.3",
 		"@orkestrel/timeout": "^0.0.2"
