@@ -63,15 +63,15 @@
 		"prepublishOnly": "npm run format:check && npm run lint:check && npm run check && npm run build && npm test"
 	},
 	"dependencies": {
-		"@orkestrel/abort": "^0.0.2",
-		"@orkestrel/contract": "^0.0.3",
-		"@orkestrel/emitter": "^0.0.2",
-		"@orkestrel/router": "^0.0.3",
-		"@orkestrel/timeout": "^0.0.2"
+		"@orkestrel/abort": "^0.0.3",
+		"@orkestrel/contract": "^0.0.5",
+		"@orkestrel/emitter": "^0.0.3",
+		"@orkestrel/router": "^0.0.4",
+		"@orkestrel/timeout": "^0.0.3"
 	},
 	"devDependencies": {
 		"@microsoft/api-extractor": "^7.58.11",
-		"@orkestrel/guide": "^0.0.2",
+		"@orkestrel/guide": "^0.0.5",
 		"@types/node": "^26.1.1",
 		"@vitest/browser-playwright": "^4.1.10",
 		"oxfmt": "^0.59.0",
