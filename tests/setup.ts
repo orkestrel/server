@@ -67,3 +67,9 @@ export function createRecorder<TArgs extends readonly unknown[]>(): TestRecorder
 export function waitForDelay(ms = 0): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms))
 }
+
+/** Whether a repository-relative Vue SFC path belongs to the private browser application. */
+export function isBrowserVuePath(path: string): boolean {
+	const normalized = path.replaceAll('\\', '/')
+	return normalized.startsWith('app/browser/')
+}

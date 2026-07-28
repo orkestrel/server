@@ -6,7 +6,6 @@ import type {
 	Encoding,
 	MiddlewareContext,
 	MiddlewareHandler,
-	NextFunction,
 	RangeSpec,
 	SSEMessage,
 	StreamInterface,
@@ -14,6 +13,7 @@ import type {
 	TokenOptions,
 	TokenSecret,
 } from './types.js'
+import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { isNumber, isRecord, isString, parseJSON } from '@orkestrel/contract'
 import {
@@ -71,19 +71,44 @@ export function compose<TState>(
 	middleware: readonly MiddlewareHandler<TState>[],
 	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
+	return middleware.reduceRight<
+		(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
+	>((next, layer) => wrapMiddleware(layer, next), terminal)
+}
+
+/**
+ * Wrap one middleware layer around its downstream handler.
+ *
+ * @remarks
+ * The returned handler enforces the one-call `next` invariant while preserving
+ * request substitution and the middleware's synchronous or asynchronous result.
+ *
+ * @typeParam TState - The consumer's opaque per-request state type
+ * @param layer - The middleware layer to invoke
+ * @param next - The downstream handler wrapped by `layer`
+ * @returns A handler with `layer` composed around `next`
+ *
+ * @example
+ * ```ts
+ * const handle = wrapMiddleware(
+ * 	async (_request, _context, next) => next(),
+ * 	async () => new Response('ok'),
+ * )
+ * ```
+ */
+export function wrapMiddleware<TState>(
+	layer: MiddlewareHandler<TState>,
+	next: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
+): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return async (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
-		const dispatch = (index: number, currentRequest: Request): Promise<Response> => {
-			const layer = middleware[index]
-			if (layer === undefined) return terminal(currentRequest, context)
-			let called = false
-			const next: NextFunction = (nextRequest?: Request): Promise<Response> => {
+		let called = false
+		return Promise.resolve(
+			layer(request, context, (nextRequest?: Request): Promise<Response> => {
 				if (called) return Promise.reject(new Error('next() was already called by this middleware'))
 				called = true
-				return dispatch(index + 1, nextRequest ?? currentRequest)
-			}
-			return Promise.resolve(layer(currentRequest, context, next))
-		}
-		return dispatch(0, request)
+				return next(nextRequest ?? request, context)
+			}),
+		)
 	}
 }
 
@@ -936,7 +961,9 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	if (header === undefined) return undefined
 	const match = /^bytes=(.*)$/.exec(header.trim())
 	if (match === null) return undefined
-	const spec = match[1].trim()
+	const capture = match[1]
+	if (capture === undefined) return undefined
+	const spec = capture.trim()
 	if (spec.includes(',')) return undefined
 	const dash = spec.indexOf('-')
 	if (dash < 0) return undefined
@@ -1104,8 +1131,12 @@ export function ipv6Network(address: string): string | undefined {
 	const bare = percent === -1 ? address : address.slice(0, percent)
 	const halves = bare.split('::')
 	if (halves.length > 2) return undefined
-	const head = halves[0] === '' ? [] : halves[0].split(':')
-	const tail = halves.length === 2 ? (halves[1] === '' ? [] : halves[1].split(':')) : []
+	const first = halves[0]
+	if (first === undefined) return undefined
+	const second = halves[1]
+	if (halves.length === 2 && second === undefined) return undefined
+	const head = first === '' ? [] : first.split(':')
+	const tail = second === undefined || second === '' ? [] : second.split(':')
 	let groups: string[]
 	if (halves.length === 2) {
 		const missing = 8 - head.length - tail.length
@@ -1182,6 +1213,34 @@ export function serializeEvent(message: SSEMessage): string {
 }
 
 /**
+ * Enqueue encoded text into an open byte stream.
+ *
+ * @param controller - The stream controller, when the stream has started
+ * @param encoder - The encoder used for the stream's byte representation
+ * @param closed - Whether the stream has already ended or been cancelled
+ * @param text - The text to encode and enqueue
+ * @returns Nothing
+ *
+ * @example
+ * ```ts
+ * const body = new ReadableStream<Uint8Array>({
+ * 	start(controller) {
+ * 		enqueueStreamText(controller, new TextEncoder(), false, 'hello')
+ * 	},
+ * })
+ * ```
+ */
+export function enqueueStreamText(
+	controller: ReadableStreamDefaultController<Uint8Array> | undefined,
+	encoder: TextEncoder,
+	closed: boolean,
+	text: string,
+): void {
+	if (closed || controller === undefined) return
+	controller.enqueue(encoder.encode(text))
+}
+
+/**
  * Open a generic Server-Sent-Events stream — a fetch-standard `Response`
  * whose body is a `ReadableStream` a caller writes {@link SSEMessage}s into.
  *
@@ -1220,20 +1279,16 @@ export function openStream(options?: StreamOptions): StreamInterface {
 	})
 	const headers = new Headers({ ...SSE_HEADERS, ...options?.headers })
 	const response = new Response(body, { status: options?.status ?? 200, headers })
-	const enqueue = (text: string): void => {
-		if (closed || controller === undefined) return
-		controller.enqueue(encoder.encode(text))
-	}
 	return {
 		response,
 		get closed(): boolean {
 			return closed
 		},
 		write(message: SSEMessage): void {
-			enqueue(serializeEvent(message))
+			enqueueStreamText(controller, encoder, closed, serializeEvent(message))
 		},
 		comment(text: string): void {
-			enqueue(`: ${text}\n\n`)
+			enqueueStreamText(controller, encoder, closed, `: ${text}\n\n`)
 		},
 		end(): void {
 			if (closed) return
@@ -1531,6 +1586,30 @@ export function isAddressInfo(value: unknown): value is AddressInfo {
 }
 
 /**
+ * Bind and close a throwaway TCP server to resolve one available port.
+ *
+ * @param port - The requested port, with `0` selecting an ephemeral port
+ * @returns The bound port after the probe server has closed
+ *
+ * @example
+ * ```ts
+ * const port = await probePort(0)
+ * ```
+ */
+export async function probePort(port: number): Promise<number> {
+	const probe = createNetServer()
+	const listening = once(probe, 'listening')
+	probe.listen(port)
+	await listening
+	const address = probe.address()
+	const resolved = isAddressInfo(address) ? address.port : 0
+	const closed = once(probe, 'close')
+	probe.close()
+	await closed
+	return resolved
+}
+
+/**
  * Find a FREE TCP port — bind a throwaway `node:net` server, read the
  * OS-assigned port, close it, and resolve that port.
  *
@@ -1555,23 +1634,13 @@ export function isAddressInfo(value: unknown): value is AddressInfo {
  * const port = await discoverPort() // a guaranteed-free ephemeral port
  * ```
  */
-export function discoverPort(preferred?: number): Promise<number> {
-	return new Promise<number>((resolve, reject) => {
-		const bind = (port: number, fallback: boolean): void => {
-			const probe = createNetServer()
-			const onError = (error: Error): void => {
-				probe.close()
-				const taken = 'code' in error && error.code === 'EADDRINUSE'
-				if (fallback && taken) bind(0, false)
-				else reject(error)
-			}
-			probe.once('error', onError)
-			probe.listen(port, () => {
-				const address = probe.address()
-				const resolved = isAddressInfo(address) ? address.port : 0
-				probe.close(() => resolve(resolved))
-			})
-		}
-		bind(preferred ?? 0, preferred !== undefined)
-	})
+export async function discoverPort(preferred?: number): Promise<number> {
+	if (preferred === undefined) return probePort(0)
+	try {
+		return await probePort(preferred)
+	} catch (error) {
+		if (error instanceof Error && 'code' in error && error.code === 'EADDRINUSE')
+			return probePort(0)
+		throw error
+	}
 }

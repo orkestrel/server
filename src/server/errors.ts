@@ -57,7 +57,7 @@ export class HTTPError extends Error {
 		super(message)
 		this.name = 'HTTPError'
 		this.status = status
-		this.context = context
+		if (context !== undefined) this.context = context
 	}
 }
 

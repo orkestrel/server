@@ -14,6 +14,7 @@ import type {
 	ServerStatus,
 	UpgradeHandler,
 } from './types.js'
+import { once } from 'node:events'
 import { createServer as createHTTPServer } from 'node:http'
 import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout } from '@orkestrel/timeout'
@@ -88,10 +89,10 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 	#http: NodeHTTPServer | undefined
 	#abort: AbortInterface = createAbort()
+	#wakeup: AbortInterface = createAbort()
 	#status: ServerStatus = 'idle'
 	#port: number | undefined
 	#pending = 0
-	#waiters: (() => void)[] = []
 
 	constructor(options: ServerOptions<TState>) {
 		if (!isFunction(options.state)) throw new TypeError('ServerOptions.state must be a function')
@@ -125,7 +126,10 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#expose = options.expose ?? false
 		this.#report = options.report
 		this.#timeouts = timeouts
-		this.#emitter = new Emitter<ServerEventMap>({ on: options.on, error: options.error })
+		this.#emitter = new Emitter<ServerEventMap>({
+			...(options.on === undefined ? {} : { on: options.on }),
+			...(options.error === undefined ? {} : { error: options.error }),
+		})
 	}
 
 	get status(): ServerStatus {
@@ -170,25 +174,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		// no manual removal needed (the same per-run lifecycle as the handler above).
 		server.on('upgrade', (request, socket, head) => this.#onUpgrade(request, socket, head))
 		this.#http = server
-		return new Promise<number>((resolve, reject) => {
-			const onError = (error: Error): void => {
-				server.off('listening', onListening)
-				this.#http = undefined
-				this.#status = 'idle'
-				reject(error)
-			}
-			const onListening = (): void => {
-				server.off('error', onError)
-				const port = this.#resolvePort(server)
-				this.#port = port
-				this.#status = 'listening'
-				this.#emitter.emit('start', port)
-				resolve(port)
-			}
-			server.once('error', onError)
-			server.once('listening', onListening)
-			server.listen(this.#configuredPort ?? 0, this.#host)
-		})
+		return this.#listen(server)
 	}
 
 	async stop(): Promise<void> {
@@ -262,19 +248,16 @@ export class Server<TState> implements ServerInterface<TState> {
 			const linked = linkSignal(raw.signal, this.#abort.signal)
 			const request = new Request(raw, { signal: linked })
 			this.#emitter.emit('request', method, url.pathname)
+			const ip = message.socket.remoteAddress
 			const connection = {
-				ip: message.socket.remoteAddress,
+				...(ip === undefined ? {} : { ip }),
 				encrypted: isEncryptedSocket(message.socket),
 			}
-			let cached: Promise<unknown> | undefined
 			const context: MiddlewareContext<TState> = {
 				url,
 				method,
 				state: this.#state(connection),
-				body: () => {
-					cached ??= readBody(request, { limit: this.#limit })
-					return cached
-				},
+				body: this.#createBody(request),
 			}
 			const runner = compose(this.#middleware, (currentRequest, currentContext) =>
 				this.#dispatcher.handle(currentRequest, currentContext.state),
@@ -358,6 +341,31 @@ export class Server<TState> implements ServerInterface<TState> {
 		return 0
 	}
 
+	async #listen(server: NodeHTTPServer): Promise<number> {
+		try {
+			const listening = once(server, 'listening')
+			server.listen(this.#configuredPort ?? 0, this.#host)
+			await listening
+		} catch (error) {
+			this.#http = undefined
+			this.#status = 'idle'
+			throw error
+		}
+		const port = this.#resolvePort(server)
+		this.#port = port
+		this.#status = 'listening'
+		this.#emitter.emit('start', port)
+		return port
+	}
+
+	#createBody(request: Request): () => Promise<unknown> {
+		let cached: Promise<unknown> | undefined
+		return () => {
+			cached ??= readBody(request, { limit: this.#limit })
+			return cached
+		}
+	}
+
 	// Close the underlying server, resolving once it stops accepting
 	// connections. A keep-alive client leaves its socket IDLE after a
 	// response, which would hang a plain `close()` — so idle sockets are
@@ -373,34 +381,24 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Track one in-flight request; returns an idempotent finish thunk. When
-	// the last in-flight request finishes, every parked drain waiter is woken
-	// — event-driven, never a busy-loop.
+	// the last in-flight request finishes, the current drain wakeup fires —
+	// event-driven, never a busy-loop.
 	#trackStart(): () => void {
+		if (this.#pending === 0) this.#wakeup = createAbort()
 		this.#pending += 1
 		let finished = false
 		return () => {
 			if (finished) return
 			finished = true
 			this.#pending -= 1
-			if (this.#pending === 0) {
-				const waiters = this.#waiters
-				this.#waiters = []
-				for (const wake of waiters) wake()
-			}
+			if (this.#pending === 0) this.#wakeup.abort()
 		}
 	}
 
 	// Park until the in-flight count reaches zero OR `signal` fires —
 	// event-driven (wake-park), no polling.
-	#drainPending(signal: AbortSignal): Promise<void> {
-		if (this.#pending === 0 || signal.aborted) return Promise.resolve()
-		return new Promise<void>((resolve) => {
-			const onDone = (): void => {
-				signal.removeEventListener('abort', onDone)
-				resolve()
-			}
-			this.#waiters.push(onDone)
-			signal.addEventListener('abort', onDone, { once: true })
-		})
+	async #drainPending(signal: AbortSignal): Promise<void> {
+		if (this.#pending === 0 || signal.aborted) return
+		await once(AbortSignal.any([signal, this.#wakeup.signal]), 'abort')
 	}
 }

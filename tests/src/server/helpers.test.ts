@@ -403,6 +403,7 @@ describe('writeSignedCookie / readSignedCookie', () => {
 		await writeSignedCookie(headers, 'session', 'user-1', 'shh')
 		const cookieHeader = headers.get('set-cookie') ?? ''
 		const nameValue = cookieHeader.split(';')[0]
+		if (nameValue === undefined) throw new Error('expected a signed cookie header')
 		const request = new Request('http://localhost/', { headers: { cookie: nameValue } })
 		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBe('user-1')
 	})
