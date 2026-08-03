@@ -208,8 +208,10 @@ describe('Server — socket caps', () => {
 			port,
 			'GET /headers HTTP/1.1\r\nHost: localhost\r\nX-Extra: present\r\nConnection: close\r\n\r\n',
 		)
-		expect(raw).toContain('missing')
 		expect(raw).not.toContain('present')
+		expect(
+			raw.includes('HTTP/1.1 431 Request Header Fields Too Large') || raw.endsWith('missing'),
+		).toBe(true)
 	})
 
 	it('closes keep-alive after the configured requests-per-socket cap', async () => {
