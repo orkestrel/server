@@ -1,6 +1,6 @@
 {
 	"name": "@orkestrel/server",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"description": "A typed HTTP server for the @orkestrel line — composes the @orkestrel/router dispatcher behind a managed lifecycle. Part of the @orkestrel line.",
 	"keywords": [
 		"fetch",
@@ -67,17 +67,17 @@
 		"@orkestrel/abort": "^0.0.4",
 		"@orkestrel/contract": "^0.0.9",
 		"@orkestrel/emitter": "^0.0.5",
-		"@orkestrel/router": "^0.0.7",
+		"@orkestrel/router": "^0.0.8",
 		"@orkestrel/timeout": "^0.0.4"
 	},
 	"devDependencies": {
 		"@microsoft/api-extractor": "^7.58.12",
 		"@orkestrel/guide": "^0.0.8",
-		"@orkestrel/scaffold": "^0.0.16",
+		"@orkestrel/scaffold": "^0.0.18",
 		"@types/node": "^26.1.2",
 		"@vitest/browser-playwright": "^4.1.10",
-		"oxfmt": "^0.61.0",
-		"oxlint": "^1.76.0",
+		"oxfmt": "^0.62.0",
+		"oxlint": "^1.77.0",
 		"typescript": "^6.0.3",
 		"vite": "^8.2.0",
 		"vite-plugin-dts": "^5.0.3",

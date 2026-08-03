@@ -43,8 +43,8 @@ descriptions never enter agent instruction context.
 | @orkestrel/indexeddb  | 0.0.6   |
 | @orkestrel/interpret  | 0.0.7   |
 | @orkestrel/markdown   | 0.0.7   |
-| @orkestrel/mcp        | 0.0.9   |
-| @orkestrel/middleware | 0.0.6   |
+| @orkestrel/mcp        | 0.0.10  |
+| @orkestrel/middleware | 0.0.7   |
 | @orkestrel/msg        | 0.0.5   |
 | @orkestrel/ndjson     | 0.0.5   |
 | @orkestrel/ollama     | 0.0.8   |
@@ -55,19 +55,19 @@ descriptions never enter agent instruction context.
 | @orkestrel/rater      | 0.0.8   |
 | @orkestrel/reason     | 0.0.4   |
 | @orkestrel/relation   | 0.0.7   |
-| @orkestrel/router     | 0.0.7   |
-| @orkestrel/scaffold   | 0.0.16  |
+| @orkestrel/router     | 0.0.8   |
+| @orkestrel/scaffold   | 0.0.18  |
 | @orkestrel/sea        | 0.0.4   |
-| @orkestrel/server     | 0.0.7   |
+| @orkestrel/server     | 0.0.8   |
 | @orkestrel/sqlite     | 0.0.6   |
 | @orkestrel/sse        | 0.0.4   |
 | @orkestrel/template   | 0.0.2   |
 | @orkestrel/terminal   | 0.0.5   |
 | @orkestrel/timeout    | 0.0.4   |
-| @orkestrel/tool       | 0.0.8   |
+| @orkestrel/tool       | 0.0.9   |
 | @orkestrel/toolbox    | 0.0.2   |
 | @orkestrel/websocket  | 0.0.7   |
-| @orkestrel/worker     | 0.0.5   |
+| @orkestrel/worker     | 0.0.6   |
 | @orkestrel/workflow   | 0.0.9   |
 | @orkestrel/workspace  | 0.0.2   |
 
