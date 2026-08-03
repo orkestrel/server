@@ -48,9 +48,9 @@ import { HTTPError, isHTTPError } from './errors.js'
  *   `close`); a `Request` is built via the router's `buildRequest`, its
  *   `signal` LINKED to this run's stop signal via `@orkestrel/abort`'s
  *   `linkSignal` (a fresh `Request` is constructed with the linked signal —
- *   `buildRequest`'s own abort, tied to client disconnect, composes with the
- *   server's stop signal via `AbortSignal.any`, so a handler awaiting
- *   `request.signal` observes BOTH); `context.state` is built via
+ *   `buildRequest`'s own abort, armed by BOTH request-side and response-side
+ *   teardown, composes with the server's stop signal via `AbortSignal.any`,
+ *   so a handler awaiting `request.signal` observes BOTH); `context.state` is built via
  *   {@link ServerOptions.state} from the connection facts; the composed
  *   middleware onion runs, terminating in `dispatcher.handle`; the result is
  *   written back via `sendResponse`.
@@ -250,7 +250,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	async #accept(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		let raw: Request
 		try {
-			raw = buildRequest(message)
+			raw = buildRequest(message, { response })
 		} catch {
 			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
 			return

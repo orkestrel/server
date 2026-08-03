@@ -2,6 +2,8 @@ import type { IncomingMessage } from 'node:http'
 import type { Duplex } from 'node:stream'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type { ConnectionStateFunction, ServerInterface, ServerOptions } from '@src/server'
+import { once } from 'node:events'
+import http from 'node:http'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, HTTPError, openStream } from '@src/server'
@@ -340,6 +342,47 @@ describe('Server — the stop signal reaches handlers', () => {
 		await inflight
 		await stopping
 	})
+})
+
+describe('Server — the client disconnect signal reaches streaming handlers', () => {
+	it('aborts an idle streaming handler when the client destroys its response socket', async () => {
+		const aborted = Promise.withResolvers<void>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/events',
+			handler: (request) => {
+				const stream = openStream()
+				request.signal.addEventListener('abort', () => aborted.resolve(), { once: true })
+				stream.write({ data: 'ready' })
+				void aborted.promise.then(() => stream.end())
+				return stream.response
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const port = await server.start()
+		const connected = Promise.withResolvers<IncomingMessage>()
+		const client = http.get(`http://127.0.0.1:${port}/events`, (response) =>
+			connected.resolve(response),
+		)
+		client.on('error', (error) => connected.reject(error))
+		const response = await connected.promise
+		response.on('error', () => undefined)
+		try {
+			await once(response, 'data')
+			response.socket.destroy()
+			// A real TCP teardown crosses Node's response-close boundary asynchronously;
+			// bound the proof so a missing disconnect binding fails instead of hanging.
+			const observed = await Promise.race([
+				aborted.promise.then(() => true),
+				waitForDelay(2_000).then(() => false),
+			])
+			expect(observed).toBe(true)
+		} finally {
+			response.destroy()
+			client.destroy()
+		}
+	}, 10_000)
 })
 
 describe('Server — setup-phase crash safety (built-in boundary encloses per-request setup)', () => {
