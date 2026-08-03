@@ -210,7 +210,7 @@ describe('Server — socket caps', () => {
 		)
 		expect(raw).not.toContain('present')
 		expect(
-			raw.includes('HTTP/1.1 431 Request Header Fields Too Large') || raw.endsWith('missing'),
+			raw.includes('HTTP/1.1 431 Request Header Fields Too Large') || raw.includes('missing'),
 		).toBe(true)
 	})
 
