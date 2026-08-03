@@ -14,13 +14,13 @@ import type {
 	ServerStatus,
 	UpgradeHandler,
 } from './types.js'
-import { once } from 'node:events'
+import { addAbortListener, once } from 'node:events'
 import { createServer as createHTTPServer } from 'node:http'
 import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { isFiniteNumber, isFunction } from '@orkestrel/contract'
+import { isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
 import { compose, isAddressInfo, readBody } from './helpers.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
 import { HTTPError, isHTTPError } from './errors.js'
@@ -33,14 +33,17 @@ import { HTTPError, isHTTPError } from './errors.js'
  * @typeParam TState - The consumer's opaque per-request state type
  *
  * @remarks
- * - **Lifecycle (AGENTS §10).** `start()` builds the underlying `node:http`
+ * - **Lifecycle (AGENTS §10).** `start(signal?)` builds the underlying `node:http`
  *   server, binds the configured {@link ServerOptions.host} / {@link
  *   ServerOptions.port} (omitted/`0` port ⇒ EPHEMERAL, resolved from the
- *   bound address), and transitions `idle → starting → listening`. `stop()`
- *   transitions to `stopping`: refuses new connections, fires a fresh-per-run
- *   stop signal so in-flight handlers observe cancellation, drains up to the
- *   `drain` deadline (event-driven, no busy-loop), then closes → `stopped`.
- *   `destroy()` is the idempotent final teardown.
+ *   bound address), observes caller cancellation plus the configured
+ *   `timeouts.start` deadline while the bind is pending, and transitions
+ *   `idle → starting → listening`. A cancelled or expired bind closes its
+ *   partial server and resets to `idle` for another start. `stop()` transitions
+ *   to `stopping`: refuses new connections, fires a fresh-per-run stop signal
+ *   so in-flight handlers observe cancellation, drains up to the `drain`
+ *   deadline (event-driven, no busy-loop), then closes → `stopped`. `destroy()`
+ *   is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built via the router's `buildRequest`, its
  *   `signal` LINKED to this run's stop signal via `@orkestrel/abort`'s
@@ -83,9 +86,15 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #expose: boolean
 	readonly #report: ((error: unknown, request?: { method: string; url: URL }) => void) | undefined
 	readonly #timeouts: {
+		readonly start?: number
 		readonly request?: number
 		readonly headers?: number
 		readonly keepalive?: number
+	}
+	readonly #sockets: {
+		readonly connections?: number
+		readonly headers?: number
+		readonly requests?: number
 	}
 	#http: NodeHTTPServer | undefined
 	#abort: AbortInterface = createAbort()
@@ -116,6 +125,11 @@ export class Server<TState> implements ServerInterface<TState> {
 		) {
 			throw new TypeError('ServerOptions.timeouts.headers must not exceed timeouts.keepalive')
 		}
+		const sockets = options.sockets ?? {}
+		for (const [name, value] of Object.entries(sockets)) {
+			if (value !== undefined && (!isInteger(value) || value < 0))
+				throw new TypeError(`ServerOptions.sockets.${name} must be a non-negative integer`)
+		}
 		this.#dispatcher = options.dispatcher
 		this.#state = options.state
 		this.#middleware = options.middleware === undefined ? [] : [...options.middleware]
@@ -126,6 +140,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#expose = options.expose ?? false
 		this.#report = options.report
 		this.#timeouts = timeouts
+		this.#sockets = sockets
 		this.#emitter = new Emitter<ServerEventMap>({
 			...(options.on === undefined ? {} : { on: options.on }),
 			...(options.error === undefined ? {} : { error: options.error }),
@@ -159,7 +174,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#upgradeHandlers.push(handler)
 	}
 
-	start(): Promise<number> {
+	start(signal?: AbortSignal): Promise<number> {
 		if (this.#status !== 'idle' && this.#status !== 'stopped') {
 			return Promise.reject(new Error(`server cannot start from '${this.#status}'`))
 		}
@@ -170,11 +185,14 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#timeouts.request !== undefined) server.requestTimeout = this.#timeouts.request
 		if (this.#timeouts.headers !== undefined) server.headersTimeout = this.#timeouts.headers
 		if (this.#timeouts.keepalive !== undefined) server.keepAliveTimeout = this.#timeouts.keepalive
+		if (this.#sockets.connections !== undefined) server.maxConnections = this.#sockets.connections
+		if (this.#sockets.headers !== undefined) server.maxHeadersCount = this.#sockets.headers
+		if (this.#sockets.requests !== undefined) server.maxRequestsPerSocket = this.#sockets.requests
 		// Bound to THIS run's server instance, discarded with it on stop/restart —
 		// no manual removal needed (the same per-run lifecycle as the handler above).
 		server.on('upgrade', (request, socket, head) => this.#onUpgrade(request, socket, head))
 		this.#http = server
-		return this.#listen(server)
+		return this.#listen(server, signal)
 	}
 
 	async stop(): Promise<void> {
@@ -341,15 +359,55 @@ export class Server<TState> implements ServerInterface<TState> {
 		return 0
 	}
 
-	async #listen(server: NodeHTTPServer): Promise<number> {
+	async #listen(server: NodeHTTPServer, signal?: AbortSignal): Promise<number> {
+		const deadline =
+			this.#timeouts.start === undefined ? undefined : createTimeout({ ms: this.#timeouts.start })
+		const startup = deadline === undefined ? signal : linkSignal(deadline.signal, signal)
+		const binding = createAbort()
+		const relay =
+			startup === undefined
+				? undefined
+				: addAbortListener(startup, () => binding.abort(startup.reason))
+		let listening: Promise<unknown[]> | undefined
 		try {
-			const listening = once(server, 'listening')
-			server.listen(this.#configuredPort ?? 0, this.#host)
+			signal?.throwIfAborted()
+			deadline?.start()
+			if (deadline?.ms === 0 && startup !== undefined) await once(startup, 'abort')
+			startup?.throwIfAborted()
+			listening = once(server, 'listening', { signal: binding.signal })
+			if (startup === undefined) server.listen(this.#configuredPort ?? 0, this.#host)
+			else {
+				server.listen({
+					port: this.#configuredPort ?? 0,
+					...(this.#host === undefined ? {} : { host: this.#host }),
+					signal: binding.signal,
+				})
+			}
 			await listening
 		} catch (error) {
+			const expired = deadline?.expired === true
+			const cancelled = startup?.aborted === true
+			// A cancellation removes `events.once`'s temporary error listener. Keep
+			// the discarded server guarded while a simultaneous late bind error
+			// settles so it cannot escape as an uncaught process error.
+			server.on('error', () => undefined)
+			binding.abort(error)
+			if (listening !== undefined) await listening.catch(() => undefined)
+			await this.#close(server, true)
 			this.#http = undefined
+			this.#port = undefined
 			this.#status = 'idle'
+			if (expired && deadline !== undefined) {
+				throw new DOMException(
+					`Server startup exceeded ${deadline.ms} milliseconds`,
+					'TimeoutError',
+				)
+			}
+			if (cancelled && startup !== undefined) throw startup.reason
 			throw error
+		} finally {
+			relay?.[Symbol.dispose]()
+			deadline?.clear()
 		}
 		const port = this.#resolvePort(server)
 		this.#port = port

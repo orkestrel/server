@@ -533,11 +533,20 @@ export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TS
  *   request's method + parsed `url` when one is available (absent on an
  *   upgrade-path fault); its own throw is swallowed so reporting can never
  *   crash the response.
- * @param timeouts - `node:http` tuning knobs: `request` (max time to fully
- *   receive + respond, `requestTimeout`), `headers` (max time to receive the
- *   request headers, `headersTimeout`), `keepalive` (idle keep-alive socket
- *   timeout, `keepAliveTimeout`). `headers` must not exceed `keepalive` (the
- *   Slowloris footgun) — construction throws a `TypeError` otherwise.
+ * @param timeouts - Lifecycle and `node:http` tuning knobs: `start` (maximum
+ *   time to bind the listener; `0` permits no startup window), `request` (max
+ *   time to fully receive + respond, `requestTimeout`), `headers` (max time
+ *   to receive the request headers, `headersTimeout`), and `keepalive` (idle
+ *   keep-alive socket timeout, `keepAliveTimeout`). `headers` must not exceed
+ *   `keepalive` (the Slowloris footgun) — construction throws a `TypeError`
+ *   otherwise. Every present value must be a non-negative finite number. A
+ *   startup expiry rejects with a `DOMException` named `TimeoutError`; caller
+ *   cancellation rejects with the caller signal's `reason`.
+ * @param sockets - `node:http` socket caps: `connections` maps to
+ *   `maxConnections` (`0` rejects every incoming connection), `headers` maps
+ *   to `maxHeadersCount` (`0` disables the limit), and `requests` maps to
+ *   `maxRequestsPerSocket` (`0` disables the limit). Every present value must
+ *   be a non-negative integer. Omitted leaves preserve node's defaults.
  * @param on - The reserved {@link EmitterHooks} for {@link ServerEventMap}
  *   (AGENTS §8), wiring initial lifecycle listeners at construction.
  * @param error - The emitter's listener-error handler (AGENTS §13) — a
@@ -554,9 +563,15 @@ export interface ServerOptions<TState> {
 	readonly expose?: boolean
 	readonly report?: (error: unknown, request?: { method: string; url: URL }) => void
 	readonly timeouts?: {
+		readonly start?: number
 		readonly request?: number
 		readonly headers?: number
 		readonly keepalive?: number
+	}
+	readonly sockets?: {
+		readonly connections?: number
+		readonly headers?: number
+		readonly requests?: number
 	}
 	readonly on?: EmitterHooks<ServerEventMap>
 	readonly error?: EmitterErrorHandler
@@ -571,18 +586,19 @@ export interface ServerOptions<TState> {
  *
  * @remarks
  * `use` adds middleware and `upgrade` registers a protocol-upgrade claimant,
- * both configurable before or after `start()`. `start()` binds the configured
- * `host`/`port` (an omitted/`0` port ⇒ an EPHEMERAL port, resolved from the
- * bound address) and resolves the actually-bound port. `stop()` refuses new
+ * both configurable before or after `start()`. `start(signal?)` binds the
+ * configured `host`/`port` (an omitted/`0` port ⇒ an EPHEMERAL port, resolved
+ * from the bound address), observes caller cancellation plus `timeouts.start`
+ * while binding, and resolves the actually-bound port. A cancelled or expired
+ * bind closes its partial server and resets to `idle`. `stop()` refuses new
  * connections, fires the stop signal so in-flight handlers can observe it,
  * drains up to the configured deadline, then closes. `destroy()` is the final
  * idempotent teardown. Per request: a `Request` is built via the router's
- * `buildRequest` (its signal linked to the server's stop signal), the
- * composed middleware onion runs terminating in `dispatcher.handle`, and the
- * result is written back via `sendResponse` — every escaping throw is caught
- * by the built-in boundary (`HTTPError` → its status; anything else → a
- * hidden-unless-`expose` `500`) so a handler error can never crash the
- * process.
+ * `buildRequest` (its signal linked to the server's stop signal), the composed
+ * middleware onion runs terminating in `dispatcher.handle`, and the result is
+ * written back via `sendResponse` — every escaping throw is caught by the
+ * built-in boundary (`HTTPError` → its status; anything else → a
+ * hidden-unless-`expose` `500`) so a handler error can never crash the process.
  */
 export interface ServerInterface<TState> {
 	readonly id: string
@@ -593,7 +609,14 @@ export interface ServerInterface<TState> {
 	use(middleware: MiddlewareHandler<TState>): void
 	use(middleware: readonly MiddlewareHandler<TState>[]): void
 	upgrade(handler: UpgradeHandler): void
-	start(): Promise<number>
+	/**
+	 * Bind the configured listener and resolve its actually-bound port.
+	 *
+	 * @param signal - Optional caller cancellation observed only while startup
+	 *   is pending; aborting after this method resolves does not stop the server.
+	 * @returns The actually-bound TCP port
+	 */
+	start(signal?: AbortSignal): Promise<number>
 	stop(): Promise<void>
 	destroy(): Promise<void>
 }

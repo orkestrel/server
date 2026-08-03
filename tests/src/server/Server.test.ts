@@ -6,7 +6,7 @@ import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, HTTPError, openStream } from '@src/server'
 import { createRecorder, waitForDelay } from '../../setup.js'
-import { rawRequest, upgradeRequest } from '../../setupServer.js'
+import { probeConnectionDrop, rawRequest, upgradeRequest } from '../../setupServer.js'
 
 // src/server/Server.ts — the lifecycle facade over REAL node:http (no mocks,
 // the node src:server project). Routing outcomes themselves are the router's
@@ -70,6 +70,22 @@ describe('Server — lifecycle', () => {
 		expect(server.status).toBe('listening')
 	})
 
+	it('starts cleanly within its configured deadline and ignores caller abort after binding', async () => {
+		const controller = new AbortController()
+		const server = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				timeouts: { start: 500 },
+			}),
+		)
+		const port = await server.start(controller.signal)
+		controller.abort()
+		const response = await fetch(`http://127.0.0.1:${port}/ping`)
+		expect(response.status).toBe(200)
+		expect(await response.text()).toBe('pong')
+	})
+
 	it('destroy is idempotent and leaves the server stopped', async () => {
 		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
 		await server.start()
@@ -98,6 +114,118 @@ describe('Server — construction guards', () => {
 		expect(() =>
 			createServer({ dispatcher: pingDispatcher(), state: () => undefined, limit: -1 }),
 		).toThrow(TypeError)
+	})
+
+	it('throws when startup timeout or socket caps violate their numeric contracts', () => {
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				timeouts: { start: -1 },
+			}),
+		).toThrow(TypeError)
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				sockets: { connections: 1.5 },
+			}),
+		).toThrow(TypeError)
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				sockets: { headers: Number.NaN },
+			}),
+		).toThrow(TypeError)
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				sockets: { requests: -1 },
+			}),
+		).toThrow(TypeError)
+	})
+})
+
+describe('Server — bounded cancellable startup', () => {
+	it('cancels a pending bind from the caller signal and remains restartable', async () => {
+		const controller = new AbortController()
+		const reason = new Error('cancel startup')
+		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const starting = server.start(controller.signal)
+		controller.abort(reason)
+		await expect(starting).rejects.toBe(reason)
+		expect(server.status).toBe('idle')
+		expect(server.port).toBeUndefined()
+		const retryController = new AbortController()
+		const retryReason = new Error('cancel retry')
+		const restarting = server.start(retryController.signal)
+		retryController.abort(retryReason)
+		await expect(restarting).rejects.toBe(retryReason)
+		expect(server.status).toBe('idle')
+	})
+
+	it('times out a zero-window bind and leaves the lifecycle able to start again', async () => {
+		const server = createServer({
+			dispatcher: pingDispatcher(),
+			state: () => undefined,
+			timeouts: { start: 0 },
+		})
+		await expect(server.start()).rejects.toMatchObject({ name: 'TimeoutError' })
+		expect(server.status).toBe('idle')
+		expect(server.port).toBeUndefined()
+		await expect(server.start()).rejects.toMatchObject({ name: 'TimeoutError' })
+		expect(server.status).toBe('idle')
+	})
+})
+
+describe('Server — socket caps', () => {
+	it('applies the connection cap before bind', async () => {
+		const server = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				sockets: { connections: 0 },
+			}),
+		)
+		const port = await server.start()
+		await expect(probeConnectionDrop(port)).resolves.toBe(true)
+	})
+
+	it('limits parsed incoming headers', async () => {
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/headers',
+			handler: (request) => new Response(request.headers.get('x-extra') ?? 'missing'),
+		})
+		const server = track(
+			createServer({ dispatcher, state: () => undefined, sockets: { headers: 1 } }),
+		)
+		const port = await server.start()
+		const raw = await rawRequest(
+			port,
+			'GET /headers HTTP/1.1\r\nHost: localhost\r\nX-Extra: present\r\nConnection: close\r\n\r\n',
+		)
+		expect(raw).toContain('missing')
+		expect(raw).not.toContain('present')
+	})
+
+	it('closes keep-alive after the configured requests-per-socket cap', async () => {
+		const server = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				sockets: { requests: 1 },
+			}),
+		)
+		const port = await server.start()
+		const raw = await rawRequest(
+			port,
+			'GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n',
+		)
+		expect(raw).toMatch(/\r\nConnection: close\r\n/i)
 	})
 })
 
@@ -792,6 +920,9 @@ describe('ServerOptions<TState> / ServerInterface<TState> — TState flow', () =
 		expectTypeOf<ServerInterface<undefined>['use']>().toBeFunction()
 		expectTypeOf<ServerInterface<undefined>['upgrade']>().toBeFunction()
 		expectTypeOf<ServerInterface<undefined>['start']>().returns.toEqualTypeOf<Promise<number>>()
+		expectTypeOf<ServerInterface<undefined>['start']>().toEqualTypeOf<
+			(signal?: AbortSignal) => Promise<number>
+		>()
 		expectTypeOf<ServerInterface<undefined>['stop']>().returns.toEqualTypeOf<Promise<void>>()
 		expectTypeOf<ServerInterface<undefined>['destroy']>().returns.toEqualTypeOf<Promise<void>>()
 	})

@@ -1,4 +1,5 @@
 import type { AddressInfo } from 'node:net'
+import { once } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath, URL } from 'node:url'
@@ -139,6 +140,33 @@ export function rawRequest(port: number, raw: string): Promise<string> {
 		socket.on('close', () => resolve(data))
 		socket.on('error', reject)
 	})
+}
+
+/**
+ * Probe whether a real TCP connection is dropped before it can carry data.
+ *
+ * @remarks
+ * Connects to `127.0.0.1:port` and observes the socket directly. A close or
+ * connection error before `ms` is a drop; a connection that remains open
+ * through the observation window is not. The socket is always destroyed
+ * before resolution.
+ *
+ * @param port - The target server's bound port
+ * @param ms - Maximum observation window in milliseconds
+ * @returns Whether the server dropped the connection within the window
+ */
+export async function probeConnectionDrop(port: number, ms = 500): Promise<boolean> {
+	const socket = net.createConnection({ port, host: '127.0.0.1' })
+	const signal = AbortSignal.timeout(ms)
+	try {
+		await once(socket, 'connect', { signal })
+		await once(socket, 'close', { signal })
+		return true
+	} catch {
+		return socket.destroyed && !signal.aborted
+	} finally {
+		socket.destroy()
+	}
 }
 
 export function upgradeRequest(
