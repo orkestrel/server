@@ -142,6 +142,63 @@ export function rawRequest(port: number, raw: string): Promise<string> {
 	})
 }
 
+/** A real HTTP response socket whose readable side starts paused. */
+export interface PausedResponseInterface {
+	/** Resolves when the peer closes the response connection. */
+	readonly closed: Promise<void>
+	/** Raw response bytes delivered to userland after the socket is resumed. */
+	readonly bytes: number
+	/** Resume reading response bytes from the TCP socket. */
+	resume(): void
+	/** Tear down the socket, including while it is still paused. */
+	destroy(): void
+}
+
+/**
+ * Open a real HTTP request over TCP while parking the response reader.
+ *
+ * @remarks
+ * Connects to `127.0.0.1`, pauses the socket's readable side before sending
+ * the request, and asks the server to close the connection after the response.
+ * This creates a protocol-faithful slow consumer without replacing either the
+ * project server or Node's socket behavior. Call `resume()` to release the
+ * receive pressure and `destroy()` during cleanup.
+ *
+ * @param port - The target server's bound port
+ * @param path - The request path, defaulting to `/`
+ * @returns The paused response handle
+ */
+export async function openPausedResponse(
+	port: number,
+	path = '/',
+): Promise<PausedResponseInterface> {
+	const socket = net.createConnection({ port, host: '127.0.0.1' })
+	const closed = Promise.withResolvers<void>()
+	let bytes = 0
+	socket.on('data', (chunk: Buffer) => {
+		bytes += chunk.byteLength
+	})
+	socket.once('close', () => closed.resolve())
+	socket.once('error', (error) => closed.reject(error))
+	await once(socket, 'connect')
+	socket.pause()
+	socket.write(
+		`GET ${path} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n`,
+	)
+	return {
+		closed: closed.promise,
+		get bytes(): number {
+			return bytes
+		},
+		resume(): void {
+			socket.resume()
+		},
+		destroy(): void {
+			socket.destroy()
+		},
+	}
+}
+
 /**
  * Probe whether a real TCP connection is dropped before it can carry data.
  *

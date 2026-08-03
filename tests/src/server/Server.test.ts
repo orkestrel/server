@@ -6,7 +6,12 @@ import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, HTTPError, openStream } from '@src/server'
 import { createRecorder, waitForDelay } from '../../setup.js'
-import { probeConnectionDrop, rawRequest, upgradeRequest } from '../../setupServer.js'
+import {
+	openPausedResponse,
+	probeConnectionDrop,
+	rawRequest,
+	upgradeRequest,
+} from '../../setupServer.js'
 
 // src/server/Server.ts — the lifecycle facade over REAL node:http (no mocks,
 // the node src:server project). Routing outcomes themselves are the router's
@@ -893,6 +898,121 @@ describe('Server — upgrade seam', () => {
 		expect(upgrades.count).toBe(1)
 		expect(upgrades.calls[0]?.[1]).toBe(false)
 	})
+})
+
+// Saturating a real kernel TCP send buffer takes seconds; the explicit timeouts below
+// cover that physical fill time, not slowness in the code under test.
+describe('Server — stream backpressure', () => {
+	it('parks a cooperative producer on a real slow TCP consumer and resumes after drain', async () => {
+		const parked = Promise.withResolvers<{ readonly bytes: number; readonly writes: number }>()
+		const resumed = Promise.withResolvers<void>()
+		const finished = Promise.withResolvers<void>()
+		let active: Promise<void> | undefined
+		let sustained: Promise<void> | undefined
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/events',
+			handler: () => {
+				const stream = openStream()
+				void waitForDelay(10).then(async () => {
+					const payload = 'x'.repeat(65_536)
+					let bytes = 0
+					let flowing = false
+					let writes = 0
+					try {
+						for (let index = 0; index < 1_024; index += 1) {
+							const ready = stream.write({ data: payload })
+							writes += 1
+							bytes += payload.length + 8
+							if (ready) {
+								flowing = true
+								continue
+							}
+							const draining = stream.drain()
+							active = draining
+							if (flowing) {
+								void waitForDelay(50).then(() => {
+									if (active !== draining) return
+									sustained = draining
+									parked.resolve({ bytes, writes })
+								})
+							}
+							await draining
+							flowing = true
+							if (active === draining) active = undefined
+							if (sustained === draining) {
+								resumed.resolve()
+								break
+							}
+						}
+					} finally {
+						stream.end()
+						finished.resolve()
+					}
+				})
+				return stream.response
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const port = await server.start()
+		const client = await openPausedResponse(port, '/events')
+		try {
+			const outcome = await Promise.race([
+				parked.promise.then(() => 'parked'),
+				finished.promise.then(() => 'finished'),
+			])
+			expect(outcome).toBe('parked')
+			if (outcome !== 'parked') return
+			const snapshot = await parked.promise
+			expect(snapshot.writes).toBeGreaterThan(1)
+			expect(snapshot.bytes).toBeLessThan(16_777_216)
+			expect(client.bytes).toBe(0)
+			client.resume()
+			await resumed.promise
+			await finished.promise
+			await client.closed
+			expect(client.bytes).toBeGreaterThan(snapshot.bytes)
+		} finally {
+			client.destroy()
+		}
+	}, 30_000)
+
+	it('preserves unconditional enqueue behavior when the producer ignores readiness', async () => {
+		const produced = Promise.withResolvers<{
+			readonly bytes: number
+			readonly unavailable: number
+		}>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/events',
+			handler: () => {
+				const stream = openStream()
+				const payload = 'y'.repeat(32_768)
+				let unavailable = 0
+				for (let index = 0; index < 32; index += 1) {
+					if (!stream.write({ data: payload })) unavailable += 1
+				}
+				stream.end()
+				produced.resolve({ bytes: 32 * (payload.length + 8), unavailable })
+				return stream.response
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const port = await server.start()
+		const client = await openPausedResponse(port, '/events')
+		try {
+			const snapshot = await produced.promise
+			expect(snapshot.unavailable).toBeGreaterThan(0)
+			expect(client.bytes).toBe(0)
+			client.resume()
+			await client.closed
+			expect(client.bytes).toBeGreaterThan(snapshot.bytes)
+		} finally {
+			client.destroy()
+		}
+	}, 30_000)
 })
 
 // ── Type-level: ServerOptions / ServerInterface TState flow ──────────────────

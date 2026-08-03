@@ -334,10 +334,23 @@ export interface StreamOptions {
  * SSEMessage}), so any streaming consumer maps its own events onto `write`.
  * `response` is the `Response` to return from the route handler (its body is
  * the `ReadableStream` this handle writes into). Each `write` serializes the
- * message to the wire and enqueues it; `comment` writes a `: text` keep-alive
- * line (ignored by a conforming SSE parser — no spurious event); `end` closes
- * the stream. Every method is a SAFE NO-OP once `closed` is `true`, so a late
+ * message to the wire, enqueues it, and reports whether that process-local
+ * queue still has capacity; a producer that receives `false` parks on
+ * `drain()` before writing again. `comment` writes a `: text` keep-alive line
+ * (ignored by a conforming SSE parser — no spurious event); `end` closes the
+ * stream. Every method is a SAFE NO-OP once `closed` is `true`, so a late
  * `write` never throws.
+ *
+ * The readiness signal is deliberately local: it reflects the
+ * `ReadableStream` controller's queue, not proof that a remote peer consumed
+ * bytes. With a drain-honoring response pump, that queue stops draining while
+ * the process-local socket sink is backpressured, so a cooperative producer
+ * can bound its contribution to transport buffering without polling. A caller
+ * that ignores the boolean keeps the prior unconditional-enqueue behavior.
+ * The stream's default strategy measures queued CHUNKS, not their byte length,
+ * so a producer seeking a byte bound must also bound each individual message.
+ * Return `response` before awaiting a `false` write: the consumer cannot pull
+ * until it receives the response.
  */
 export interface StreamInterface {
 	/** The streaming `Response` to return from the route handler. */
@@ -345,17 +358,30 @@ export interface StreamInterface {
 	/** Whether the underlying stream is done (ended, or the consumer disconnected). */
 	readonly closed: boolean
 	/**
-	 * Serialize + enqueue one {@link SSEMessage} to the wire (a no-op once `closed`).
+	 * Serialize + enqueue one {@link SSEMessage} to the wire.
 	 *
 	 * @param message - The event to send (its `data` split on `\n` into `data:` lines)
+	 * @returns `true` when the process-local stream queue has capacity after
+	 *   accepting the event; `false` when the queue is full or the stream is
+	 *   closed. A `false` event was still accepted unless `closed` was already
+	 *   `true`; await {@link drain} before producing another event.
 	 */
-	write(message: SSEMessage): void
+	write(message: SSEMessage): boolean
 	/**
 	 * Write a `: text` SSE comment line — a keep-alive a conforming parser ignores.
 	 *
 	 * @param text - The comment text (sent after the `: ` prefix)
 	 */
 	comment(text: string): void
+	/**
+	 * Park until the process-local stream queue has capacity again.
+	 *
+	 * @returns A promise that resolves when a consumer pull restores positive
+	 *   desired size, or immediately when capacity is already available or the
+	 *   stream is closed. The wakeup is event-driven; it does not poll and does
+	 *   not prove that a remote peer consumed the queued bytes.
+	 */
+	drain(): Promise<void>
 	/** End the stream, completing the response (a no-op once already `closed`). */
 	end(): void
 }

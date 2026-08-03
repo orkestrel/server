@@ -1248,11 +1248,24 @@ export function enqueueStreamText(
  * Builds the `Response` immediately with {@link import('./constants.js').SSE_HEADERS}
  * merged under any `options.headers` (a seam-owned key is never overridden),
  * at `options.status` (default `200`). The returned {@link StreamInterface}'s
- * `write` serializes one message ({@link serializeEvent}) and enqueues it;
+ * `write` serializes one message ({@link serializeEvent}), enqueues it, and
+ * returns whether the controller still has positive desired size. A producer
+ * receiving `false` can await `drain()`; its event-driven promise resolves on
+ * the next consumer pull that restores capacity, or on stream closure.
  * `comment` writes a `: text` keep-alive line a conforming parser ignores;
  * `end` closes the stream. Every method is a SAFE NO-OP once `closed` (ended
  * by `end()`, or the consumer cancelled the stream), so a late write never
  * throws.
+ *
+ * This readiness reflects only the process-local `ReadableStream` queue — it
+ * is not proof that a remote peer consumed bytes. When the response pump
+ * honors its socket sink's drain state, socket pressure stops body pulls and
+ * therefore keeps this queue full, allowing a cooperative producer to bound
+ * buffering. Ignoring the return value preserves the prior unconditional-
+ * enqueue behavior. The default stream strategy counts chunks rather than
+ * their byte length, so a byte-bounded producer must also cap each message.
+ * Return `response` before awaiting a `false` write, because the consumer
+ * cannot pull until it receives the response.
  *
  * @param options - Optional `status` + extra `headers`; see {@link StreamOptions}
  * @returns The {@link StreamInterface} handle
@@ -1260,8 +1273,10 @@ export function enqueueStreamText(
  * @example
  * ```ts
  * const stream = openStream()
- * stream.write({ event: 'token', data: 'hello' })
- * stream.end()
+ * void Promise.resolve().then(async () => {
+ * 	if (!stream.write({ event: 'token', data: 'hello' })) await stream.drain()
+ * 	stream.end()
+ * })
  * // return stream.response from the route handler
  * ```
  */
@@ -1269,12 +1284,20 @@ export function openStream(options?: StreamOptions): StreamInterface {
 	const encoder = new TextEncoder()
 	let closed = false
 	let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+	let wakeup: PromiseWithResolvers<void> | undefined
 	const body = new ReadableStream<Uint8Array>({
 		start(streamController) {
 			controller = streamController
 		},
+		pull(streamController) {
+			if (streamController.desiredSize === null || streamController.desiredSize <= 0) return
+			wakeup?.resolve()
+			wakeup = undefined
+		},
 		cancel() {
 			closed = true
+			wakeup?.resolve()
+			wakeup = undefined
 		},
 	})
 	const headers = new Headers({ ...SSE_HEADERS, ...options?.headers })
@@ -1284,16 +1307,28 @@ export function openStream(options?: StreamOptions): StreamInterface {
 		get closed(): boolean {
 			return closed
 		},
-		write(message: SSEMessage): void {
+		write(message: SSEMessage): boolean {
+			if (closed || controller === undefined) return false
 			enqueueStreamText(controller, encoder, closed, serializeEvent(message))
+			return controller.desiredSize !== null && controller.desiredSize > 0
 		},
 		comment(text: string): void {
 			enqueueStreamText(controller, encoder, closed, `: ${text}\n\n`)
+		},
+		drain(): Promise<void> {
+			const desired = controller?.desiredSize
+			if (closed || (desired !== undefined && desired !== null && desired > 0)) {
+				return Promise.resolve()
+			}
+			wakeup ??= Promise.withResolvers<void>()
+			return wakeup.promise
 		},
 		end(): void {
 			if (closed) return
 			closed = true
 			controller?.close()
+			wakeup?.resolve()
+			wakeup = undefined
 		},
 	}
 }

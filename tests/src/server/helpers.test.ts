@@ -5,6 +5,7 @@ import type {
 	MiddlewareContext,
 	MiddlewareHandler,
 	NextFunction,
+	StreamInterface,
 } from '@src/server'
 import { createDispatcher } from '@orkestrel/router'
 import {
@@ -844,6 +845,11 @@ describe('serializeEvent', () => {
 })
 
 describe('openStream', () => {
+	it('exposes boolean write readiness and an asynchronous drain wakeup', () => {
+		expectTypeOf<StreamInterface['write']>().returns.toEqualTypeOf<boolean>()
+		expectTypeOf<StreamInterface['drain']>().returns.toEqualTypeOf<Promise<void>>()
+	})
+
 	it('opens a Response with the SSE headers', () => {
 		const stream = openStream()
 		expect(stream.response.headers.get('content-type')).toContain('text/event-stream')
@@ -854,17 +860,48 @@ describe('openStream', () => {
 		const stream = openStream()
 		stream.end()
 		expect(stream.closed).toBe(true)
-		expect(() => stream.write({ data: 'late' })).not.toThrow()
+		expect(stream.write({ data: 'late' })).toBe(false)
 		expect(() => stream.comment('late')).not.toThrow()
+		await expect(stream.drain()).resolves.toBeUndefined()
 		expect(() => stream.end()).not.toThrow()
 	})
 
-	it('round-trips written events onto the response body', async () => {
+	it('keeps accepting events when a caller ignores the readiness signal', async () => {
 		const stream = openStream()
-		stream.write({ event: 'token', data: 'hi' })
+		expect(stream.write({ event: 'token', data: 'first' })).toBe(false)
+		expect(stream.write({ event: 'token', data: 'second' })).toBe(false)
 		stream.end()
 		const text = await new Response(stream.response.body).text()
-		expect(text).toBe('event: token\ndata: hi\n\n')
+		expect(text).toBe('event: token\ndata: first\n\nevent: token\ndata: second\n\n')
+	})
+
+	it('parks at the stream high-water mark and wakes on the next consumer pull', async () => {
+		const stream = openStream()
+		expect(stream.write({ data: 'queued' })).toBe(false)
+		let drained = false
+		const draining = stream.drain().then(() => {
+			drained = true
+		})
+		await Promise.resolve()
+		expect(drained).toBe(false)
+		const body = stream.response.body
+		expect(body).not.toBeNull()
+		if (body === null) return
+		const reader = body.getReader()
+		const first = await reader.read()
+		await draining
+		expect(drained).toBe(true)
+		expect(new TextDecoder().decode(first.value)).toBe('data: queued\n\n')
+		stream.end()
+		await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
+	})
+
+	it('settles a parked producer when the stream ends', async () => {
+		const stream = openStream()
+		expect(stream.write({ data: 'queued' })).toBe(false)
+		const draining = stream.drain()
+		stream.end()
+		await expect(draining).resolves.toBeUndefined()
 	})
 
 	it('flips closed and becomes a safe no-op when the CONSUMER cancels the stream', async () => {
@@ -875,7 +912,8 @@ describe('openStream', () => {
 		const reader = body.getReader()
 		await reader.cancel()
 		expect(stream.closed).toBe(true)
-		expect(() => stream.write({ data: 'after-cancel' })).not.toThrow()
+		expect(stream.write({ data: 'after-cancel' })).toBe(false)
+		await expect(stream.drain()).resolves.toBeUndefined()
 	})
 })
 
