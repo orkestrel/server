@@ -11,8 +11,8 @@
 > tolerant percent-decoding, and the `answers` native-override seam all come
 > from this single engine (AGENTS §21 "one engine, native overrides"); the
 > core-first story is what makes the other two faces thin. Source:
-> [`src/core`](../../src/core), [`src/browser`](../../src/browser),
-> [`src/server`](../../src/server). Surfaced through the `@orkestrel/router`
+> [`src/core`](../src/core), [`src/browser`](../src/browser),
+> [`src/server`](../src/server). Surfaced through the `@orkestrel/router`
 > barrel (aliased `@src/core` / `@src/browser` / `@src/server` inside this
 > repo).
 
@@ -614,46 +614,46 @@ const server = http.createServer((incoming, response) => {
 
 ## Tests
 
-- [`tests/src/core/Router.test.ts`](../../tests/src/core/Router.test.ts) —
+- [`tests/src/core/Router.test.ts`](../tests/src/core/Router.test.ts) —
   registration boundary guard, method-less matching, order-independent
   literal-over-param-over-wildcard precedence, wildcard capture, the
   `answers` seam, `entries()` (all + filtered), dedup via `key`, case
   sensitivity, and `RouterInterface` conformance.
-- [`tests/src/core/Group.test.ts`](../../tests/src/core/Group.test.ts) —
+- [`tests/src/core/Group.test.ts`](../tests/src/core/Group.test.ts) —
   `Group` direct construction, prefix composition and nesting, batch
   registration, dedup-key collision across differently-nested group chains,
   and `GroupInterface` conformance.
-- [`tests/src/core/Dispatcher.test.ts`](../../tests/src/core/Dispatcher.test.ts) —
+- [`tests/src/core/Dispatcher.test.ts`](../tests/src/core/Dispatcher.test.ts) —
   type-level surfaces (`RouteHandler` context typing, `TState` generic flow,
   `DispatcherInterface` member shape, factory return type), emitter event
   payload shapes, destroy idempotence, the cross-face grammar parity
   fixture, the full functional dispatch matrix (auto-HEAD, auto-OPTIONS,
   404/405 responders, handler-throw propagation), and per-method dedup.
-- [`tests/src/core/DispatchGroup.test.ts`](../../tests/src/core/DispatchGroup.test.ts) —
+- [`tests/src/core/DispatchGroup.test.ts`](../tests/src/core/DispatchGroup.test.ts) —
   `DispatchGroup` direct construction and group + nested group registration
   with prefixes composed.
-- [`tests/src/core/helpers.test.ts`](../../tests/src/core/helpers.test.ts) —
+- [`tests/src/core/helpers.test.ts`](../tests/src/core/helpers.test.ts) —
   `escapeRegExp`, `canonicalizePath`, `computeDispatchKey`, `compilePath` (literal/param/wildcard,
   trailing-slash folding, case sensitivity, the wildcard-not-final throw),
   `decodeParam` (including a malformed `%` escape), `matchPath`,
   `classifySegment` (the literal-vs-param classification fix regression
   case), `computeSpecificity`, `compareSpecificity`, `joinPaths`, and `route`
   (identity pass-through, literal `Path` preservation at the call site).
-- [`tests/src/core/factories.test.ts`](../../tests/src/core/factories.test.ts) —
+- [`tests/src/core/factories.test.ts`](../tests/src/core/factories.test.ts) —
   `createRouter`/`createDispatcher` round-trips and factory return-type
   assertions.
-- [`tests/src/browser/Navigator.test.ts`](../../tests/src/browser/Navigator.test.ts) —
+- [`tests/src/browser/Navigator.test.ts`](../tests/src/browser/Navigator.test.ts) —
   hash and history modes, `navigate()`/`active`/`navigate` event, fallback
   semantics, guard veto (sync + async, including supersede-discard), link
   interception on/off, `start`/`stop`/`destroy` idempotence, and
   `NavigatorInterface` conformance.
-- [`tests/src/browser/factories.test.ts`](../../tests/src/browser/factories.test.ts) —
+- [`tests/src/browser/factories.test.ts`](../tests/src/browser/factories.test.ts) —
   `createNavigator` returns a working `NavigatorInterface`.
-- [`tests/src/browser/helpers.test.ts`](../../tests/src/browser/helpers.test.ts) —
+- [`tests/src/browser/helpers.test.ts`](../tests/src/browser/helpers.test.ts) —
   `computeNavigationKey`, `extractHashPath`, `resolveLocationPath` (hash + history, with/without
   `base`), and `findAnchor` (including a click on a styled child inside an
   anchor).
-- [`tests/src/server/helpers.test.ts`](../../tests/src/server/helpers.test.ts) —
+- [`tests/src/server/helpers.test.ts`](../tests/src/server/helpers.test.ts) —
   `isEncryptedSocket`, `buildRequest` fidelity (method, URL from `Host`,
   headers including multi-value and `set-cookie`, body streaming, the
   incomplete-request and complete-request response-side disconnect aborts,
@@ -664,10 +664,10 @@ const server = http.createServer((incoming, response) => {
 
 ## See also
 
-- [`AGENTS.md`](../../AGENTS.md) — the rules; §13 the Emitter pattern, §14
+- [`AGENTS.md`](../AGENTS.md) — the rules; §13 the Emitter pattern, §14
   contract & validation architecture, §21 "one engine, native overrides",
   §22 documentation-as-contracts.
 - [`abort.md`](abort.md) — `@orkestrel/abort`, the supersede-safe guard
   cancellation primitive the Navigator composes, and the client-disconnect
   cancellation primitive the Listener composes.
-- [`README.md`](../README.md) — the guides index.
+- [`README.md`](README.md) — the guides index.
