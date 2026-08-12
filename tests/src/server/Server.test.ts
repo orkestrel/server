@@ -454,9 +454,10 @@ describe('Server — connection facts', () => {
 		)
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/who`)
-		const body = (await response.json()) as EchoState
-		expect(typeof body.ip).toBe('string')
-		expect(body.encrypted).toBe(false)
+		await expect(response.json()).resolves.toEqual({
+			ip: expect.any(String),
+			encrypted: false,
+		})
 	})
 })
 
@@ -1135,8 +1136,7 @@ describe('Server — capstone', () => {
 		const response = await fetch(`http://127.0.0.1:${port}/users/7`)
 		expect(response.status).toBe(200)
 		expect(response.headers.get('x-capstone')).toBe('yes')
-		const body = (await response.json()) as { readonly id: string; readonly userId?: string }
-		expect(body).toEqual({ id: '7', userId: 'capstone-user' })
+		await expect(response.json()).resolves.toEqual({ id: '7', userId: 'capstone-user' })
 	})
 
 	it('a thrown HTTPError surfaces the boundary mapping through the wire, even behind middleware', async () => {
@@ -1152,7 +1152,7 @@ describe('Server — capstone', () => {
 			createServer<AppState>({
 				dispatcher,
 				state: () => ({}),
-				middleware: [async (request, context, next) => next(request)],
+				middleware: [async (request, _context, next) => next(request)],
 			}),
 		)
 		const port = await server.start()

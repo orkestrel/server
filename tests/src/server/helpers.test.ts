@@ -94,13 +94,13 @@ async function gzip(text: string): Promise<Uint8Array<ArrayBuffer>> {
 describe('compose', () => {
 	it('runs middleware outermost-first around the terminal', async () => {
 		const order: string[] = []
-		const first: MiddlewareHandler<Record<string, never>> = async (request, context, next) => {
+		const first: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
 			order.push('first-before')
 			const response = await next()
 			order.push('first-after')
 			return response
 		}
-		const second: MiddlewareHandler<Record<string, never>> = async (request, context, next) => {
+		const second: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
 			order.push('second-before')
 			const response = await next()
 			order.push('second-after')
@@ -121,7 +121,11 @@ describe('compose', () => {
 	})
 
 	it('rejects a second call to the same next()', async () => {
-		const doubleNext: MiddlewareHandler<Record<string, never>> = async (request, context, next) => {
+		const doubleNext: MiddlewareHandler<Record<string, never>> = async (
+			_request,
+			_context,
+			next,
+		) => {
 			await next()
 			return next()
 		}
@@ -133,8 +137,8 @@ describe('compose', () => {
 
 	it('rejects the second of two CONCURRENT next() calls from the same middleware', async () => {
 		const concurrentDoubleNext: MiddlewareHandler<Record<string, never>> = async (
-			request,
-			context,
+			_request,
+			_context,
 			next,
 		) => {
 			const results = await Promise.allSettled([next(), next()])
@@ -164,7 +168,7 @@ describe('compose', () => {
 
 	it('substitutes the downstream request via next(newRequest)', async () => {
 		let seenUrl = ''
-		const substitute: MiddlewareHandler<Record<string, never>> = async (request, context, next) =>
+		const substitute: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) =>
 			next(new Request('http://localhost/substituted'))
 		const handle = compose([substitute], async (request) => {
 			seenUrl = request.url
@@ -175,7 +179,11 @@ describe('compose', () => {
 	})
 
 	it('lets a middleware transform the response after next()', async () => {
-		const addHeader: MiddlewareHandler<Record<string, never>> = async (request, context, next) => {
+		const addHeader: MiddlewareHandler<Record<string, never>> = async (
+			_request,
+			_context,
+			next,
+		) => {
 			const response = await next()
 			response.headers.set('x-test', 'yes')
 			return response
@@ -188,7 +196,7 @@ describe('compose', () => {
 	it('a short-circuit skips downstream but an outer middleware still post-processes the response', async () => {
 		let terminalRan = false
 		let downstreamRan = false
-		const outer: MiddlewareHandler<Record<string, never>> = async (request, context, next) => {
+		const outer: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
 			const response = await next()
 			response.headers.set('x-outer', 'seen')
 			return response
@@ -234,12 +242,10 @@ describe('compose', () => {
 			state,
 			body: async () => undefined,
 		})
-		const body = (await response.json()) as {
-			readonly params: { readonly id: string }
-			readonly userId?: string
-		}
-		expect(body.params).toEqual({ id: '7' })
-		expect(body.userId).toBe('user-42')
+		await expect(response.json()).resolves.toEqual({
+			params: { id: '7' },
+			userId: 'user-42',
+		})
 	})
 })
 
