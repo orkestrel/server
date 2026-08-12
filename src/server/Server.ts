@@ -76,7 +76,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly id = crypto.randomUUID()
 	readonly #dispatcher: DispatcherInterface<TState>
 	readonly #state: ConnectionStateFunction<TState>
-	readonly #middleware: MiddlewareHandler<TState>[]
+	readonly #middleware: Array<MiddlewareHandler<TState>>
 	readonly #upgradeHandlers: UpgradeHandler[] = []
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
@@ -164,8 +164,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	use(middleware: MiddlewareHandler<TState>): void
-	use(middleware: readonly MiddlewareHandler<TState>[]): void
-	use(middleware: MiddlewareHandler<TState> | readonly MiddlewareHandler<TState>[]): void {
+	use(middleware: ReadonlyArray<MiddlewareHandler<TState>>): void
+	use(middleware: MiddlewareHandler<TState> | ReadonlyArray<MiddlewareHandler<TState>>): void {
 		if (typeof middleware === 'function') this.#middleware.push(middleware)
 		else this.#middleware.push(...middleware)
 	}

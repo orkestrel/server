@@ -10,7 +10,7 @@
 > seam, connection-fact injection, and `discoverPort`. The server
 > **consumes** `@orkestrel/router` — routing, matching, and dispatch are that
 > package's, never re-implemented here (AGENTS §21 "mechanism, never
-> policy"). Source: [`src/server`](../../src/server). Surfaced through the
+> policy"). Source: [`src/server`](../src/server). Surfaced through the
 > `@orkestrel/server` barrel (aliased `@src/server` inside this repo).
 
 ## Surface
@@ -603,23 +603,23 @@ await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression 
 
 ## Tests
 
-- [`tests/src/server/helpers.test.ts`](../../tests/src/server/helpers.test.ts) —
+- [`tests/src/server/helpers.test.ts`](../tests/src/server/helpers.test.ts) —
   `compose` (outer-first ordering, double-`next` rejection, short-circuit,
   request substitution, response transformation), cookie parse/serialize/
   attribute-injection guards, `resolveSecure`, `appendCookie`/`clearCookie`,
   `isAddressInfo` narrowing, `openStream` readiness/drain and
   ignore-the-signal behavior, and `discoverPort` (default, preferred, and
   taken-preferred-falls-back cases).
-- [`tests/src/server/Negotiator.test.ts`](../../tests/src/server/Negotiator.test.ts) —
+- [`tests/src/server/Negotiator.test.ts`](../tests/src/server/Negotiator.test.ts) —
   `negotiate`/`encoding`/`language`/`format`: exact vs subtype-wildcard vs
   any-range precedence, `;q=0` rejection semantics, q-tie server-order
   break, `format`'s 406 fallback and handler dispatch.
-- [`tests/src/server/errors.test.ts`](../../tests/src/server/errors.test.ts) —
+- [`tests/src/server/errors.test.ts`](../tests/src/server/errors.test.ts) —
   `HTTPError`/`ContentTooLargeError` shape and `isHTTPError` narrowing.
-- [`tests/src/server/factories.test.ts`](../../tests/src/server/factories.test.ts) —
+- [`tests/src/server/factories.test.ts`](../tests/src/server/factories.test.ts) —
   `createNegotiator` round-trip + factory return-type assertion, and
   `createServer` round-trip, option threading, and construction guards.
-- [`tests/src/server/Server.test.ts`](../../tests/src/server/Server.test.ts) —
+- [`tests/src/server/Server.test.ts`](../tests/src/server/Server.test.ts) —
   the status matrix, restart-fresh-abort, caller-cancelled / timed-out / clean
   bounded startup, `EADDRINUSE` honesty, host/port binds, ephemeral default,
   connection / header / per-socket request caps, graceful-vs-forced drain,
@@ -631,7 +631,7 @@ await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression 
 
 ## See also
 
-- [`AGENTS.md`](../../AGENTS.md) — the rules; §13 the Emitter pattern, §14
+- [`AGENTS.md`](../AGENTS.md) — the rules; §13 the Emitter pattern, §14
   contract & validation architecture, §21 "mechanism, never policy", §22
   documentation-as-contracts.
 - [`router.md`](router.md) — `@orkestrel/router`, the dispatcher this server
@@ -642,4 +642,4 @@ await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression 
   lifecycle event map.
 - [`contract.md`](contract.md) — `@orkestrel/contract`, the guards backing
   every construction boundary and untrusted read.
-- [`README.md`](../README.md) — the guides index.
+- [`README.md`](README.md) — the guides index.

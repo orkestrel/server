@@ -68,7 +68,7 @@ import { ContentTooLargeError, HTTPError } from './errors.js'
  * ```
  */
 export function compose<TState>(
-	middleware: readonly MiddlewareHandler<TState>[],
+	middleware: ReadonlyArray<MiddlewareHandler<TState>>,
 	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return middleware.reduceRight<

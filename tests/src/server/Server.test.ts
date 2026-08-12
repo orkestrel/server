@@ -42,7 +42,7 @@ function pingDispatcher(): DispatcherInterface<undefined> {
 	return dispatcher
 }
 
-const running: { stop(): Promise<void> }[] = []
+const running: Array<{ stop(): Promise<void> }> = []
 
 function track<T extends { stop(): Promise<void> }>(server: T): T {
 	running.push(server)

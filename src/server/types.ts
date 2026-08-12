@@ -581,7 +581,7 @@ export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TS
 export interface ServerOptions<TState> {
 	readonly dispatcher: DispatcherInterface<TState>
 	readonly state: ConnectionStateFunction<TState>
-	readonly middleware?: readonly MiddlewareHandler<TState>[]
+	readonly middleware?: ReadonlyArray<MiddlewareHandler<TState>>
 	readonly host?: string
 	readonly port?: number
 	readonly drain?: number
@@ -633,7 +633,7 @@ export interface ServerInterface<TState> {
 	readonly dispatcher: DispatcherInterface<TState>
 	readonly emitter: EmitterInterface<ServerEventMap>
 	use(middleware: MiddlewareHandler<TState>): void
-	use(middleware: readonly MiddlewareHandler<TState>[]): void
+	use(middleware: ReadonlyArray<MiddlewareHandler<TState>>): void
 	upgrade(handler: UpgradeHandler): void
 	/**
 	 * Bind the configured listener and resolve its actually-bound port.
