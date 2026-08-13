@@ -9,6 +9,7 @@ import { createDispatcher } from '@orkestrel/router'
 import { createServer, HTTPError, openStream } from '@src/server'
 import { createRecorder, waitForDelay } from '../../setup.js'
 import {
+	holdUpgrade,
 	openPausedResponse,
 	probeConnectionDrop,
 	rawRequest,
@@ -40,6 +41,22 @@ function pingDispatcher(): DispatcherInterface<undefined> {
 	const dispatcher = createDispatcher<undefined>()
 	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
 	return dispatcher
+}
+
+// Claim every upgrade and HOLD the socket, which is what a real WebSocket
+// handler does after its handshake — the tests that end the socket inline
+// (the fan-out suite below) never reach the stop path this exercises. The
+// returned array is the live set of sockets the server handed over.
+function claimUpgrades(server: ServerInterface<undefined>): Duplex[] {
+	const claimed: Duplex[] = []
+	server.upgrade((_request, socket) => {
+		claimed.push(socket)
+		socket.write(
+			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+		)
+		return true
+	})
+	return claimed
 }
 
 const running: Array<{ stop(): Promise<void> }> = []
@@ -566,6 +583,132 @@ describe('Server — graceful drain', () => {
 	})
 })
 
+describe('Server — graceful drain with an upgraded socket', () => {
+	it('drains a held socket to the deadline and cuts it, where the same stop with none is immediate', async () => {
+		// CONTROL — identical configuration, nothing upgraded. Without it a
+		// passing subject proves only that stop() returns eventually, not that
+		// the held socket is what it waited on.
+		const control = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 300 }),
+		)
+		await control.start()
+		const idle = performance.now()
+		await control.stop()
+		const idleMs = performance.now() - idle
+		expect(control.status).toBe('stopped')
+
+		// SUBJECT — one claimed socket held open, the way a WebSocket peer holds it.
+		const server = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 300 }),
+		)
+		const claimed = claimUpgrades(server)
+		const port = await server.start()
+		const held = await holdUpgrade(port, '/ws')
+		const started = performance.now()
+		await server.stop()
+		const heldMs = performance.now() - started
+
+		expect(server.status).toBe('stopped')
+		expect(claimed).toHaveLength(1)
+		expect(claimed[0]?.destroyed).toBe(true)
+		// The peer really lost the connection — the cut reached the wire, not
+		// just the server's own bookkeeping.
+		await held.closed
+		expect(held.done).toBe(true)
+		// Stated as the relationship rather than one run's numbers: the held
+		// socket cost a drain the idle control never paid, and that wait was
+		// the configured budget rather than an accident.
+		expect(heldMs).toBeGreaterThan(idleMs)
+		expect(heldMs).toBeGreaterThanOrEqual(250)
+	})
+
+	it('settles the moment the claimant closes its socket, well inside the deadline', async () => {
+		const server = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 10_000 }),
+		)
+		const claimed = claimUpgrades(server)
+		// What the stop event is for: the claimant owns the protocol, so it
+		// performs the clean close the server cannot speak.
+		server.emitter.on('stop', () => {
+			for (const socket of claimed) socket.end()
+		})
+		const port = await server.start()
+		const held = await holdUpgrade(port, '/ws')
+		const started = performance.now()
+		await server.stop()
+		const ms = performance.now() - started
+
+		expect(server.status).toBe('stopped')
+		// Far below the 10s budget, so the drain woke on the close event rather
+		// than running the deadline out — a drain, not a timer.
+		expect(ms).toBeLessThan(1_000)
+		await held.closed
+		held.release()
+	})
+
+	it('reports the cut on drain, and a clean drain as zero', async () => {
+		const cut = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				drain: 100,
+				on: { drain: cut.handler },
+			}),
+		)
+		claimUpgrades(server)
+		const port = await server.start()
+		const held = await holdUpgrade(port, '/ws')
+		await server.stop()
+		// No request was pending; one upgraded socket was still attached, so the
+		// close that followed was forced — the caller can tell.
+		expect(cut.calls[0]).toEqual([0, 1])
+		await held.closed
+
+		const clean = createRecorder<readonly [number, number]>()
+		const quiet = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				drain: 100,
+				on: { drain: clean.handler },
+			}),
+		)
+		await quiet.start()
+		await quiet.stop()
+		expect(clean.calls[0]).toEqual([0, 0])
+	})
+
+	it('cuts a held socket immediately at the drain: 0 boundary', async () => {
+		// The guide's escape hatch for a caller who wants no window at all — a
+		// zero deadline must fire rather than park forever on a socket.
+		const server = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 0 }),
+		)
+		const claimed = claimUpgrades(server)
+		const port = await server.start()
+		const held = await holdUpgrade(port, '/ws')
+		await server.stop()
+		expect(server.status).toBe('stopped')
+		expect(claimed[0]?.destroyed).toBe(true)
+		await held.closed
+	})
+
+	it('destroy() cuts a held socket instead of waiting on it', async () => {
+		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const claimed = claimUpgrades(server)
+		const port = await server.start()
+		const held = await holdUpgrade(port, '/ws')
+		// node detaches an upgraded socket from the set `closeAllConnections()`
+		// walks, so the terminal teardown hangs on it too unless the server
+		// destroys what it tracked.
+		await server.destroy()
+		expect(server.status).toBe('stopped')
+		expect(claimed[0]?.destroyed).toBe(true)
+		await held.closed
+	})
+})
+
 describe('Server — boundary mapping', () => {
 	it('maps a thrown HTTPError to its status + message', async () => {
 		const dispatcher = createDispatcher<undefined>()
@@ -674,7 +817,7 @@ describe('Server — lifecycle + emit safety', () => {
 		const starts = createRecorder<readonly [number]>()
 		const requests = createRecorder<readonly [string, string]>()
 		const stops = createRecorder<readonly []>()
-		const drains = createRecorder<readonly [number]>()
+		const drains = createRecorder<readonly [number, number]>()
 		const server = track(
 			createServer({
 				dispatcher: pingDispatcher(),
@@ -694,6 +837,7 @@ describe('Server — lifecycle + emit safety', () => {
 		expect(requests.calls).toContainEqual(['GET', '/ping'])
 		expect(stops.count).toBe(1)
 		expect(drains.count).toBe(1)
+		expect(drains.calls[0]).toEqual([0, 0])
 	})
 
 	it('a throwing observer cannot crash the server and routes to the error option', async () => {

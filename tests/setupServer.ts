@@ -226,6 +226,64 @@ export async function probeConnectionDrop(port: number, ms = 500): Promise<boole
 	}
 }
 
+/** A client-side upgraded connection deliberately left open — see {@link holdUpgrade}. */
+export interface HeldUpgradeInterface {
+	/** Resolves when the connection closes, from either end. */
+	readonly closed: Promise<void>
+	/** Whether the client socket is already gone. */
+	readonly done: boolean
+	/** Close the client end. */
+	release(): void
+}
+
+/**
+ * Complete a real protocol upgrade and KEEP the socket open — the long-lived
+ * connection a WebSocket peer holds, for the tests that ask what `stop()` does
+ * while one is attached.
+ *
+ * @remarks
+ * The sibling of {@link upgradeRequest}, which ends the socket the moment the
+ * `101` lands and so can never hold the server's stop path open. Real client
+ * sockets throughout (§16: no mocks); `closed` resolves when the server cuts
+ * the connection, which is how a test proves the force-close reached the peer
+ * rather than only the server's own bookkeeping.
+ *
+ * @param port - The target server's bound port (assumed `127.0.0.1`)
+ * @param path - The request path to upgrade, defaulting to `/`
+ * @returns The held-connection handle
+ *
+ * @example
+ * ```ts
+ * import { holdUpgrade } from '../../setupServer.js'
+ *
+ * const held = await holdUpgrade(port, '/ws')
+ * await server.stop()
+ * await held.closed // the stop cut it
+ * ```
+ */
+export async function holdUpgrade(port: number, path = '/'): Promise<HeldUpgradeInterface> {
+	const socket = net.createConnection({ port, host: '127.0.0.1' })
+	const closed = Promise.withResolvers<void>()
+	socket.once('close', () => closed.resolve())
+	socket.once('error', () => closed.resolve())
+	await once(socket, 'connect')
+	socket.write(
+		`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: aGVsZA==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+	)
+	// Return only once the handshake reply is in, so the server has genuinely
+	// upgraded (and tracked) the connection before the caller acts on it.
+	await once(socket, 'data')
+	return {
+		closed: closed.promise,
+		get done(): boolean {
+			return socket.destroyed
+		},
+		release(): void {
+			socket.destroy()
+		},
+	}
+}
+
 export function upgradeRequest(
 	base: string,
 	path = '/',

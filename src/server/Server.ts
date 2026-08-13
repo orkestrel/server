@@ -41,9 +41,10 @@ import { HTTPError, isHTTPError } from './errors.js'
  *   `idle → starting → listening`. A cancelled or expired bind closes its
  *   partial server and resets to `idle` for another start. `stop()` transitions
  *   to `stopping`: refuses new connections, fires a fresh-per-run stop signal
- *   so in-flight handlers observe cancellation, drains up to the `drain`
- *   deadline (event-driven, no busy-loop), then closes → `stopped`. `destroy()`
- *   is the idempotent final teardown.
+ *   so in-flight handlers observe cancellation, drains in-flight requests AND
+ *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
+ *   busy-loop), then closes → `stopped`, forcing whatever the deadline caught
+ *   still open. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built via the router's `buildRequest`, its
  *   `signal` LINKED to this run's stop signal via `@orkestrel/abort`'s
@@ -68,6 +69,9 @@ import { HTTPError, isHTTPError } from './errors.js'
  * - **Upgrade fan-out** — verbatim old semantics (first-claimer-wins, a
  *   throwing handler is treated as declined and surfaced on `error`, an
  *   unclaimed upgrade destroys the socket), bound per-run to this instance.
+ *   A CLAIMED socket joins `#upgraded` until it closes: the claimant still
+ *   owns it, and the tracking exists because node detaches an upgraded socket
+ *   from the set its own close calls walk, so nothing else can end it.
  * - **Observable (§13).** Owns an {@link Emitter} over {@link ServerEventMap}
  *   exposed as `readonly emitter`; the emitter isolates a listener throw and
  *   routes it to the `error` OPTION (not the domain `error` event).
@@ -78,6 +82,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #state: ConnectionStateFunction<TState>
 	readonly #middleware: Array<MiddlewareHandler<TState>>
 	readonly #upgradeHandlers: UpgradeHandler[] = []
+	readonly #upgraded = new Set<Duplex>()
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
 	readonly #configuredPort: number | undefined
@@ -147,6 +152,13 @@ export class Server<TState> implements ServerInterface<TState> {
 		})
 	}
 
+	// Everything `stop()` has to drain: in-flight requests plus the upgraded
+	// sockets handlers claimed. Derived, so the two counters can never drift
+	// out of step with a third stored flag.
+	get #inflight(): number {
+		return this.#pending + this.#upgraded.size
+	}
+
 	get status(): ServerStatus {
 		return this.#status
 	}
@@ -210,8 +222,9 @@ export class Server<TState> implements ServerInterface<TState> {
 		await this.#drainPending(deadline.signal)
 		deadline.clear()
 		const pending = this.#pending
-		this.#emitter.emit('drain', pending)
-		if (server !== undefined) await this.#close(server, pending > 0)
+		const upgraded = this.#upgraded.size
+		this.#emitter.emit('drain', pending, upgraded)
+		if (server !== undefined) await this.#close(server, pending + upgraded > 0)
 		this.#http = undefined
 		this.#port = undefined
 		this.#status = 'stopped'
@@ -346,7 +359,8 @@ export class Server<TState> implements ServerInterface<TState> {
 				this.#emitter.emit('error', error)
 			}
 		}
-		if (!handled) socket.destroy()
+		if (handled) this.#trackSocket(socket)
+		else socket.destroy()
 		this.#emitter.emit('upgrade', request, handled)
 	}
 
@@ -430,33 +444,69 @@ export class Server<TState> implements ServerInterface<TState> {
 	// always dropped (an in-flight request is untouched); when `force` is set
 	// (the drain deadline fired with work still in flight, or `destroy`)
 	// every open socket is destroyed so the callback fires promptly.
+	//
+	// A protocol-upgraded socket needs the extra loop: node detaches it from
+	// the connection set BOTH `closeIdleConnections()` and
+	// `closeAllConnections()` walk, so neither reaches it while
+	// `server.close()` still waits on it. Without destroying the tracked set
+	// here, a force close hangs exactly as hard as a graceful one.
 	#close(server: NodeHTTPServer, force: boolean): Promise<void> {
 		return new Promise<void>((resolve) => {
 			server.close(() => resolve())
-			if (force) server.closeAllConnections()
-			else server.closeIdleConnections()
+			if (force) {
+				server.closeAllConnections()
+				for (const socket of this.#upgraded) socket.destroy()
+			} else server.closeIdleConnections()
 		})
 	}
 
-	// Track one in-flight request; returns an idempotent finish thunk. When
-	// the last in-flight request finishes, the current drain wakeup fires —
-	// event-driven, never a busy-loop.
+	// Arm a fresh drain wakeup when the server goes from settled to busy.
+	// Called BEFORE the new unit is counted, so a zero here means nothing was
+	// in flight yet. The invariant this pair holds — `#wakeup` is un-aborted
+	// whenever `#inflight` is positive — is what lets `#drainPending` park on
+	// it without racing a wakeup that already fired.
+	#enter(): void {
+		if (this.#inflight === 0) this.#wakeup = createAbort()
+	}
+
+	// Fire the current drain wakeup once the LAST unit of drainable work has
+	// left. Called AFTER that unit is uncounted — event-driven, never a
+	// busy-loop.
+	#settle(): void {
+		if (this.#inflight === 0) this.#wakeup.abort()
+	}
+
+	// Track one in-flight request; returns an idempotent finish thunk.
 	#trackStart(): () => void {
-		if (this.#pending === 0) this.#wakeup = createAbort()
+		this.#enter()
 		this.#pending += 1
 		let finished = false
 		return () => {
 			if (finished) return
 			finished = true
 			this.#pending -= 1
-			if (this.#pending === 0) this.#wakeup.abort()
+			this.#settle()
 		}
 	}
 
-	// Park until the in-flight count reaches zero OR `signal` fires —
-	// event-driven (wake-park), no polling.
+	// Track one claimed upgraded socket for the duration of its life. The
+	// claiming handler still OWNS the socket — this only watches it, so the
+	// stop path can drain it like a request and cut it if the deadline wins.
+	// An already-dead socket never enters (nothing would ever untrack it).
+	#trackSocket(socket: Duplex): void {
+		if (socket.destroyed || this.#upgraded.has(socket)) return
+		this.#enter()
+		this.#upgraded.add(socket)
+		socket.once('close', () => {
+			this.#upgraded.delete(socket)
+			this.#settle()
+		})
+	}
+
+	// Park until every in-flight request and claimed upgraded socket is gone
+	// OR `signal` fires — event-driven (wake-park), no polling.
 	async #drainPending(signal: AbortSignal): Promise<void> {
-		if (this.#pending === 0 || signal.aborted) return
+		if (this.#inflight === 0 || signal.aborted) return
 		await once(AbortSignal.any([signal, this.#wakeup.signal]), 'abort')
 	}
 }

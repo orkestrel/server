@@ -472,9 +472,13 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
  *   the per-request path; `undefined` for an upgrade-handler throw (no fetch
  *   `Request` exists on that path — only a raw `IncomingMessage`) or a listen
  *   failure.
- * - `stop` — `stop()` began (status just moved to `'stopping'`).
+ * - `stop` — `stop()` began (status just moved to `'stopping'`). An upgrade
+ *   handler that owns a long-lived socket closes it from here, so the drain
+ *   below settles instead of running out the deadline.
  * - `drain` — the graceful drain settled (deadline hit or all finished);
- *   carries the still-pending request count (`0` on a clean drain).
+ *   carries the still-pending request count AND the still-attached upgraded
+ *   socket count. Both `0` is a clean drain; either non-zero means the close
+ *   that follows was FORCED and cut that work.
  * - `response` — fired after the response has been sent, for every request
  *   that reaches the middleware pipeline (the success path and the
  *   outer-boundary error path); carries the method, parsed pathname, final
@@ -489,7 +493,7 @@ export type ServerEventMap = {
 	readonly upgrade: readonly [request: IncomingMessage, handled: boolean]
 	readonly error: readonly [error: unknown, request?: { method: string; url: URL }]
 	readonly stop: readonly []
-	readonly drain: readonly [pending: number]
+	readonly drain: readonly [pending: number, upgraded: number]
 	readonly response: readonly [
 		event: { method: string; pathname: string; status: number; ms: number },
 	]
@@ -507,6 +511,16 @@ export type ServerEventMap = {
  * socket is destroyed so an unhandled upgrade never leaks a dangling
  * connection. `request` / `socket` / `head` are node's own raw values, handed
  * over verbatim — no assertion at this boundary (AGENTS §14).
+ *
+ * A CLAIMED socket is TRACKED until it closes. The handler still owns it —
+ * the server only watches — but `stop()` now drains that socket like an
+ * in-flight request and destroys it if the `drain` deadline expires first.
+ * Node detaches an upgraded socket from its own connection set, so neither
+ * `closeIdleConnections()` nor `closeAllConnections()` reaches it and this
+ * tracking is what lets `stop()` and `destroy()` finish at all. A handler
+ * that wants a protocol-clean goodbye (a WebSocket close frame) sends it on
+ * the server's `stop` event and closes the socket; the drain settles the
+ * moment the last one goes.
  *
  * @param request - The raw `node:http` upgrade request
  * @param socket - The raw, now-detached `Duplex` connection
@@ -545,9 +559,12 @@ export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TS
  *   `EADDRINUSE` — no silent ephemeral fallback (use `discoverPort` to pick a
  *   guaranteed-free port up front).
  * @param drain - The graceful-stop deadline in milliseconds: on `stop()` the
- *   server stops accepting new connections and gives in-flight requests this
- *   long to finish before forcing sockets closed. Defaults to
- *   `DEFAULT_DRAIN_MS`. Must be a non-negative finite number.
+ *   server stops accepting new connections and gives in-flight requests AND
+ *   claimed upgraded sockets this long to finish before forcing every
+ *   remaining socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be a
+ *   non-negative finite number. A long-lived upgraded socket that nothing
+ *   closes therefore costs `stop()` this whole budget, so a WebSocket
+ *   handler closes its sockets on the `stop` event to settle sooner.
  * @param limit - The default request-body byte cap the context's `body()`
  *   reads through. Defaults to `DEFAULT_BODY_LIMIT`. Must be a non-negative
  *   finite number.
@@ -618,7 +635,8 @@ export interface ServerOptions<TState> {
  * while binding, and resolves the actually-bound port. A cancelled or expired
  * bind closes its partial server and resets to `idle`. `stop()` refuses new
  * connections, fires the stop signal so in-flight handlers can observe it,
- * drains up to the configured deadline, then closes. `destroy()` is the final
+ * drains in-flight requests and claimed upgraded sockets up to the configured
+ * deadline, then closes — forcing whatever is left. `destroy()` is the final
  * idempotent teardown. Per request: a `Request` is built via the router's
  * `buildRequest` (its signal linked to the server's stop signal), the composed
  * middleware onion runs terminating in `dispatcher.handle`, and the result is
@@ -643,6 +661,25 @@ export interface ServerInterface<TState> {
 	 * @returns The actually-bound TCP port
 	 */
 	start(signal?: AbortSignal): Promise<number>
+	/**
+	 * Stop gracefully: refuse new connections, fire the stop signal, drain, close.
+	 *
+	 * @remarks
+	 * Drainable work is every in-flight request PLUS every upgraded socket a
+	 * handler claimed. The drain parks on that work reaching zero or the
+	 * `drain` deadline expiring, emits `drain` with both remaining counts, and
+	 * then closes — dropping idle keep-alive sockets on a clean drain, and
+	 * destroying every open socket (including the claimed upgraded ones node's
+	 * own force-close cannot reach) when either count is still non-zero. It
+	 * therefore always resolves; the `drain` counts say whether anything was cut.
+	 *
+	 * @returns Resolves once the listener is closed and the status is `'stopped'`
+	 */
 	stop(): Promise<void>
+	/**
+	 * Tear down for good: force-close the listener and every socket, then the emitter.
+	 *
+	 * @returns Resolves once nothing is left open; idempotent from any state
+	 */
 	destroy(): Promise<void>
 }
