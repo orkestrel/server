@@ -7,7 +7,7 @@ import http from 'node:http'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, HTTPError, openStream } from '@src/server'
-import { createRecorder, waitForDelay } from '../../setup.js'
+import { createRecorder, waitForDelay } from '@orkestrel/test'
 import {
 	holdUpgrade,
 	openPausedResponse,
