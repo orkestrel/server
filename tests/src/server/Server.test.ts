@@ -1,4 +1,5 @@
 import type { IncomingMessage } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type { ConnectionStateFunction, ServerInterface, ServerOptions } from '@src/server'
@@ -79,12 +80,16 @@ describe('Server — lifecycle', () => {
 			}),
 		)
 		expect(server.status).toBe('idle')
+		expect(server.address).toBeUndefined()
 		const port = await server.start()
 		expect(server.status).toBe('listening')
 		expect(server.port).toBe(port)
+		expect(server.address?.port).toBe(port)
 		expect(server.id).toMatch(/[0-9a-f-]{36}/)
 		const response = await fetch(`http://127.0.0.1:${port}/ping`)
 		expect(await response.text()).toBe('pong')
+		await server.stop()
+		expect(server.address).toBeUndefined()
 	})
 
 	it('transitions idle → listening → stopped and refuses start while listening', async () => {
@@ -117,6 +122,7 @@ describe('Server — lifecycle', () => {
 		await server.destroy()
 		expect(server.status).toBe('stopped')
 		expect(server.port).toBeUndefined()
+		expect(server.address).toBeUndefined()
 	})
 })
 
@@ -264,12 +270,23 @@ describe('Server — host/port bind', () => {
 		expect(second.status).toBe('idle')
 	})
 
-	it('binds the configured host and is reachable on it', async () => {
+	it('exposes an IPv4 literal host and its real ephemeral port', async () => {
 		const server = track(
 			createServer({ dispatcher: pingDispatcher(), state: () => undefined, host: '127.0.0.1' }),
 		)
 		const port = await server.start()
+		expect(server.address).toEqual({ address: '127.0.0.1', family: 'IPv4', port })
 		const response = await fetch(`http://127.0.0.1:${port}/ping`)
+		expect(await response.text()).toBe('pong')
+	})
+
+	it('exposes an IPv6 literal host and its real ephemeral port', async () => {
+		const server = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, host: '::1' }),
+		)
+		const port = await server.start()
+		expect(server.address).toEqual({ address: '::1', family: 'IPv6', port })
+		const response = await fetch(`http://[::1]:${port}/ping`)
 		expect(await response.text()).toBe('pong')
 	})
 
@@ -317,6 +334,7 @@ describe('Server — restart + idempotent lifecycle', () => {
 		await expect(server.stop()).resolves.toBeUndefined()
 		expect(server.status).toBe('stopped')
 		expect(server.port).toBeUndefined()
+		expect(server.address).toBeUndefined()
 	})
 
 	it('destroy() while listening tears down without a prior stop, and the socket refuses new connections', async () => {
@@ -324,6 +342,7 @@ describe('Server — restart + idempotent lifecycle', () => {
 		const port = await server.start()
 		await server.destroy()
 		expect(server.status).toBe('stopped')
+		expect(server.address).toBeUndefined()
 		await expect(server.destroy()).resolves.toBeUndefined()
 		await expect(fetch(`http://127.0.0.1:${port}/ping`)).rejects.toBeDefined()
 	})
@@ -1221,10 +1240,12 @@ describe('ServerOptions<TState> / ServerInterface<TState> — TState flow', () =
 		>()
 	})
 
-	it('exposes id, status, port, dispatcher, emitter, use, upgrade, start, stop, destroy', () => {
+	it('exposes id, status, port, address, dispatcher, emitter, use, upgrade, start, stop, destroy', () => {
 		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('id')
 		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('status')
 		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('port')
+		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('address')
+		expectTypeOf<ServerInterface<undefined>['address']>().toEqualTypeOf<AddressInfo | undefined>()
 		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('dispatcher')
 		expectTypeOf<ServerInterface<undefined>>().toHaveProperty('emitter')
 		expectTypeOf<ServerInterface<undefined>['use']>().toBeFunction()

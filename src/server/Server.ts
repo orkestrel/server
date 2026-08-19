@@ -1,4 +1,5 @@
 import type { IncomingMessage, Server as NodeHTTPServer, ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { AbortInterface } from '@orkestrel/abort'
 import type { TimeoutInterface } from '@orkestrel/timeout'
@@ -36,10 +37,11 @@ import { HTTPError, isHTTPError } from './errors.js'
  * - **Lifecycle (AGENTS §10).** `start(signal?)` builds the underlying `node:http`
  *   server, binds the configured {@link ServerOptions.host} / {@link
  *   ServerOptions.port} (omitted/`0` port ⇒ EPHEMERAL, resolved from the
- *   bound address), observes caller cancellation plus the configured
- *   `timeouts.start` deadline while the bind is pending, and transitions
- *   `idle → starting → listening`. A cancelled or expired bind closes its
- *   partial server and resets to `idle` for another start. `stop()` transitions
+ *   bound address), exposes that {@link AddressInfo} through `address`, observes
+ *   caller cancellation plus the configured `timeouts.start` deadline while the
+ *   bind is pending, and transitions `idle → starting → listening`. A
+ *   cancelled or expired bind closes its partial server and resets to `idle` for
+ *   another start. `stop()` transitions
  *   to `stopping`: refuses new connections, fires a fresh-per-run stop signal
  *   so in-flight handlers observe cancellation, drains in-flight requests AND
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
@@ -165,6 +167,11 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	get port(): number | undefined {
 		return this.#port
+	}
+
+	get address(): AddressInfo | undefined {
+		const address = this.#http?.address()
+		return isAddressInfo(address) ? address : undefined
 	}
 
 	get dispatcher(): DispatcherInterface<TState> {

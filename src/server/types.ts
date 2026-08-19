@@ -440,6 +440,7 @@ export interface BodyOptions {
 // ============================================================================
 
 import type { IncomingMessage } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkestrel/emitter'
@@ -631,9 +632,10 @@ export interface ServerOptions<TState> {
  * `use` adds middleware and `upgrade` registers a protocol-upgrade claimant,
  * both configurable before or after `start()`. `start(signal?)` binds the
  * configured `host`/`port` (an omitted/`0` port ⇒ an EPHEMERAL port, resolved
- * from the bound address), observes caller cancellation plus `timeouts.start`
- * while binding, and resolves the actually-bound port. A cancelled or expired
- * bind closes its partial server and resets to `idle`. `stop()` refuses new
+ * from the bound address), exposes that {@link AddressInfo} through `address`,
+ * observes caller cancellation plus `timeouts.start` while binding, and resolves
+ * the actually-bound port. A cancelled or expired bind closes its partial server
+ * and resets to `idle`. `stop()` refuses new
  * connections, fires the stop signal so in-flight handlers can observe it,
  * drains in-flight requests and claimed upgraded sockets up to the configured
  * deadline, then closes — forcing whatever is left. `destroy()` is the final
@@ -648,6 +650,8 @@ export interface ServerInterface<TState> {
 	readonly id: string
 	readonly status: ServerStatus
 	readonly port: number | undefined
+	/** The bound listener address, or `undefined` while no listener is active. */
+	readonly address: AddressInfo | undefined
 	readonly dispatcher: DispatcherInterface<TState>
 	readonly emitter: EmitterInterface<ServerEventMap>
 	use(middleware: MiddlewareHandler<TState>): void
