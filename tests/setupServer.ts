@@ -20,25 +20,6 @@ export interface UpgradeOutcomeInterface {
 }
 
 /**
- * Drive a raw `node:http` protocol-upgrade request against a running server —
- * the real-socket probe the server face's upgrade-seam tests use (§16: no
- * mocks). Resolves once the outcome is known: a `101` upgrade response means
- * a registered handler CLAIMED the socket, an ordinary HTTP response (or a
- * connection error from a destroyed socket) means none did.
- *
- * @param base - The server's base URL (`http://127.0.0.1:PORT`)
- * @param path - The request path to upgrade
- * @param headers - Extra request headers merged with the upgrade handshake headers
- * @returns An {@link UpgradeOutcomeInterface}
- *
- * @example
- * ```ts
- * import { upgradeRequest } from '../setupServer.js'
- *
- * const outcome = await upgradeRequest(handle.url, '/ws')
- * ```
- */
-/**
  * Send a raw, hand-written HTTP request over a bare `node:net` socket and
  * resolve with whatever bytes come back — the real-socket probe for
  * malformed-request vectors (a bad `Host` header) that `fetch` would refuse
@@ -213,6 +194,37 @@ export async function holdUpgrade(port: number, path = '/'): Promise<HeldUpgrade
 	}
 }
 
+/**
+ * Drives a raw `node:http` protocol-upgrade request against a running server —
+ * the real-socket probe the server face's upgrade-seam tests use (§16: no
+ * mocks). Resolves after the outcome is known: a `101` upgrade response means a
+ * registered handler CLAIMED the socket, and an ordinary HTTP response or a
+ * connection error from a destroyed socket means none did.
+ *
+ * @param base - The server's base URL (`http://127.0.0.1:PORT`)
+ * @param path - The request path to upgrade
+ * @param headers - Extra request headers merged with the upgrade handshake headers
+ * @returns An {@link UpgradeOutcomeInterface}
+ *
+ * @remarks
+ * Kept local rather than replaced by `requestUpgrade` from `@orkestrel/test/server`,
+ * on measurements taken against this server's own upgrade seam. This face
+ * declines an upgrade by destroying the un-upgraded socket, which the shipped
+ * helper reads as a transport failure: driven at a port whose sole handler
+ * returns `false`, and at a port with no handler registered, it rejects with
+ * `Error: socket hang up` where the suites here assert `claimed: false`. Its
+ * result is a discriminated union whose claimed arm carries `protocol` and no
+ * `status`, so the `101` this file reports is unavailable there. It also offers
+ * no way to send `Sec-WebSocket-Key`, which the claimed-path test supplies —
+ * `protocols` is the only header input it accepts.
+ *
+ * @example
+ * ```ts
+ * import { upgradeRequest } from '../setupServer.js'
+ *
+ * const outcome = await upgradeRequest(handle.url, '/ws')
+ * ```
+ */
 export function upgradeRequest(
 	base: string,
 	path = '/',
