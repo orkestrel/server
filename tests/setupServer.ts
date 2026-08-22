@@ -136,6 +136,37 @@ export async function probeConnectionDrop(port: number, ms = 500): Promise<boole
 	}
 }
 
+/**
+ * Checks whether this host can bind a loopback address family.
+ *
+ * @param host - The loopback literal to attempt, such as `127.0.0.1` or `::1`.
+ * @returns True if a listener bound the address; false otherwise.
+ *
+ * @remarks
+ * A host built without IPv6 rejects `::1` with `EAFNOSUPPORT` at `listen`, so a proof whose
+ * subject is an address family asks the host rather than the platform name. The listener takes an
+ * ephemeral port and closes before the answer returns.
+ *
+ * @example
+ * ```ts
+ * import { probeLoopback } from './setupServer.js'
+ *
+ * await probeLoopback('127.0.0.1') // true on every host this suite runs on
+ * ```
+ */
+export async function probeLoopback(host: string): Promise<boolean> {
+	const server = net.createServer()
+	try {
+		server.listen(0, host)
+		await once(server, 'listening')
+		return true
+	} catch {
+		return false
+	} finally {
+		server.close()
+	}
+}
+
 /** A client-side upgraded connection deliberately left open — see {@link holdUpgrade}. */
 export interface HeldUpgradeInterface {
 	/** Resolves when the connection closes, from either end. */

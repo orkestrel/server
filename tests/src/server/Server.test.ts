@@ -13,9 +13,14 @@ import {
 	holdUpgrade,
 	openPausedResponse,
 	probeConnectionDrop,
+	probeLoopback,
 	rawRequest,
 	upgradeRequest,
 } from '../../setupServer.js'
+
+// A host built without IPv6 rejects `::1` with `EAFNOSUPPORT` at `listen`, so the IPv6 proof asks
+// this host whether the family binds at all rather than naming a platform it expects to work on.
+const BINDS_IPV6 = await probeLoopback('::1')
 
 // src/server/Server.ts — the lifecycle facade over REAL node:http (no mocks,
 // the node src:server project). Routing outcomes themselves are the router's
@@ -280,7 +285,7 @@ describe('Server — host/port bind', () => {
 		expect(await response.text()).toBe('pong')
 	})
 
-	it('exposes an IPv6 literal host and its real ephemeral port', async () => {
+	it.skipIf(!BINDS_IPV6)('exposes an IPv6 literal host and its real ephemeral port', async () => {
 		const server = track(
 			createServer({ dispatcher: pingDispatcher(), state: () => undefined, host: '::1' }),
 		)
