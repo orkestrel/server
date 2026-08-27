@@ -15,6 +15,7 @@ import type {
 } from './types.js'
 import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
+import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { isNumber, isRecord, isString, parseJSON } from '@orkestrel/contract'
 import {
 	COMPRESSIBLE_TYPES,
@@ -424,91 +425,6 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 // `signToken` throws, and only on a misconfigured (empty) secret.
 
 /**
- * Encode a byte sequence as standard padded Base64 — the RFC 4648 §4 alphabet
- * (`+`, `/`) with `=` padding, the form wire formats such as MCP blob content
- * and the MCP header sentinel compare against.
- *
- * @param bytes - The bytes to encode
- * @returns The standard Base64 string, padded
- *
- * @example
- * ```ts
- * encodeBase64(new TextEncoder().encode('hi')) // 'aGk='
- * ```
- */
-export function encodeBase64(bytes: Uint8Array): string {
-	let binary = ''
-	for (const byte of bytes) binary += String.fromCharCode(byte)
-	return btoa(binary)
-}
-
-/**
- * Decode a standard Base64 string back into its bytes — the inverse of
- * {@link encodeBase64}.
- *
- * @remarks
- * Decodes with `atob`, which THROWS `DOMException` on a malformed input —
- * a caller on an untrusted path catches it, or validates the grammar first,
- * to stay total.
- *
- * @param value - The standard Base64 string to decode
- * @returns The decoded bytes
- * @throws {DOMException} When `value` is not valid Base64
- *
- * @example
- * ```ts
- * new TextDecoder().decode(decodeBase64('aGk=')) // 'hi'
- * ```
- */
-export function decodeBase64(value: string): Uint8Array<ArrayBuffer> {
-	const binary = atob(value)
-	const bytes = new Uint8Array(binary.length)
-	for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-	return bytes
-}
-
-/**
- * Base64url-encode a byte sequence — the payload encoding {@link signToken} /
- * {@link verifyToken} use, and the signature encoding for the HMAC.
- *
- * @param bytes - The bytes to encode
- * @returns The base64url string (no padding)
- *
- * @example
- * ```ts
- * encodeBase64Url(new TextEncoder().encode('hi')) // 'aGk'
- * ```
- */
-export function encodeBase64Url(bytes: Uint8Array): string {
-	return encodeBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-/**
- * Decode a base64url string back into its bytes — the inverse of
- * {@link encodeBase64Url}.
- *
- * @remarks
- * Restores the standard base64 alphabet + padding before decoding through
- * {@link decodeBase64}. THROWS `DOMException` on a malformed input — callers
- * on the untrusted-token path (`verifyToken`) catch it to stay total
- * (AGENTS §14).
- *
- * @param value - The base64url string to decode
- * @returns The decoded bytes
- * @throws {DOMException} When `value` is not valid base64url
- *
- * @example
- * ```ts
- * new TextDecoder().decode(decodeBase64Url('aGk')) // 'hi'
- * ```
- */
-export function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> {
-	const restored = value.replace(/-/g, '+').replace(/_/g, '/')
-	const padding = restored.length % 4 === 0 ? '' : '='.repeat(4 - (restored.length % 4))
-	return decodeBase64(restored + padding)
-}
-
-/**
  * Sign a value into a stateless, HMAC-SHA256 token — `<payload>.<signature>`.
  *
  * @remarks
@@ -538,7 +454,7 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
 	const secret = secrets[0]
 	if (secret === undefined) throw new HTTPError(500, 'signToken requires at least one secret')
 	const exp = options.ttl !== undefined ? Date.now() + options.ttl : undefined
-	const encoded = encodeBase64Url(new TextEncoder().encode(JSON.stringify({ value, exp })))
+	const encoded = encodeBase64URL(new TextEncoder().encode(JSON.stringify({ value, exp })))
 	const key = await crypto.subtle.importKey(
 		'raw',
 		new TextEncoder().encode(secret),
@@ -547,7 +463,7 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
 		['sign'],
 	)
 	const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(encoded))
-	return `${encoded}.${encodeBase64Url(new Uint8Array(signature))}`
+	return `${encoded}.${encodeBase64URL(new Uint8Array(signature))}`
 }
 
 /**
@@ -555,8 +471,10 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
  *
  * @remarks
  * The inverse of {@link signToken}: splits the token on its LAST `.` (so a
- * value containing dots survives), and checks the payload's HMAC-SHA256
- * signature against EACH {@link TokenSecret} candidate via
+ * value containing dots survives), decodes the signature with
+ * `@orkestrel/codec`'s `decodeBase64URL` — a signature that is not canonical
+ * base64url is refused there, before any key import — and checks the payload's
+ * HMAC-SHA256 signature against EACH {@link TokenSecret} candidate via
  * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
  * retired, §3 of the proposal), accepting the token on the first match (the
  * rotation path). It then decodes + narrows the payload (`isRecord` +
@@ -580,10 +498,14 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 	const dot = token.lastIndexOf('.')
 	if (dot < 0) return undefined
 	const encoded = token.slice(0, dot)
-	const signatureText = token.slice(dot + 1)
+	const decoded = decodeBase64URL(token.slice(dot + 1))
+	if (decoded === undefined) return undefined
+	// The codec declares `Uint8Array` (an `ArrayBufferLike` buffer), which is
+	// not a `BufferSource`; copy once into an `ArrayBuffer`-backed view rather
+	// than per candidate secret.
+	const signature = new Uint8Array(decoded)
+	const data = new TextEncoder().encode(encoded)
 	try {
-		const signature = decodeBase64Url(signatureText)
-		const data = new TextEncoder().encode(encoded)
 		for (const candidate of secrets) {
 			const key = await crypto.subtle.importKey(
 				'raw',
@@ -597,7 +519,8 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 		}
 		return undefined
 	} catch {
-		// A malformed base64url signature/payload is just an invalid token — stay total.
+		// WebCrypto is the only thrower left here — it rejects unusable key
+		// material. An unverifiable token is invalid, so stay total.
 		return undefined
 	}
 }
@@ -608,17 +531,21 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
  * signature match.
  *
  * @remarks
- * Decodes the base64url payload to UTF-8 JSON, narrows it to a record with a
- * string `value` (AGENTS §14 — never `as`), and rejects an expired `exp`.
- * TOTAL — any decode/shape/expiry failure yields `undefined`.
+ * Decodes the payload with `@orkestrel/codec`'s `decodeBase64URL` (total — a
+ * non-canonical base64url segment answers `undefined` rather than throwing),
+ * reads it as UTF-8 JSON, narrows it to a record with a string `value`
+ * (AGENTS §14 — never `as`), and rejects an expired `exp`. TOTAL — any
+ * decode/shape/expiry failure yields `undefined`; only `JSON.parse` still
+ * throws, and its `catch` answers `undefined` too.
  *
  * @param encoded - The base64url-encoded payload segment (before the last `.`)
  * @returns The embedded value when the payload is well-shaped + unexpired, else `undefined`
  */
 export function decodeTokenPayload(encoded: string): string | undefined {
+	const bytes = decodeBase64URL(encoded)
+	if (bytes === undefined) return undefined
 	try {
-		const text = new TextDecoder().decode(decodeBase64Url(encoded))
-		const payload: unknown = JSON.parse(text)
+		const payload: unknown = JSON.parse(new TextDecoder().decode(bytes))
 		if (!isRecord(payload)) return undefined
 		if (typeof payload.value !== 'string') return undefined
 		if (payload.exp !== undefined && typeof payload.exp !== 'number') return undefined

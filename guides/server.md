@@ -92,10 +92,6 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 | `writeSignedCookie`     | function | Write a SIGNED cookie (`signToken` + `Set-Cookie`).                                                                                         |
 | `readSignedCookie`      | function | Read + verify a SIGNED cookie off a request — total, returns `undefined` on any failure.                                                    |
 | `clearCookie`           | function | Clear a cookie via an immediately-expiring `Set-Cookie`.                                                                                    |
-| `encodeBase64`          | function | Encode a byte sequence as standard padded Base64 (RFC 4648 §4).                                                                             |
-| `decodeBase64`          | function | Decode a standard Base64 string back into its bytes.                                                                                        |
-| `encodeBase64Url`       | function | Base64url-encode a byte sequence.                                                                                                           |
-| `decodeBase64Url`       | function | Decode a base64url string back into its bytes.                                                                                              |
 | `signToken`             | function | Sign a value into a stateless, HMAC-SHA256 token.                                                                                           |
 | `verifyToken`           | function | Verify a stateless token and return its embedded value — total, never throws.                                                               |
 | `decodeTokenPayload`    | function | Decode + narrow a signed token's payload, honoring its expiry.                                                                              |

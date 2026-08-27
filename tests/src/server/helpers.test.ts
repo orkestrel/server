@@ -7,6 +7,7 @@ import type {
 	NextFunction,
 	StreamInterface,
 } from '@src/server'
+import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { createDispatcher } from '@orkestrel/router'
 import {
 	appendCookie,
@@ -16,13 +17,9 @@ import {
 	compose,
 	computeBodyETag,
 	ContentTooLargeError,
-	decodeBase64,
-	decodeBase64Url,
 	decodeCookieValue,
 	decompressRequestBody,
 	discoverPort,
-	encodeBase64,
-	encodeBase64Url,
 	HTTPError,
 	isAddressInfo,
 	isCompressibleType,
@@ -446,38 +443,6 @@ describe('writeSignedCookie / readSignedCookie', () => {
 	})
 })
 
-describe('encodeBase64 / decodeBase64', () => {
-	it('encodes standard padded Base64', () => {
-		expect(encodeBase64(new TextEncoder().encode('hi'))).toBe('aGk=')
-	})
-
-	it('round-trips arbitrary bytes, the full octet range included', () => {
-		const bytes = new Uint8Array(256)
-		for (let index = 0; index < bytes.length; index += 1) bytes[index] = index
-		expect(decodeBase64(encodeBase64(bytes))).toEqual(bytes)
-	})
-
-	it('round-trips UTF-8 text through the encoder', () => {
-		const encoded = encodeBase64(new TextEncoder().encode('café'))
-		expect(new TextDecoder().decode(decodeBase64(encoded))).toBe('café')
-	})
-
-	it('keeps the standard alphabet where base64url substitutes', () => {
-		const bytes = new Uint8Array([0xfb, 0xff, 0xbf])
-		expect(encodeBase64(bytes)).toBe('+/+/')
-		expect(encodeBase64Url(bytes)).toBe('-_-_')
-	})
-
-	it('round-trips the empty sequence', () => {
-		expect(encodeBase64(new Uint8Array(0))).toBe('')
-		expect(decodeBase64('')).toEqual(new Uint8Array(0))
-	})
-
-	it('throws DOMException on input outside the Base64 alphabet', () => {
-		expect(() => decodeBase64('not base64!')).toThrow(DOMException)
-	})
-})
-
 // ── Tokens (WebCrypto async) ──────────────────────────────────────────────────
 
 describe('signToken / verifyToken', () => {
@@ -533,13 +498,15 @@ describe('signToken / verifyToken', () => {
 		const dot = token.lastIndexOf('.')
 		const encoded = token.slice(0, dot)
 		const signature = token.slice(dot + 1)
-		const payloadText = new TextDecoder().decode(decodeBase64Url(encoded))
-		const payload: unknown = JSON.parse(payloadText)
+		const payloadBytes = decodeBase64URL(encoded)
+		if (payloadBytes === undefined)
+			throw new Error('signToken must emit a canonical base64url payload')
+		const payload: unknown = JSON.parse(new TextDecoder().decode(payloadBytes))
 		const tamperedPayload = {
 			...(typeof payload === 'object' && payload !== null ? payload : {}),
 			exp: Date.now() + 1_000_000,
 		}
-		const tamperedEncoded = encodeBase64Url(
+		const tamperedEncoded = encodeBase64URL(
 			new TextEncoder().encode(JSON.stringify(tamperedPayload)),
 		)
 		const tamperedToken = `${tamperedEncoded}.${signature}`
