@@ -424,6 +424,50 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 // `signToken` throws, and only on a misconfigured (empty) secret.
 
 /**
+ * Encode a byte sequence as standard padded Base64 — the RFC 4648 §4 alphabet
+ * (`+`, `/`) with `=` padding, the form wire formats such as MCP blob content
+ * and the MCP header sentinel compare against.
+ *
+ * @param bytes - The bytes to encode
+ * @returns The standard Base64 string, padded
+ *
+ * @example
+ * ```ts
+ * encodeBase64(new TextEncoder().encode('hi')) // 'aGk='
+ * ```
+ */
+export function encodeBase64(bytes: Uint8Array): string {
+	let binary = ''
+	for (const byte of bytes) binary += String.fromCharCode(byte)
+	return btoa(binary)
+}
+
+/**
+ * Decode a standard Base64 string back into its bytes — the inverse of
+ * {@link encodeBase64}.
+ *
+ * @remarks
+ * Decodes with `atob`, which THROWS `DOMException` on a malformed input —
+ * a caller on an untrusted path catches it, or validates the grammar first,
+ * to stay total.
+ *
+ * @param value - The standard Base64 string to decode
+ * @returns The decoded bytes
+ * @throws {DOMException} When `value` is not valid Base64
+ *
+ * @example
+ * ```ts
+ * new TextDecoder().decode(decodeBase64('aGk=')) // 'hi'
+ * ```
+ */
+export function decodeBase64(value: string): Uint8Array<ArrayBuffer> {
+	const binary = atob(value)
+	const bytes = new Uint8Array(binary.length)
+	for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+	return bytes
+}
+
+/**
  * Base64url-encode a byte sequence — the payload encoding {@link signToken} /
  * {@link verifyToken} use, and the signature encoding for the HMAC.
  *
@@ -436,9 +480,7 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
  * ```
  */
 export function encodeBase64Url(bytes: Uint8Array): string {
-	let binary = ''
-	for (const byte of bytes) binary += String.fromCharCode(byte)
-	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+	return encodeBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
 /**
@@ -446,9 +488,10 @@ export function encodeBase64Url(bytes: Uint8Array): string {
  * {@link encodeBase64Url}.
  *
  * @remarks
- * Restores the standard base64 alphabet + padding before decoding with
- * `atob`. THROWS `DOMException` on a malformed input — callers on the
- * untrusted-token path (`verifyToken`) catch it to stay total (AGENTS §14).
+ * Restores the standard base64 alphabet + padding before decoding through
+ * {@link decodeBase64}. THROWS `DOMException` on a malformed input — callers
+ * on the untrusted-token path (`verifyToken`) catch it to stay total
+ * (AGENTS §14).
  *
  * @param value - The base64url string to decode
  * @returns The decoded bytes
@@ -462,10 +505,7 @@ export function encodeBase64Url(bytes: Uint8Array): string {
 export function decodeBase64Url(value: string): Uint8Array<ArrayBuffer> {
 	const restored = value.replace(/-/g, '+').replace(/_/g, '/')
 	const padding = restored.length % 4 === 0 ? '' : '='.repeat(4 - (restored.length % 4))
-	const binary = atob(restored + padding)
-	const bytes = new Uint8Array(binary.length)
-	for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-	return bytes
+	return decodeBase64(restored + padding)
 }
 
 /**

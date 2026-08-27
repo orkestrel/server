@@ -16,10 +16,12 @@ import {
 	compose,
 	computeBodyETag,
 	ContentTooLargeError,
+	decodeBase64,
 	decodeBase64Url,
 	decodeCookieValue,
 	decompressRequestBody,
 	discoverPort,
+	encodeBase64,
 	encodeBase64Url,
 	HTTPError,
 	isAddressInfo,
@@ -441,6 +443,38 @@ describe('writeSignedCookie / readSignedCookie', () => {
 		expect(cookieHeader).toContain('Path=/account')
 		expect(cookieHeader).toContain('HttpOnly')
 		expect(cookieHeader).toContain('SameSite=Strict')
+	})
+})
+
+describe('encodeBase64 / decodeBase64', () => {
+	it('encodes standard padded Base64', () => {
+		expect(encodeBase64(new TextEncoder().encode('hi'))).toBe('aGk=')
+	})
+
+	it('round-trips arbitrary bytes, the full octet range included', () => {
+		const bytes = new Uint8Array(256)
+		for (let index = 0; index < bytes.length; index += 1) bytes[index] = index
+		expect(decodeBase64(encodeBase64(bytes))).toEqual(bytes)
+	})
+
+	it('round-trips UTF-8 text through the encoder', () => {
+		const encoded = encodeBase64(new TextEncoder().encode('café'))
+		expect(new TextDecoder().decode(decodeBase64(encoded))).toBe('café')
+	})
+
+	it('keeps the standard alphabet where base64url substitutes', () => {
+		const bytes = new Uint8Array([0xfb, 0xff, 0xbf])
+		expect(encodeBase64(bytes)).toBe('+/+/')
+		expect(encodeBase64Url(bytes)).toBe('-_-_')
+	})
+
+	it('round-trips the empty sequence', () => {
+		expect(encodeBase64(new Uint8Array(0))).toBe('')
+		expect(decodeBase64('')).toEqual(new Uint8Array(0))
+	})
+
+	it('throws DOMException on input outside the Base64 alphabet', () => {
+		expect(() => decodeBase64('not base64!')).toThrow(DOMException)
 	})
 })
 
