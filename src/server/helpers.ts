@@ -498,12 +498,8 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 	const dot = token.lastIndexOf('.')
 	if (dot < 0) return undefined
 	const encoded = token.slice(0, dot)
-	const decoded = decodeBase64URL(token.slice(dot + 1))
-	if (decoded === undefined) return undefined
-	// The codec declares `Uint8Array` (an `ArrayBufferLike` buffer), which is
-	// not a `BufferSource`; copy once into an `ArrayBuffer`-backed view rather
-	// than per candidate secret.
-	const signature = new Uint8Array(decoded)
+	const signature = decodeBase64URL(token.slice(dot + 1))
+	if (signature === undefined) return undefined
 	const data = new TextEncoder().encode(encoded)
 	try {
 		for (const candidate of secrets) {
