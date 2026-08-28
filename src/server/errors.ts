@@ -1,10 +1,10 @@
-// AGENTS §12: a handler signals a client-facing fault by throwing an
-// `HTTPError` carrying the HTTP `status` to send; the server's error boundary
-// (§5.3 of the proposal) turns it into a response of that status. Any OTHER
-// throw is a programmer/runtime error → a 500 (its message hidden unless
-// `expose`). The machine-readable field here is the numeric `status` (plus an
-// optional `context` bag) — `MultipartError` is NOT ported here: it moves to
-// the future `@orkestrel/middleware` package with its owner (`createMultipart`).
+// A handler signals a client-facing fault by throwing an `HTTPError` carrying
+// the HTTP `status` to send; the server's error boundary turns it into a
+// response of that status. Any OTHER throw is a programmer/runtime error → a
+// 500 (its message hidden unless `expose`). The machine-readable field here is
+// the numeric `status` (plus an optional `context` bag) — `MultipartError` is
+// NOT declared here: it belongs to `@orkestrel/middleware` with its owner
+// (`createMultipart`).
 //
 // Dual-package hazard: `instanceof HTTPError` fails when the thrown value was
 // constructed by a DIFFERENT copy of this package (version skew, a linked
@@ -48,7 +48,7 @@ import { HTTP_ERROR_BRAND } from './constants.js'
 export class HTTPError extends Error {
 	readonly status: number
 	readonly context?: Readonly<Record<string, unknown>>
-	// The cross-copy brand (AGENTS §12 / dual-package hazard) — `isHTTPError`
+	// The cross-copy brand (the dual-package hazard) — `isHTTPError`
 	// reads it structurally when `instanceof` fails across package copies.
 	// Not a public field to set by hand: the constructor is the only writer.
 	readonly [HTTP_ERROR_BRAND] = true

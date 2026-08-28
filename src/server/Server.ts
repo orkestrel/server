@@ -9,6 +9,7 @@ import type {
 	ConnectionStateFunction,
 	MiddlewareContext,
 	MiddlewareHandler,
+	RequestLine,
 	ServerEventMap,
 	ServerInterface,
 	ServerOptions,
@@ -34,7 +35,7 @@ import { HTTPError, isHTTPError } from './errors.js'
  * @typeParam TState - The consumer's opaque per-request state type
  *
  * @remarks
- * - **Lifecycle (AGENTS §10).** `start(signal?)` builds the underlying `node:http`
+ * - **Lifecycle.** `start(signal?)` builds the underlying `node:http`
  *   server, binds the configured {@link ServerOptions.host} / {@link
  *   ServerOptions.port} (omitted/`0` port ⇒ EPHEMERAL, resolved from the
  *   bound address), exposes that {@link AddressInfo} through `address`, observes
@@ -74,7 +75,7 @@ import { HTTPError, isHTTPError } from './errors.js'
  *   A CLAIMED socket joins `#upgraded` until it closes: the claimant still
  *   owns it, and the tracking exists because node detaches an upgraded socket
  *   from the set its own close calls walk, so nothing else can end it.
- * - **Observable (§13).** Owns an {@link Emitter} over {@link ServerEventMap}
+ * - **Observable.** Owns an {@link Emitter} over {@link ServerEventMap}
  *   exposed as `readonly emitter`; the emitter isolates a listener throw and
  *   routes it to the `error` OPTION (not the domain `error` event).
  */
@@ -91,7 +92,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #drain: number
 	readonly #limit: number
 	readonly #expose: boolean
-	readonly #report: ((error: unknown, request?: { method: string; url: URL }) => void) | undefined
+	readonly #report: ((error: unknown, request?: RequestLine) => void) | undefined
 	readonly #timeouts: {
 		readonly start?: number
 		readonly request?: number
@@ -152,13 +153,6 @@ export class Server<TState> implements ServerInterface<TState> {
 			...(options.on === undefined ? {} : { on: options.on }),
 			...(options.error === undefined ? {} : { error: options.error }),
 		})
-	}
-
-	// Everything `stop()` has to drain: in-flight requests plus the upgraded
-	// sockets handlers claimed. Derived, so the two counters can never drift
-	// out of step with a third stored flag.
-	get #inflight(): number {
-		return this.#pending + this.#upgraded.size
 	}
 
 	get status(): ServerStatus {
@@ -465,6 +459,13 @@ export class Server<TState> implements ServerInterface<TState> {
 				for (const socket of this.#upgraded) socket.destroy()
 			} else server.closeIdleConnections()
 		})
+	}
+
+	// Everything `stop()` has to drain: in-flight requests plus the upgraded
+	// sockets handlers claimed. Derived, so the two counters can never drift
+	// out of step with a third stored flag.
+	get #inflight(): number {
+		return this.#pending + this.#upgraded.size
 	}
 
 	// Arm a fresh drain wakeup when the server goes from settled to busy.

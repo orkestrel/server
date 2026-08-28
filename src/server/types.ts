@@ -1,20 +1,20 @@
 // ============================================================================
-//  The middleware seam + substrate — type definitions (the §5 source of
-//  truth). Two families, both `readonly` per AGENTS §11, both fetch/string-
-//  pure (no `node:*`, no DOM):
+//  The middleware seam + substrate — type definitions, the source of truth for
+//  this half of the package. Two families, both `readonly` (`AGENTS.md`
+//  § Non-negotiable rules), both fetch/string-pure (no `node:*`, no DOM):
 //
 //    1. The middleware seam — {@link MiddlewareContext}, {@link NextFunction},
-//       {@link MiddlewareHandler} — the frozen contract `compose` (U3) wires
-//       together and the future `@orkestrel/middleware` package peer-depends
-//       on. {@link ConnectionInfo} is the adapter-injected per-request fact
+//       {@link MiddlewareHandler} — the frozen contract `compose` wires
+//       together and the `@orkestrel/middleware` package peer-depends on.
+//       {@link ConnectionInfo} is the adapter-injected per-request fact
 //       slice a consumer's `state` function turns into its `TState`.
 //    2. The shared substrate's data shapes — cookies ({@link CookieOptions}),
 //       tokens ({@link TokenSecret} / {@link TokenOptions}), negotiation
 //       ({@link AcceptEntry} / {@link Encoding} / {@link FormatHandlerMap} /
 //       {@link NegotiatorInterface}), conditional requests ({@link RangeSpec}),
 //       SSE ({@link SSEMessage} / {@link StreamOptions} / {@link
-//       StreamInterface}), and the body pipeline ({@link BodyOptions}) — the
-//       future-middleware fuel `helpers.ts` (U2) implements against.
+//       StreamInterface}), and the body pipeline ({@link BodyOptions}) — what
+//       `helpers.ts` implements against and middleware builds on.
 // ============================================================================
 
 /**
@@ -183,6 +183,22 @@ export interface AcceptEntry {
 }
 
 /**
+ * Rates one candidate media type against a parsed `Accept` header — the
+ * quality and specificity `matchMediaType` reports for the best matching
+ * {@link AcceptEntry}.
+ *
+ * @remarks
+ * `q` is the client's quality weight in `[0, 1]`. `rank` is the specificity of
+ * the entry that matched: `0` for an exact type, `1` for a subtype wildcard
+ * (`type/*`), `2` for the any-range (`* / *`). A lower `rank` wins, and a
+ * higher `q` breaks a rank tie.
+ */
+export interface MediaMatch {
+	readonly q: number
+	readonly rank: number
+}
+
+/**
  * A content-coding the substrate compresses / decompresses with — the
  * `Content-Encoding` / `Accept-Encoding` token vocabulary it understands.
  *
@@ -190,10 +206,9 @@ export interface AcceptEntry {
  * `gzip` / `deflate` map to `CompressionStream` / `DecompressionStream`
  * (web-standard, no external codec); `identity` is the no-op "uncompressed"
  * coding. Brotli (`br`) has no `CompressionStream` implementation yet, so it
- * is deliberately OMITTED here — Brotli parity is the future middleware
- * package's node-entry decision (§3 of the proposal), not this core's. A
- * constrained set of external-spec literals, so it stays a union, not a
- * behavioral toggle (AGENTS §4.4).
+ * is deliberately OMITTED here — Brotli parity is the middleware package's
+ * node-entry decision, not this core's. A constrained set of external-spec
+ * literals, so it stays a union, not a behavioral toggle.
  */
 export type Encoding = 'gzip' | 'deflate' | 'identity'
 
@@ -431,12 +446,11 @@ export interface BodyOptions {
 }
 
 // ============================================================================
-//  The node face — type definitions (the §5 source of truth). The `Server`
+//  The node face — type definitions, the source of truth for the `Server`
 //  entity's public surface: the status machine, its observable events, the
-//  upgrade seam, connection-fact-derived state, and `createServer`'s options
-//  (AGENTS §5). Everything here is genuinely node-bound (PROPOSAL §4) — the
-//  middleware seam + substrate types are declared above in this same file,
-//  never re-declared.
+//  upgrade seam, connection-fact-derived state, and `createServer`'s options.
+//  Everything here is genuinely node-bound — the middleware seam + substrate
+//  types are declared earlier in this same file, never re-declared.
 // ============================================================================
 
 import type { IncomingMessage } from 'node:http'
@@ -446,7 +460,7 @@ import type { DispatcherInterface } from '@orkestrel/router'
 import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkestrel/emitter'
 
 /**
- * The `Server`'s lifecycle state (AGENTS §10 vocabulary).
+ * The `Server`'s lifecycle state.
  *
  * @remarks
  * `idle` (never started, or a fresh instance) → `starting` (binding the
@@ -458,7 +472,38 @@ import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkes
 export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'stopped'
 
 /**
- * The `Server`'s observable lifecycle events (AGENTS §13).
+ * Identifies the request a server-level fault came from — its method and its
+ * parsed URL.
+ *
+ * @remarks
+ * Carried by {@link ServerEventMap.error}'s optional second element and by
+ * {@link ServerOptions.report}'s optional second parameter, and present only
+ * when the fault happened on the per-request path — an upgrade-handler throw
+ * or a listen failure has no fetch `Request` to derive it from.
+ */
+export interface RequestLine {
+	readonly method: string
+	readonly url: URL
+}
+
+/**
+ * Records one finished request — the payload {@link ServerEventMap.response}
+ * carries.
+ *
+ * @remarks
+ * `method` and `pathname` come from the parsed request, `status` is the status
+ * actually sent (on the success path or the outer-boundary error path), and
+ * `ms` is the elapsed time in whole milliseconds.
+ */
+export interface ResponseRecord {
+	readonly method: string
+	readonly pathname: string
+	readonly status: number
+	readonly ms: number
+}
+
+/**
+ * The `Server`'s observable lifecycle events.
  *
  * @remarks
  * - `start` — `listen()` resolved; carries the actually-bound port (an
@@ -492,12 +537,10 @@ export type ServerEventMap = {
 	readonly start: readonly [port: number]
 	readonly request: readonly [method: string, pathname: string]
 	readonly upgrade: readonly [request: IncomingMessage, handled: boolean]
-	readonly error: readonly [error: unknown, request?: { method: string; url: URL }]
+	readonly error: readonly [error: unknown, request?: RequestLine]
 	readonly stop: readonly []
 	readonly drain: readonly [pending: number, upgraded: number]
-	readonly response: readonly [
-		event: { method: string; pathname: string; status: number; ms: number },
-	]
+	readonly response: readonly [event: ResponseRecord]
 }
 
 /**
@@ -505,13 +548,14 @@ export type ServerEventMap = {
  * {@link ServerInterface.upgrade}.
  *
  * @remarks
- * Fan-out semantics (verbatim, PROPOSAL §4): handlers run in registration
+ * Fan-out semantics: handlers run in registration
  * order, the FIRST to return `true` CLAIMS (owns) the socket and stops the
  * fan-out; a handler that THROWS is treated as declined (the throw surfaces
  * on the `error` event) and the fan-out continues; if NONE claim it, the
  * socket is destroyed so an unhandled upgrade never leaks a dangling
  * connection. `request` / `socket` / `head` are node's own raw values, handed
- * over verbatim — no assertion at this boundary (AGENTS §14).
+ * over verbatim — no assertion at this boundary (`AGENTS.md`
+ * § Non-negotiable rules).
  *
  * A CLAIMED socket is TRACKED until it closes. The handler still owns it —
  * the server only watches — but `stop()` now drains that socket like an
@@ -591,9 +635,9 @@ export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TS
  *   to `maxHeadersCount` (`0` disables the limit), and `requests` maps to
  *   `maxRequestsPerSocket` (`0` disables the limit). Every present value must
  *   be a non-negative integer. Omitted leaves preserve node's defaults.
- * @param on - The reserved {@link EmitterHooks} for {@link ServerEventMap}
- *   (AGENTS §8), wiring initial lifecycle listeners at construction.
- * @param error - The emitter's listener-error handler (AGENTS §13) — a
+ * @param on - The reserved {@link EmitterHooks} for {@link ServerEventMap},
+ *   wiring initial lifecycle listeners at construction.
+ * @param error - The emitter's listener-error handler — a
  *   listener throw routes here, never to the domain `error` event.
  */
 export interface ServerOptions<TState> {
@@ -605,7 +649,7 @@ export interface ServerOptions<TState> {
 	readonly drain?: number
 	readonly limit?: number
 	readonly expose?: boolean
-	readonly report?: (error: unknown, request?: { method: string; url: URL }) => void
+	readonly report?: (error: unknown, request?: RequestLine) => void
 	readonly timeouts?: {
 		readonly start?: number
 		readonly request?: number

@@ -69,9 +69,19 @@ describe('Negotiator#negotiate', () => {
 })
 
 describe('Negotiator#encoding', () => {
-	it('delegates to the shared negotiateEncoding helper', () => {
+	it('picks the highest-quality offered coding', () => {
 		const negotiator = new Negotiator()
 		expect(negotiator.encoding('gzip;q=1.0, deflate;q=0.8', ['gzip', 'deflate'])).toBe('gzip')
+	})
+
+	it('keeps server preference order on a client-side tie', () => {
+		const negotiator = new Negotiator()
+		expect(negotiator.encoding('gzip;q=1.0, deflate;q=1.0', ['deflate', 'gzip'])).toBe('deflate')
+	})
+
+	it('returns undefined when no coding is offered', () => {
+		const negotiator = new Negotiator()
+		expect(negotiator.encoding('gzip', [])).toBeUndefined()
 	})
 
 	it('honors the `*` wildcard as the first offered coding', () => {

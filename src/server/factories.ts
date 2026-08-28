@@ -6,10 +6,6 @@ import { Server } from './Server.js'
  * Create a {@link NegotiatorInterface} — the reusable content-negotiation
  * machine over the weighted `Accept` family.
  *
- * @remarks
- * Prefer this over `new Negotiator()` at call sites that only need the
- * interface.
- *
  * @returns A {@link NegotiatorInterface}
  *
  * @example

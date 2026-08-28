@@ -4,6 +4,7 @@ import type {
 	BodyOptions,
 	CookieOptions,
 	Encoding,
+	MediaMatch,
 	MiddlewareContext,
 	MiddlewareHandler,
 	RangeSpec,
@@ -26,9 +27,9 @@ import {
 } from './constants.js'
 import { ContentTooLargeError, HTTPError } from './errors.js'
 
-// The middleware seam's composition engine (AGENTS §5 — a pure function, not a
-// class: `compose` has no instance state, so it lives here rather than as an
-// entity). The RETURNING onion (§5.1 of the proposal): each middleware may
+// The middleware seam's composition engine — a pure function, not a class:
+// `compose` has no instance state, so it lives here rather than as an entity.
+// The RETURNING onion: each middleware may
 // transform the request (`next(newRequest)`), transform the response (`await
 // next()` then mutate the result), or short-circuit (return without calling
 // `next`) — no mutable framework object anywhere. The double-`next` guard
@@ -38,7 +39,7 @@ import { ContentTooLargeError, HTTPError } from './errors.js'
 
 /**
  * Compose an ordered chain of {@link MiddlewareHandler}s around a `terminal`
- * handler into one request handler — the frozen middleware seam (§5.1).
+ * handler into one request handler — the frozen middleware seam.
  *
  * @remarks
  * `middleware[0]` runs OUTERMOST: it is invoked first, and its call to `next`
@@ -113,7 +114,7 @@ export function wrapMiddleware<TState>(
 	}
 }
 
-// The cookie machinery (AGENTS §4.3 module-scope helpers) — `parseCookies`
+// The cookie machinery (module-scope helpers) — `parseCookies`
 // decodes a raw `Cookie:` header into a name→value lookup; `serializeCookie`
 // builds a spec-shaped `Set-Cookie` value with its attributes. The SIGNED
 // pair reuses the shipped HMAC token primitives rather than a second HMAC
@@ -122,7 +123,7 @@ export function wrapMiddleware<TState>(
 // verifyToken(parseCookies(...)[name], secret)` — so a cookie is just a
 // `signToken` value in a `Set-Cookie`, with the SAME secret rotation + tamper
 // rejection. Every reader narrows untrusted request input with `typeof`,
-// never `as` (§14), and total on hostile input.
+// never `as` (`AGENTS.md` § Non-negotiable rules), and total on hostile input.
 
 /**
  * Parse a raw `Cookie:` request header into a `name → value` lookup.
@@ -135,7 +136,7 @@ export function wrapMiddleware<TState>(
  * {@link isCookieName} rather than silently reconciling into a
  * prefix-protected `__Host-` name. A pair without `=`, or with an invalid
  * name, is skipped; a later duplicate name wins. TOTAL — an absent/empty/
- * malformed header yields an empty record, never throws (AGENTS §14).
+ * malformed header yields an empty record, never throws.
  *
  * @param header - The raw `Cookie` header value (possibly `undefined`)
  * @returns A record of every parsed cookie, `name → decoded value`
@@ -243,8 +244,7 @@ export function isCookieAttribute(value: string): boolean {
  * `Domain`, `Path` (default `/`), `Max-Age`, `HttpOnly` (default ON), `Secure`
  * (default OFF), `SameSite` (default `Lax`). `Domain` / `Path` are validated
  * with {@link isCookieAttribute} and THROW an {@link HTTPError} on an
- * injection attempt (a programmer misconfiguration, AGENTS §12 — never a
- * silent drop). A `sameSite: 'None'` cookie is ALWAYS `Secure` regardless of
+ * injection attempt (a programmer misconfiguration — never a silent drop). A `sameSite: 'None'` cookie is ALWAYS `Secure` regardless of
  * the `secure` option (the spec requires it); an un-resolved `undefined`
  * `secure` here falls to OFF — request-aware callers resolve it first via
  * {@link resolveSecure}.
@@ -339,7 +339,7 @@ export function appendCookie(headers: Headers, cookie: string): void {
  * (`<payload>.<signature>`), so a signed cookie is a stateless token in a
  * cookie — the same secret rotation and tamper rejection, no second HMAC
  * scheme. Appends (never clobbers) via {@link appendCookie}. Async — WebCrypto
- * signing is asynchronous (§3 of the proposal).
+ * signing is asynchronous.
  *
  * @param headers - The response `Headers` to write into
  * @param name - The cookie name
@@ -414,14 +414,14 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 	appendCookie(headers, serializeCookie(name, '', { ...options, maxAge: 0 }))
 }
 
-// The stateless signed-token primitives over WebCrypto (AGENTS §4.3 module-
-// scope helpers, §3 of the proposal). A token is `<payload>.<signature>`: the
+// The stateless signed-token primitives over WebCrypto (module-scope
+// helpers). A token is `<payload>.<signature>`: the
 // payload a base64url JSON `{ value, exp? }`, the signature an HMAC-SHA256 of
 // the payload under the secret. Signing always uses the FIRST secret (a
 // rotation list's current head); verifying accepts ANY secret in the list,
 // via `crypto.subtle.verify` — constant-time internally, so the old
 // `safeCompare` is RETIRED, never ported. `verifyToken` is TOTAL (never
-// throws — adversarial input returns `undefined`, AGENTS §14); only
+// throws — adversarial input returns `undefined`); only
 // `signToken` throws, and only on a misconfigured (empty) secret.
 
 /**
@@ -435,7 +435,7 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
  * {@link TokenSecret} (the current secret, or the head of a rotation list).
  * Blank/whitespace-only secrets are IGNORED ({@link normalizeSecret}); a
  * misconfigured secret with no usable entry THROWS an {@link HTTPError}
- * (`500`) — fail-closed, a programmer error (AGENTS §12). Verify with
+ * (`500`) — fail-closed, a programmer error. Verify with
  * {@link verifyToken}. Omitting `ttl` mints a token that never expires.
  *
  * @param value - The opaque value to embed (a session id, a deployment marker)
@@ -476,9 +476,10 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
  * base64url is refused there, before any key import — and checks the payload's
  * HMAC-SHA256 signature against EACH {@link TokenSecret} candidate via
  * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
- * retired, §3 of the proposal), accepting the token on the first match (the
+ * retired), accepting the token on the first match (the
  * rotation path). It then decodes + narrows the payload (`isRecord` +
- * `typeof`, never `as` — AGENTS §14) and, when an expiry was bound in,
+ * `typeof`, never `as` — `AGENTS.md` § Non-negotiable rules) and, when an
+ * expiry was bound in,
  * rejects an expired token. ANY failure — a malformed token, a bad signature,
  * a hostile/non-JSON payload, an empty secret list, or an elapsed expiry —
  * yields `undefined` rather than throwing.
@@ -530,7 +531,8 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
  * Decodes the payload with `@orkestrel/codec`'s `decodeBase64URL` (total — a
  * non-canonical base64url segment answers `undefined` rather than throwing),
  * reads it as UTF-8 JSON, narrows it to a record with a string `value`
- * (AGENTS §14 — never `as`), and rejects an expired `exp`. TOTAL — any
+ * (`AGENTS.md` § Non-negotiable rules — never `as`), and rejects an expired
+ * `exp`. TOTAL — any
  * decode/shape/expiry failure yields `undefined`; only `JSON.parse` still
  * throws, and its `catch` answers `undefined` too.
  *
@@ -575,9 +577,9 @@ export function normalizeSecret(secret: TokenSecret): readonly string[] {
 	return list.filter((entry) => entry.trim().length > 0)
 }
 
-// The content-negotiation helpers (AGENTS §4.3 module-scope, §5) — the ONE
-// shared q-value parser behind the `Negotiator` (U3) and any future
-// compression middleware's `Accept-Encoding` pick.
+// The content-negotiation helpers (module-scope) — the ONE shared q-value
+// parser behind the `Negotiator` and any compression middleware's
+// `Accept-Encoding` pick.
 
 /**
  * Parse a weighted `Accept` / `Accept-Encoding` / `Accept-Language` header
@@ -709,7 +711,7 @@ export function negotiateEncoding<T extends string>(
  *
  * @param entries - The parsed {@link AcceptEntry} list
  * @param candidate - The candidate media type to score (e.g. `'text/html'`)
- * @returns The `{ q, rank }` of the best matching entry, or `undefined` when nothing matches
+ * @returns The {@link MediaMatch} for the best matching entry, or `undefined` when nothing matches
  *
  * @example
  * ```ts
@@ -722,10 +724,10 @@ export function negotiateEncoding<T extends string>(
 export function matchMediaType(
 	entries: readonly AcceptEntry[],
 	candidate: string,
-): { readonly q: number; readonly rank: number } | undefined {
+): MediaMatch | undefined {
 	const slash = candidate.indexOf('/')
 	const type = slash === -1 ? candidate : candidate.slice(0, slash)
-	let best: { readonly q: number; readonly rank: number } | undefined
+	let best: MediaMatch | undefined
 	for (const entry of entries) {
 		let rank: number | undefined
 		if (entry.value === candidate) rank = 0
@@ -812,7 +814,7 @@ export function isCompressibleType(type: string): boolean {
 	return COMPRESSIBLE_TYPES.has(bare)
 }
 
-// The conditional-request helpers (AGENTS §4.3 module-scope, §5) — ETag
+// The conditional-request helpers (module-scope) — ETag
 // compute/compare (RFC 7232 §2.3.2 WEAK comparison) and the TOTAL `Range`
 // parser.
 
@@ -948,7 +950,7 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	return { satisfiable: true, start, end: Math.min(end, size - 1) }
 }
 
-// The security primitives (AGENTS §4.3 module-scope, §5) — CORS origin
+// The security primitives (module-scope) — CORS origin
 // resolution, `Vary` merging, security-header resolution, request-id
 // validation, and the IPv6 `/64` rate-key collapse.
 
@@ -1020,7 +1022,7 @@ export function mergeVary(existing: string | undefined, value: string): string {
  *
  * @remarks
  * The shared "a `string` value, or `false` to omit, or a default when unset"
- * resolution (AGENTS §4.4 — a value-or-off union, not a behavioral toggle):
+ * resolution (a value-or-off union, not a behavioral toggle):
  * `false` ⇒ `undefined` (omit the header), an explicit `string` ⇒ that
  * override, `undefined` (unset) ⇒ `fallback` (the secure default).
  *
@@ -1141,11 +1143,10 @@ export function clientRateKey(address: string): string {
 	return ipv6Network(address) ?? address
 }
 
-// The Server-Sent-Events seam (AGENTS §4.3 module-scope, §5.4 of the
-// proposal) — `serializeEvent` is the wire encoder (the exact inverse of a
-// consuming SSE parser); `openStream` is the generic `Response`-returning
-// stream handle any streaming route (SSE today, a future producer tomorrow)
-// opens over a `ReadableStream`.
+// The Server-Sent-Events seam (module-scope) — `serializeEvent` is the wire
+// encoder (the exact inverse of a consuming SSE parser); `openStream` is the
+// generic `Response`-returning stream handle any streaming route opens over a
+// `ReadableStream`.
 
 /**
  * Serialize one {@link SSEMessage} to the SSE wire.
@@ -1296,7 +1297,7 @@ export function openStream(options?: StreamOptions): StreamInterface {
 	}
 }
 
-// The body pipeline (AGENTS §4.3 module-scope, §5.4 of the proposal) —
+// The body pipeline (module-scope) —
 // `readBody` collects a request body capped at `limit` bytes (413 over),
 // transparently decompresses a `gzip`/`deflate` `Content-Encoding` body
 // through a byte-counting `TransformStream` that ABORTS the instant
@@ -1419,8 +1420,8 @@ export async function collectRequestBody(
  *
  * @remarks
  * Lower-cases + trims and returns the matching {@link Encoding} ONLY for
- * `gzip` / `deflate` (the two `DecompressionStream`-supported codings, §3 of
- * the proposal). An absent header, `identity`, an unknown value, or a
+ * `gzip` / `deflate` (the two `DecompressionStream`-supported codings). An
+ * absent header, `identity`, an unknown value, or a
  * comma-joined multi-coding all yield `undefined` (the body is read as-is).
  * TOTAL — never asserts the loose `string | null` header.
  *
@@ -1448,7 +1449,7 @@ export function requestEncoding(header: string | null): Exclude<Encoding, 'ident
  * Pipes `bytes` through `DecompressionStream(encoding)` and a byte-counting
  * `TransformStream` that ABORTS the pipe the INSTANT the running decompressed
  * total exceeds `cap` — fail-before-materialize, since `DecompressionStream`
- * has no `maxOutputLength` knob (§3 of the proposal). A cap breach surfaces
+ * has no `maxOutputLength` knob. A cap breach surfaces
  * as a {@link ContentTooLargeError} (413); a genuinely corrupt/truncated
  * compressed stream surfaces as a distinct `400`-mappable {@link HTTPError}
  * (never conflated with the cap). A non-positive `cap` means uncapped.
@@ -1554,7 +1555,7 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 }
 
 // ============================================================================
-//  The node face — pure helpers (AGENTS §5). Every function here is genuinely
+//  The node face — pure helpers. Every function here is genuinely
 //  node-bound (a `node:net` probe, an `AddressInfo` narrow) — everything
 //  fetch/string-pure lives above in this same file and is consumed, never
 //  duplicated (the socket-encrypted narrow and the `Request`/`Response`
@@ -1565,7 +1566,7 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 /**
  * Whether a `node:net` `server.address()` return is the structured
  * {@link AddressInfo} (carrying a numeric `port`) rather than a pipe `string`
- * or `null` — the total, never-throwing narrow (AGENTS §14) `discoverPort`
+ * or `null` — the total, never-throwing narrow `discoverPort`
  * and the `Server`'s own port resolution read the bound port through.
  *
  * @param value - The `server.address()` return (`AddressInfo | string | null`)

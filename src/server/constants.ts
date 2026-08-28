@@ -1,12 +1,12 @@
 import type { Encoding } from './types.js'
 
-// The substrate's tunable defaults (AGENTS §5 constants file) — only the
-// constants with a real consumer inside THIS package (AGENTS §21: build
-// against a concrete consumer, not speculatively). Frozen so a consumer can
-// read but never mutate the shared default. Middleware-package-only defaults
-// (rate limiting, CSRF, sessions, static serving, multipart — Appendix A of
-// the proposal) stay OUT of this file; they belong to that package's own
-// `constants.ts`.
+// The substrate's tunable defaults — only the constants with a real consumer
+// inside THIS package (`AGENTS.md` § Design laws: a capability arrives with
+// its first real consumer, never speculatively). Each is frozen or declared
+// readonly, so a consumer reads but never mutates the shared default. The
+// defaults only `@orkestrel/middleware` needs (rate limiting, CSRF, sessions,
+// static serving, multipart) stay OUT of this file; they belong to that
+// package's own `constants.ts`.
 
 /** Default graceful-stop deadline (ms) the server gives in-flight requests on `stop()`. */
 export const DEFAULT_DRAIN_MS = 10_000
@@ -69,9 +69,8 @@ export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
  * The strict charset `isValidRequestId` requires an incoming `X-Request-ID`
  * to match — `^[A-Za-z0-9_-]{1,200}$` — so a CRLF / log-injection / oversized
  * / control-char-bearing incoming id is REJECTED (a fresh id is minted
- * instead) rather than ever riding into a response header or `context.state`
- * (AGENTS §14 totality). Frozen so a consumer can read but never mutate the
- * shared default.
+ * instead) rather than ever riding into a response header or `context.state`.
+ * Frozen so a consumer can read but never mutate the shared default.
  */
 export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-]{1,200}$/)
 
@@ -84,23 +83,26 @@ export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-
  * The text-shaped application types worth compressing (JSON / JavaScript /
  * XML / SVG / WASM / a few document formats) — NOT already-compressed
  * binaries (`image/png`, `image/jpeg`, `video/*`, `application/zip`, a font's
- * `woff2`), which gzip/deflate would only bloat. Frozen so a consumer reads
- * but never mutates the shared default.
+ * `woff2`), which gzip/deflate would only bloat. The declared `ReadonlySet`
+ * withholds `add` / `delete` / `clear` from the shared default, so a consumer
+ * reads it without reaching a mutator.
  */
-export const COMPRESSIBLE_TYPES: ReadonlySet<string> = new Set([
-	'application/json',
-	'application/javascript',
-	'application/xml',
-	'application/xhtml+xml',
-	'application/rss+xml',
-	'application/atom+xml',
-	'application/ld+json',
-	'application/manifest+json',
-	'application/vnd.api+json',
-	'application/wasm',
-	'image/svg+xml',
-	'application/pdf',
-])
+export const COMPRESSIBLE_TYPES: ReadonlySet<string> = Object.freeze(
+	new Set([
+		'application/json',
+		'application/javascript',
+		'application/xml',
+		'application/xhtml+xml',
+		'application/rss+xml',
+		'application/atom+xml',
+		'application/ld+json',
+		'application/manifest+json',
+		'application/vnd.api+json',
+		'application/wasm',
+		'image/svg+xml',
+		'application/pdf',
+	]),
+)
 
 /**
  * The default {@link Encoding} content-codings the substrate offers, in
