@@ -1,12 +1,19 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { NegotiatorInterface, ServerInterface } from '@src/server'
+import type { NegotiatorInterface, ServerInterface, StreamInterface } from '@src/server'
 import { createDispatcher } from '@orkestrel/router'
-import { createNegotiator, createServer, Negotiator, Server } from '@src/server'
+import {
+	createNegotiator,
+	createServer,
+	createStream,
+	Negotiator,
+	Server,
+	Stream,
+} from '@src/server'
 
-// §16 mirror of `src/server/factories.ts` — `createNegotiator` round-trip
-// (instance satisfies the interface) plus its return-type assertion, and
-// `createServer` round-trip (instance satisfies the interface), option
-// threading, and construction guards firing through the factory.
+// Mirror of `src/server/factories.ts` — each factory's round-trip (the instance
+// it returns satisfies the interface it declares) plus its return-type
+// assertion, `createServer`'s option threading, and the construction guards
+// firing through the factory.
 
 describe('createNegotiator — round-trip', () => {
 	it('returns a Negotiator instance implementing NegotiatorInterface', () => {
@@ -88,5 +95,37 @@ describe('createServer — round-trip', () => {
 		expectTypeOf(createServer({ dispatcher, state: () => undefined })).toEqualTypeOf<
 			ServerInterface<undefined>
 		>()
+	})
+})
+
+describe('createStream — round-trip', () => {
+	it('returns a Stream instance implementing StreamInterface, open and writable', () => {
+		const stream = createStream()
+		expect(stream).toBeInstanceOf(Stream)
+		const check: StreamInterface = stream
+		expect(check).toBe(stream)
+		expect(stream.closed).toBe(false)
+		stream.end()
+	})
+
+	it('threads the status and header options through to the response', () => {
+		const stream = createStream({ status: 202, headers: { 'X-Trace': 'abc' } })
+		expect(stream.response.status).toBe(202)
+		expect(stream.response.headers.get('x-trace')).toBe('abc')
+		stream.end()
+	})
+
+	it('is independently usable — writes events a consumer reads off the response body', async () => {
+		const stream = createStream()
+		stream.write({ event: 'token', data: 'hello' })
+		stream.comment('keep-alive')
+		stream.end()
+		await expect(new Response(stream.response.body).text()).resolves.toBe(
+			'event: token\ndata: hello\n\n: keep-alive\n\n',
+		)
+	})
+
+	it('returns StreamInterface — a factory return type assertion', () => {
+		expectTypeOf(createStream()).toEqualTypeOf<StreamInterface>()
 	})
 })

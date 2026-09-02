@@ -1,6 +1,6 @@
 import { afterEach, vi } from 'vitest'
 
-// ── Environment-agnostic base setup (AGENTS §16.1) ────────────────────────────
+// ── Environment-agnostic base setup ───────────────────────────────────────────
 //
 // Loaded first by every test project (`vite.config.ts` `setupFiles[0]`). Holds
 // ONLY helpers with no `node:*` / DOM / Vue dependency, so it is safe for

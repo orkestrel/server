@@ -16,7 +16,14 @@
 // fields the server's boundary reads off a recognized error (`status`,
 // `message`) — so a foreign-copy instance the guard accepts can never crash
 // the boundary that trusts it.
+//
+// `ServerError` is the other half of the vocabulary and never reaches that
+// boundary: it reports a lifecycle call the CALLER programmed wrong, so it
+// keys on a `ServerErrorCode` rather than a `status`, and `isServerError`
+// narrows it with a plain `instanceof`. No error boundary consumes it across
+// package copies, so it carries no cross-copy brand.
 
+import type { ServerErrorCode } from './types.js'
 import { isNumber, isString } from '@orkestrel/contract'
 import { HTTP_ERROR_BRAND } from './constants.js'
 
@@ -123,4 +130,69 @@ export function isHTTPError(value: unknown): value is HTTPError {
 	if (!(HTTP_ERROR_BRAND in value) || value[HTTP_ERROR_BRAND] !== true) return false
 	if (!('status' in value) || !('message' in value)) return false
 	return isNumber(value.status) && isString(value.message)
+}
+
+/**
+ * The error the `Server` raises when a lifecycle call cannot run from the
+ * status the entity is in.
+ *
+ * @remarks
+ * Carries a machine-readable {@link ServerErrorCode} and an optional `context`
+ * record naming the offending facts. This is a PROGRAMMER error — the caller
+ * asked for a transition the status machine forbids — so it never reaches the
+ * request error boundary and never carries an HTTP `status`; throw an
+ * {@link HTTPError} for a client-facing fault instead. Narrow a caught value
+ * with {@link isServerError}.
+ *
+ * @example
+ * ```ts
+ * import { ServerError } from '@src/server'
+ *
+ * const error = new ServerError('status', "server cannot start from 'listening'", {
+ * 	status: 'listening',
+ * })
+ * error.code // 'status'
+ * ```
+ */
+export class ServerError extends Error {
+	readonly code: ServerErrorCode
+	readonly context?: Readonly<Record<string, unknown>>
+
+	constructor(code: ServerErrorCode, message: string, context?: Readonly<Record<string, unknown>>) {
+		super(message)
+		this.name = 'ServerError'
+		this.code = code
+		if (context !== undefined) this.context = context
+	}
+}
+
+/**
+ * Narrows an unknown caught value to a {@link ServerError}.
+ *
+ * @param value - The value to test (typically a `catch` binding)
+ * @returns True if `value` is a {@link ServerError}; false otherwise
+ *
+ * @remarks
+ * Recognizes an instance built by THIS copy of the package. A `ServerError`
+ * is raised by a `Server` to the caller that just invoked it, so both sides
+ * hold the same copy and the cross-copy brand {@link isHTTPError} needs has no
+ * consumer here.
+ *
+ * @example
+ * ```ts
+ * import { createServer, isServerError } from '@src/server'
+ * import { createDispatcher } from '@orkestrel/router'
+ *
+ * const server = createServer({ dispatcher: createDispatcher(), state: () => ({}) })
+ * await server.start()
+ * try {
+ * 	await server.start()
+ * } catch (error) {
+ * 	if (isServerError(error)) console.log(error.code) // 'status'
+ * }
+ * await server.stop()
+ * ```
+ */
+export function isServerError(value: unknown): value is ServerError {
+	return value instanceof ServerError
 }

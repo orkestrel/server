@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { ContentTooLargeError, HTTP_ERROR_BRAND, HTTPError, isHTTPError } from '@src/server'
+import {
+	ContentTooLargeError,
+	HTTP_ERROR_BRAND,
+	HTTPError,
+	isHTTPError,
+	isServerError,
+	ServerError,
+} from '@src/server'
 
 describe('HTTPError', () => {
 	it('carries the status and message', () => {
@@ -79,5 +86,45 @@ describe('isHTTPError', () => {
 			{ [HTTP_ERROR_BRAND]: true, status: 413, message: 'too large', name: 'ContentTooLargeError' },
 		)
 		expect(isHTTPError(foreignSubclass)).toBe(true)
+	})
+})
+
+describe('ServerError', () => {
+	it('carries the code, the message, and its name', () => {
+		const error = new ServerError('status', "server cannot start from 'listening'")
+		expect(error.code).toBe('status')
+		expect(error.message).toBe("server cannot start from 'listening'")
+		expect(error.name).toBe('ServerError')
+		expect(error.context).toBeUndefined()
+	})
+
+	it('carries an optional context record', () => {
+		const error = new ServerError('status', 'refused', { status: 'stopping' })
+		expect(error.context).toEqual({ status: 'stopping' })
+	})
+
+	it('is a real Error instance and not an HTTPError', () => {
+		const error = new ServerError('status', 'refused')
+		expect(error).toBeInstanceOf(Error)
+		expect(error).not.toBeInstanceOf(HTTPError)
+		expect(isHTTPError(error)).toBe(false)
+	})
+})
+
+describe('isServerError', () => {
+	it('narrows a ServerError', () => {
+		expect(isServerError(new ServerError('status', 'refused'))).toBe(true)
+	})
+
+	it('rejects a generic Error and an HTTPError', () => {
+		expect(isServerError(new Error('plain'))).toBe(false)
+		expect(isServerError(new HTTPError(404, 'not found'))).toBe(false)
+	})
+
+	it('rejects non-error values and a bare code-carrying lookalike', () => {
+		expect(isServerError(undefined)).toBe(false)
+		expect(isServerError(null)).toBe(false)
+		expect(isServerError('ServerError')).toBe(false)
+		expect(isServerError({ code: 'status', message: 'refused' })).toBe(false)
 	})
 })

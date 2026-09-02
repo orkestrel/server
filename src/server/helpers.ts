@@ -9,8 +9,6 @@ import type {
 	MiddlewareHandler,
 	RangeSpec,
 	SSEMessage,
-	StreamInterface,
-	StreamOptions,
 	TokenOptions,
 	TokenSecret,
 } from './types.js'
@@ -23,7 +21,6 @@ import {
 	DEFAULT_BODY_LIMIT,
 	DEFAULT_DECOMPRESSED_LIMIT,
 	REQUEST_ID_PATTERN,
-	SSE_HEADERS,
 } from './constants.js'
 import { ContentTooLargeError, HTTPError } from './errors.js'
 
@@ -290,7 +287,7 @@ export function serializeCookie(name: string, value: string, options?: CookieOpt
  * gets `Secure` automatically while local-dev HTTP still works.
  *
  * @param secure - The {@link CookieOptions} `secure` setting
- * @param encrypted - The connection's TLS flag ({@link import('./types.js').ConnectionInfo.encrypted})
+ * @param encrypted - The connection's TLS flag ({@link import('./types.js').Connection.encrypted})
  * @returns The concrete `Secure` flag to emit
  *
  * @example
@@ -306,40 +303,15 @@ export function resolveSecure(secure: boolean | undefined, encrypted: boolean): 
 }
 
 /**
- * Append a `Set-Cookie` header onto a fetch-standard `Headers` WITHOUT
- * clobbering a prior one.
- *
- * @remarks
- * `Headers.append` already accumulates repeated headers (unlike node's
- * `setHeader`), so this is a thin, self-documenting wrapper naming the
- * cookie-append intent — the primitive {@link writeSignedCookie} /
- * {@link clearCookie} use.
- *
- * @param headers - The response `Headers` to write into
- * @param cookie - The fully-serialized `Set-Cookie` value (from {@link serializeCookie})
- *
- * @example
- * ```ts
- * const headers = new Headers()
- * appendCookie(headers, serializeCookie('a', '1'))
- * appendCookie(headers, serializeCookie('b', '2'))
- * headers.get('set-cookie') // 'a=1; Path=/; HttpOnly; SameSite=Lax, b=2; …'
- * ```
- */
-export function appendCookie(headers: Headers, cookie: string): void {
-	headers.append('set-cookie', cookie)
-}
-
-/**
- * Write a SIGNED cookie — HMAC-sign `value` with {@link signToken} and append
- * it as a `Set-Cookie` (the inverse of {@link readSignedCookie}).
+ * Writes a SIGNED cookie — HMAC-signs `value` with {@link signToken} and
+ * appends it as a `Set-Cookie` (the inverse of {@link readSignedCookie}).
  *
  * @remarks
  * The cookie value is `await signToken(value, { secret })`
  * (`<payload>.<signature>`), so a signed cookie is a stateless token in a
  * cookie — the same secret rotation and tamper rejection, no second HMAC
- * scheme. Appends (never clobbers) via {@link appendCookie}. Async — WebCrypto
- * signing is asynchronous.
+ * scheme. Appends (never clobbers) through `Headers.append`, which accumulates
+ * repeated headers. Async — WebCrypto signing is asynchronous.
  *
  * @param headers - The response `Headers` to write into
  * @param name - The cookie name
@@ -360,7 +332,7 @@ export async function writeSignedCookie(
 	secret: TokenSecret,
 	options?: CookieOptions,
 ): Promise<void> {
-	appendCookie(headers, serializeCookie(name, await signToken(value, { secret }), options))
+	headers.append('set-cookie', serializeCookie(name, await signToken(value, { secret }), options))
 }
 
 /**
@@ -393,7 +365,7 @@ export async function readSignedCookie(
 }
 
 /**
- * Clear a cookie — append a `Set-Cookie` that expires it immediately (`Max-Age=0`).
+ * Clears a cookie — appends a `Set-Cookie` that expires it immediately (`Max-Age=0`).
  *
  * @remarks
  * Writes an empty-valued cookie of the same `name` with `Max-Age=0` plus the
@@ -411,7 +383,7 @@ export async function readSignedCookie(
  * ```
  */
 export function clearCookie(headers: Headers, name: string, options?: CookieOptions): void {
-	appendCookie(headers, serializeCookie(name, '', { ...options, maxAge: 0 }))
+	headers.append('set-cookie', serializeCookie(name, '', { ...options, maxAge: 0 }))
 }
 
 // The stateless signed-token primitives over WebCrypto (module-scope
@@ -629,9 +601,9 @@ export function parseAcceptHeader(header: string): readonly AcceptEntry[] {
 }
 
 /**
- * The client's quality (q) for one content-coding from the parsed
- * `Accept-Encoding` entries — backs {@link negotiateEncoding}'s
- * server-preference selection.
+ * Computes the client's quality (q) for one content-coding from the parsed
+ * `Accept-Encoding` entries — the scoring leaf {@link pickCoding} runs over
+ * each offered coding.
  *
  * @remarks
  * Prefers an EXACT named match (including an explicit `;q=0` rejection);
@@ -645,11 +617,11 @@ export function parseAcceptHeader(header: string): readonly AcceptEntry[] {
  *
  * @example
  * ```ts
- * codingQuality(parseAcceptHeader('gzip;q=0.5, *;q=0.1'), 'gzip') // 0.5
- * codingQuality(parseAcceptHeader('gzip;q=0.5, *;q=0.1'), 'br') // 0.1
+ * computeCodingQuality(parseAcceptHeader('gzip;q=0.5, *;q=0.1'), 'gzip') // 0.5
+ * computeCodingQuality(parseAcceptHeader('gzip;q=0.5, *;q=0.1'), 'br') // 0.1
  * ```
  */
-export function codingQuality(entries: readonly AcceptEntry[], coding: string): number {
+export function computeCodingQuality(entries: readonly AcceptEntry[], coding: string): number {
 	const named = entries.find((entry) => entry.value === coding)
 	if (named !== undefined) return named.q
 	const wildcard = entries.find((entry) => entry.value === '*')
@@ -657,15 +629,56 @@ export function codingQuality(entries: readonly AcceptEntry[], coding: string): 
 }
 
 /**
- * Select the best content-coding for an `Accept-Encoding` header from the
+ * Picks the highest-scoring content-coding the server offers against already
+ * parsed `Accept-Encoding` entries.
+ *
+ * @remarks
+ * The single selection leaf behind both doors onto this axis —
+ * {@link negotiateEncoding} for a raw header, and `Negotiator.encoding` for the
+ * entity — so the scoring loop has one implementation. Scores each `available`
+ * coding with {@link computeCodingQuality} and keeps the highest; a strict `>`
+ * keeps the earlier-offered coding on a client-side tie, which is what makes
+ * `available` the SERVER's preference order. An empty `available` list, and a
+ * list the client rejects outright, both yield `undefined` (identity — no
+ * compression). TOTAL on hostile input.
+ *
+ * @typeParam T - The coding string type (so a `readonly Encoding[]` returns an `Encoding`)
+ * @param entries - The parsed {@link AcceptEntry} list
+ * @param available - The codings the server offers, in preference (tie-break) order
+ * @returns The winning coding, or `undefined` when none of `available` is acceptable
+ *
+ * @example
+ * ```ts
+ * pickCoding(parseAcceptHeader('gzip;q=1.0, deflate;q=0.8'), ['gzip', 'deflate']) // 'gzip'
+ * pickCoding(parseAcceptHeader('br;q=1.0'), ['gzip']) // undefined
+ * ```
+ */
+export function pickCoding<T extends string>(
+	entries: readonly AcceptEntry[],
+	available: readonly T[],
+): T | undefined {
+	let best: T | undefined
+	let bestQuality = 0
+	for (const coding of available) {
+		const quality = computeCodingQuality(entries, coding)
+		if (quality > bestQuality) {
+			best = coding
+			bestQuality = quality
+		}
+	}
+	return best
+}
+
+/**
+ * Selects the best content-coding for a raw `Accept-Encoding` header from the
  * codings the server offers.
  *
  * @remarks
- * Parses the header ({@link parseAcceptHeader}) and scores each `available`
- * coding in the SERVER's preference order ({@link codingQuality}), keeping
- * the highest-scoring one (a strict `>` keeps the earlier-offered coding on a
- * client-side tie). Returns `undefined` when the client accepts none of
- * `available` (identity — no compression). TOTAL on hostile input.
+ * Parses the header ({@link parseAcceptHeader}) and hands the entries to
+ * {@link pickCoding}, the same selection leaf `Negotiator.encoding` runs, so
+ * the two doors onto this axis cannot drift. Returns `undefined` when the
+ * client accepts none of `available` (identity — no compression). TOTAL on
+ * hostile input.
  *
  * @typeParam T - The coding string type (so a `readonly Encoding[]` returns an `Encoding`)
  * @param header - The raw `Accept-Encoding` header value
@@ -682,17 +695,7 @@ export function negotiateEncoding<T extends string>(
 	available: readonly T[],
 ): T | undefined {
 	if (available.length === 0) return undefined
-	const entries = parseAcceptHeader(header)
-	let best: T | undefined
-	let bestQuality = 0
-	for (const coding of available) {
-		const quality = codingQuality(entries, coding)
-		if (quality > bestQuality) {
-			best = coding
-			bestQuality = quality
-		}
-	}
-	return best
+	return pickCoding(parseAcceptHeader(header), available)
 }
 
 /**
@@ -749,8 +752,9 @@ export function matchMediaType(
 }
 
 /**
- * The client's quality for one `candidate` language from the parsed
- * `Accept-Language` entries — backs the `Negotiator`'s `language` axis.
+ * Computes the client's quality for one `candidate` language from the parsed
+ * `Accept-Language` entries — the scoring leaf the `Negotiator`'s `language`
+ * axis runs over each offered tag.
  *
  * @remarks
  * Prefers an exact match, then a primary-tag prefix match (`en` accepts
@@ -763,12 +767,12 @@ export function matchMediaType(
  *
  * @example
  * ```ts
- * languageQuality(parseAcceptHeader('en-US, en;q=0.8'), 'en-US') // 1
- * languageQuality(parseAcceptHeader('en;q=0.8'), 'en-US') // 0.8 — primary-tag prefix
- * languageQuality(parseAcceptHeader('*;q=0.5'), 'fr') // 0.5 — wildcard
+ * computeLanguageQuality(parseAcceptHeader('en-US, en;q=0.8'), 'en-US') // 1
+ * computeLanguageQuality(parseAcceptHeader('en;q=0.8'), 'en-US') // 0.8 — primary-tag prefix
+ * computeLanguageQuality(parseAcceptHeader('*;q=0.5'), 'fr') // 0.5 — wildcard
  * ```
  */
-export function languageQuality(entries: readonly AcceptEntry[], candidate: string): number {
+export function computeLanguageQuality(entries: readonly AcceptEntry[], candidate: string): number {
 	const lower = candidate.toLowerCase()
 	const primary = lower.split('-')[0]
 	let named: number | undefined
@@ -1070,7 +1074,7 @@ export function isValidRequestId(value: string): boolean {
 }
 
 /**
- * Compute the `/64` network of a full IPv6 address, or `undefined` when the
+ * Computes the `/64` network of a full IPv6 address, or `undefined` when the
  * input is not a plain IPv6 address to collapse.
  *
  * @remarks
@@ -1086,11 +1090,11 @@ export function isValidRequestId(value: string): boolean {
  *
  * @example
  * ```ts
- * ipv6Network('2001:db8:1:2::1') // '2001:db8:1:2::/64'
- * ipv6Network('192.0.2.1') // undefined — IPv4, not collapsed
+ * computeIPv6Network('2001:db8:1:2::1') // '2001:db8:1:2::/64'
+ * computeIPv6Network('192.0.2.1') // undefined — IPv4, not collapsed
  * ```
  */
-export function ipv6Network(address: string): string | undefined {
+export function computeIPv6Network(address: string): string | undefined {
 	if (/^::ffff:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/i.test(address)) return undefined
 	const percent = address.indexOf('%')
 	const bare = percent === -1 ? address : address.slice(0, percent)
@@ -1120,33 +1124,33 @@ export function ipv6Network(address: string): string | undefined {
 }
 
 /**
- * Collapse a client IP into its rate-limit BUCKET key — an IPv6 address to
+ * Collapses a client IP into its rate-limit BUCKET key — an IPv6 address to
  * its `/64` network, an IPv4 (or IPv4-mapped) address unchanged.
  *
  * @remarks
  * A residential/mobile IPv6 user is routinely handed a WHOLE `/64`, so a
  * per-`/128` rate limit is trivially bypassed by rotating host bits — the
  * real identity is the `/64` network. Delegates the IPv6 collapse to
- * {@link ipv6Network}; anything it returns `undefined` for (an IPv4 address,
+ * {@link computeIPv6Network}; anything it returns `undefined` for (an IPv4 address,
  * a malformed string) is kept unchanged.
  *
- * @param address - The raw connection peer address ({@link import('./types.js').ConnectionInfo.ip})
+ * @param address - The raw connection peer address ({@link import('./types.js').Connection.ip})
  * @returns The bucket key — the `/64` network for an IPv6 address, else the address unchanged
  *
  * @example
  * ```ts
- * clientRateKey('2001:db8:1:2:dead:beef:0:9') // '2001:db8:1:2::/64'
- * clientRateKey('192.0.2.1') // '192.0.2.1'
+ * computeClientKey('2001:db8:1:2:dead:beef:0:9') // '2001:db8:1:2::/64'
+ * computeClientKey('192.0.2.1') // '192.0.2.1'
  * ```
  */
-export function clientRateKey(address: string): string {
-	return ipv6Network(address) ?? address
+export function computeClientKey(address: string): string {
+	return computeIPv6Network(address) ?? address
 }
 
 // The Server-Sent-Events seam (module-scope) — `serializeEvent` is the wire
-// encoder (the exact inverse of a consuming SSE parser); `openStream` is the
-// generic `Response`-returning stream handle any streaming route opens over a
-// `ReadableStream`.
+// encoder (the exact inverse of a consuming SSE parser). The stream handle
+// that writes those events over a `ReadableStream` is the `Stream` entity,
+// reached through `createStream`.
 
 /**
  * Serialize one {@link SSEMessage} to the SSE wire.
@@ -1174,127 +1178,6 @@ export function serializeEvent(message: SSEMessage): string {
 	if (message.retry !== undefined) lines.push(`retry: ${message.retry}`)
 	for (const segment of message.data.split(/\r\n|\r|\n/)) lines.push(`data: ${segment}`)
 	return `${lines.join('\n')}\n\n`
-}
-
-/**
- * Enqueue encoded text into an open byte stream.
- *
- * @param controller - The stream controller, when the stream has started
- * @param encoder - The encoder used for the stream's byte representation
- * @param closed - Whether the stream has already ended or been cancelled
- * @param text - The text to encode and enqueue
- * @returns Nothing
- *
- * @example
- * ```ts
- * const body = new ReadableStream<Uint8Array>({
- * 	start(controller) {
- * 		enqueueStreamText(controller, new TextEncoder(), false, 'hello')
- * 	},
- * })
- * ```
- */
-export function enqueueStreamText(
-	controller: ReadableStreamDefaultController<Uint8Array> | undefined,
-	encoder: TextEncoder,
-	closed: boolean,
-	text: string,
-): void {
-	if (closed || controller === undefined) return
-	controller.enqueue(encoder.encode(text))
-}
-
-/**
- * Open a generic Server-Sent-Events stream — a fetch-standard `Response`
- * whose body is a `ReadableStream` a caller writes {@link SSEMessage}s into.
- *
- * @remarks
- * Builds the `Response` immediately with {@link import('./constants.js').SSE_HEADERS}
- * merged under any `options.headers` (a seam-owned key is never overridden),
- * at `options.status` (default `200`). The returned {@link StreamInterface}'s
- * `write` serializes one message ({@link serializeEvent}), enqueues it, and
- * returns whether the controller still has positive desired size. A producer
- * receiving `false` can await `drain()`; its event-driven promise resolves on
- * the next consumer pull that restores capacity, or on stream closure.
- * `comment` writes a `: text` keep-alive line a conforming parser ignores;
- * `end` closes the stream. Every method is a SAFE NO-OP once `closed` (ended
- * by `end()`, or the consumer cancelled the stream), so a late write never
- * throws.
- *
- * This readiness reflects only the process-local `ReadableStream` queue — it
- * is not proof that a remote peer consumed bytes. When the response pump
- * honors its socket sink's drain state, socket pressure stops body pulls and
- * therefore keeps this queue full, allowing a cooperative producer to bound
- * buffering. Ignoring the return value preserves the prior unconditional-
- * enqueue behavior. The default stream strategy counts chunks rather than
- * their byte length, so a byte-bounded producer must also cap each message.
- * Return `response` before awaiting a `false` write, because the consumer
- * cannot pull until it receives the response.
- *
- * @param options - Optional `status` + extra `headers`; see {@link StreamOptions}
- * @returns The {@link StreamInterface} handle
- *
- * @example
- * ```ts
- * const stream = openStream()
- * void Promise.resolve().then(async () => {
- * 	if (!stream.write({ event: 'token', data: 'hello' })) await stream.drain()
- * 	stream.end()
- * })
- * // return stream.response from the route handler
- * ```
- */
-export function openStream(options?: StreamOptions): StreamInterface {
-	const encoder = new TextEncoder()
-	let closed = false
-	let controller: ReadableStreamDefaultController<Uint8Array> | undefined
-	let wakeup: PromiseWithResolvers<void> | undefined
-	const body = new ReadableStream<Uint8Array>({
-		start(streamController) {
-			controller = streamController
-		},
-		pull(streamController) {
-			if (streamController.desiredSize === null || streamController.desiredSize <= 0) return
-			wakeup?.resolve()
-			wakeup = undefined
-		},
-		cancel() {
-			closed = true
-			wakeup?.resolve()
-			wakeup = undefined
-		},
-	})
-	const headers = new Headers({ ...SSE_HEADERS, ...options?.headers })
-	const response = new Response(body, { status: options?.status ?? 200, headers })
-	return {
-		response,
-		get closed(): boolean {
-			return closed
-		},
-		write(message: SSEMessage): boolean {
-			if (closed || controller === undefined) return false
-			enqueueStreamText(controller, encoder, closed, serializeEvent(message))
-			return controller.desiredSize !== null && controller.desiredSize > 0
-		},
-		comment(text: string): void {
-			enqueueStreamText(controller, encoder, closed, `: ${text}\n\n`)
-		},
-		drain(): Promise<void> {
-			const desired = controller?.desiredSize
-			if (closed || (desired !== undefined && desired !== null && desired > 0)) {
-				return Promise.resolve()
-			}
-			wakeup ??= Promise.withResolvers<void>()
-			return wakeup.promise
-		},
-		end(): void {
-			if (closed) return
-			closed = true
-			controller?.close()
-			wakeup?.resolve()
-			wakeup = undefined
-		},
-	}
 }
 
 // The body pipeline (module-scope) —

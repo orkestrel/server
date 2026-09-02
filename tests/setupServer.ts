@@ -4,10 +4,10 @@ import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { resolveRoot } from '@orkestrel/test'
 
-// ── Server-only setup (AGENTS §16.1 / §17.6) ─────────────────────────────────
+// ── Server-only setup ────────────────────────────────────────────────────────
 //
 // Loaded after `setup.ts` for the `src:server` test project. Holds `node:*`
-// helpers for the server face's real-socket tests (§8/§16: no mocks — a real
+// helpers for the server face's real-socket tests (no mocks — a real
 // `node:http` server on an ephemeral port, closed by every caller).
 
 /** The workspace root, anchored from this setup file's own location. */
@@ -23,7 +23,7 @@ export interface UpgradeOutcomeInterface {
  * Send a raw, hand-written HTTP request over a bare `node:net` socket and
  * resolve with whatever bytes come back — the real-socket probe for
  * malformed-request vectors (a bad `Host` header) that `fetch` would refuse
- * to send (§16: no mocks, a genuinely raw wire payload).
+ * to send (no mocks, a genuinely raw wire payload).
  *
  * @param port - The target server's bound port (assumed `127.0.0.1`)
  * @param raw - The complete raw HTTP request text (including the trailing
@@ -185,7 +185,7 @@ export interface HeldUpgradeInterface {
  * @remarks
  * The sibling of {@link upgradeRequest}, which ends the socket the moment the
  * `101` lands and so can never hold the server's stop path open. Real client
- * sockets throughout (§16: no mocks); `closed` resolves when the server cuts
+ * sockets throughout (no mocks); `closed` resolves when the server cuts
  * the connection, which is how a test proves the force-close reached the peer
  * rather than only the server's own bookkeeping.
  *
@@ -227,7 +227,7 @@ export async function holdUpgrade(port: number, path = '/'): Promise<HeldUpgrade
 
 /**
  * Drives a raw `node:http` protocol-upgrade request against a running server —
- * the real-socket probe the server face's upgrade-seam tests use (§16: no
+ * the real-socket probe the server face's upgrade-seam tests use (no
  * mocks). Resolves after the outcome is known: a `101` upgrade response means a
  * registered handler CLAIMED the socket, and an ordinary HTTP response or a
  * connection error from a destroyed socket means none did.

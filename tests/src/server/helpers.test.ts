@@ -1,21 +1,16 @@
 import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type {
-	ConnectionInfo,
-	MiddlewareContext,
-	MiddlewareHandler,
-	NextFunction,
-	StreamInterface,
-} from '@src/server'
+import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
 import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { createDispatcher } from '@orkestrel/router'
 import {
-	appendCookie,
 	clearCookie,
-	clientRateKey,
-	codingQuality,
 	compose,
 	computeBodyETag,
+	computeClientKey,
+	computeCodingQuality,
+	computeIPv6Network,
+	computeLanguageQuality,
 	ContentTooLargeError,
 	decodeCookieValue,
 	decompressRequestBody,
@@ -27,17 +22,15 @@ import {
 	isCookieName,
 	isDangerousKey,
 	isValidRequestId,
-	ipv6Network,
-	languageQuality,
 	matchesETag,
 	matchMediaType,
 	mergeVary,
 	negotiateEncoding,
 	normalizeSecret,
-	openStream,
 	parseAcceptHeader,
 	parseCookies,
 	parseRange,
+	pickCoding,
 	readBody,
 	readSignedCookie,
 	requestEncoding,
@@ -287,13 +280,13 @@ describe('MiddlewareContext<TState> / NextFunction / MiddlewareHandler<TState> �
 	})
 })
 
-describe('ConnectionInfo — shape', () => {
+describe('Connection — shape', () => {
 	it('exposes an optional ip and a required encrypted boolean', () => {
-		expectTypeOf<ConnectionInfo>().toHaveProperty('ip')
-		expectTypeOf<ConnectionInfo['ip']>().toEqualTypeOf<string | undefined>()
-		expectTypeOf<ConnectionInfo['encrypted']>().toEqualTypeOf<boolean>()
-		const connection: ConnectionInfo = { encrypted: false }
-		expectTypeOf(connection).toEqualTypeOf<ConnectionInfo>()
+		expectTypeOf<Connection>().toHaveProperty('ip')
+		expectTypeOf<Connection['ip']>().toEqualTypeOf<string | undefined>()
+		expectTypeOf<Connection['encrypted']>().toEqualTypeOf<boolean>()
+		const connection: Connection = { encrypted: false }
+		expectTypeOf(connection).toEqualTypeOf<Connection>()
 	})
 })
 
@@ -386,20 +379,20 @@ describe('resolveSecure', () => {
 	})
 })
 
-describe('appendCookie / clearCookie', () => {
-	it('appends without clobbering a prior Set-Cookie', () => {
-		const headers = new Headers()
-		appendCookie(headers, serializeCookie('a', '1'))
-		appendCookie(headers, serializeCookie('b', '2'))
-		const value = headers.get('set-cookie') ?? ''
-		expect(value).toContain('a=1')
-		expect(value).toContain('b=2')
-	})
-
-	it('clearCookie writes a Max-Age=0 expiry', () => {
+describe('clearCookie', () => {
+	it('writes a Max-Age=0 expiry', () => {
 		const headers = new Headers()
 		clearCookie(headers, 'session')
 		expect(headers.get('set-cookie')).toContain('Max-Age=0')
+	})
+
+	it('accumulates onto a prior Set-Cookie rather than clobbering it', async () => {
+		const headers = new Headers()
+		await writeSignedCookie(headers, 'session', 'user-1', 'shh')
+		clearCookie(headers, 'legacy')
+		const value = headers.get('set-cookie') ?? ''
+		expect(value).toContain('session=')
+		expect(value).toContain('legacy=')
 	})
 })
 
@@ -552,16 +545,32 @@ describe('parseAcceptHeader', () => {
 	})
 })
 
-describe('codingQuality / negotiateEncoding', () => {
+describe('computeCodingQuality / pickCoding / negotiateEncoding', () => {
 	it('scores an exact match over a wildcard', () => {
 		const entries = parseAcceptHeader('gzip;q=0.5, *;q=0.1')
-		expect(codingQuality(entries, 'gzip')).toBe(0.5)
-		expect(codingQuality(entries, 'br')).toBe(0.1)
+		expect(computeCodingQuality(entries, 'gzip')).toBe(0.5)
+		expect(computeCodingQuality(entries, 'br')).toBe(0.1)
 	})
 
 	it('an explicit ;q=0 rejects even with a wildcard present', () => {
 		const entries = parseAcceptHeader('gzip;q=0, *;q=1')
-		expect(codingQuality(entries, 'gzip')).toBe(0)
+		expect(computeCodingQuality(entries, 'gzip')).toBe(0)
+	})
+
+	it('picks the highest-scoring offer from already parsed entries', () => {
+		const entries = parseAcceptHeader('gzip;q=0.5, deflate;q=0.9')
+		expect(pickCoding(entries, ['gzip', 'deflate'])).toBe('deflate')
+	})
+
+	it('picks in server preference order on a client tie', () => {
+		const entries = parseAcceptHeader('gzip;q=1.0, deflate;q=1.0')
+		expect(pickCoding(entries, ['deflate', 'gzip'])).toBe('deflate')
+	})
+
+	it('picks nothing from an empty offer list or an unacceptable one', () => {
+		const entries = parseAcceptHeader('br;q=1.0')
+		expect(pickCoding(entries, [])).toBeUndefined()
+		expect(pickCoding(entries, ['gzip', 'deflate'])).toBeUndefined()
 	})
 
 	it('negotiates in server preference order on a client tie', () => {
@@ -606,30 +615,30 @@ describe('matchMediaType', () => {
 	})
 })
 
-describe('languageQuality', () => {
+describe('computeLanguageQuality', () => {
 	it('exact match', () => {
 		const entries = parseAcceptHeader('en-US, en;q=0.8')
-		expect(languageQuality(entries, 'en-US')).toBe(1)
+		expect(computeLanguageQuality(entries, 'en-US')).toBe(1)
 	})
 
 	it('primary-tag prefix match', () => {
 		const entries = parseAcceptHeader('en;q=0.8')
-		expect(languageQuality(entries, 'en-US')).toBe(0.8)
+		expect(computeLanguageQuality(entries, 'en-US')).toBe(0.8)
 	})
 
 	it('wildcard match', () => {
 		const entries = parseAcceptHeader('*;q=0.5')
-		expect(languageQuality(entries, 'fr')).toBe(0.5)
+		expect(computeLanguageQuality(entries, 'fr')).toBe(0.5)
 	})
 
 	it('is 0 on a ;q=0 rejection', () => {
 		const entries = parseAcceptHeader('en;q=0')
-		expect(languageQuality(entries, 'en')).toBe(0)
+		expect(computeLanguageQuality(entries, 'en')).toBe(0)
 	})
 
 	it('is 0 when nothing matches', () => {
 		const entries = parseAcceptHeader('fr')
-		expect(languageQuality(entries, 'en')).toBe(0)
+		expect(computeLanguageQuality(entries, 'en')).toBe(0)
 	})
 })
 
@@ -803,27 +812,27 @@ describe('isValidRequestId', () => {
 	})
 })
 
-describe('ipv6Network / clientRateKey', () => {
+describe('computeIPv6Network / computeClientKey', () => {
 	it('collapses a full IPv6 address to its /64 network', () => {
-		expect(ipv6Network('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
-		expect(ipv6Network('2001:db8:1:2:dead:beef:0:9')).toBe('2001:db8:1:2::/64')
+		expect(computeIPv6Network('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
+		expect(computeIPv6Network('2001:db8:1:2:dead:beef:0:9')).toBe('2001:db8:1:2::/64')
 	})
 
 	it('strips a zone id before expanding', () => {
-		expect(ipv6Network('fe80::1%eth0')).toBe('fe80:0:0:0::/64')
+		expect(computeIPv6Network('fe80::1%eth0')).toBe('fe80:0:0:0::/64')
 	})
 
 	it('does not collapse an IPv4-mapped address', () => {
-		expect(ipv6Network('::ffff:192.0.2.1')).toBeUndefined()
+		expect(computeIPv6Network('::ffff:192.0.2.1')).toBeUndefined()
 	})
 
 	it('is undefined for a plain IPv4 address', () => {
-		expect(ipv6Network('192.0.2.1')).toBeUndefined()
+		expect(computeIPv6Network('192.0.2.1')).toBeUndefined()
 	})
 
-	it('clientRateKey collapses IPv6 but leaves IPv4 unchanged', () => {
-		expect(clientRateKey('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
-		expect(clientRateKey('192.0.2.1')).toBe('192.0.2.1')
+	it('computeClientKey collapses IPv6 but leaves IPv4 unchanged', () => {
+		expect(computeClientKey('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64')
+		expect(computeClientKey('192.0.2.1')).toBe('192.0.2.1')
 	})
 })
 
@@ -848,79 +857,6 @@ describe('serializeEvent', () => {
 		const wire = serializeEvent({ data: 'a\r\nb' })
 		expect(wire).toBe('data: a\ndata: b\n\n')
 		expect(wire).not.toContain('\r')
-	})
-})
-
-describe('openStream', () => {
-	it('exposes boolean write readiness and an asynchronous drain wakeup', () => {
-		expectTypeOf<StreamInterface['write']>().returns.toEqualTypeOf<boolean>()
-		expectTypeOf<StreamInterface['drain']>().returns.toEqualTypeOf<Promise<void>>()
-	})
-
-	it('opens a Response with the SSE headers', () => {
-		const stream = openStream()
-		expect(stream.response.headers.get('content-type')).toContain('text/event-stream')
-		expect(stream.closed).toBe(false)
-	})
-
-	it('is a safe no-op once ended', async () => {
-		const stream = openStream()
-		stream.end()
-		expect(stream.closed).toBe(true)
-		expect(stream.write({ data: 'late' })).toBe(false)
-		expect(() => stream.comment('late')).not.toThrow()
-		await expect(stream.drain()).resolves.toBeUndefined()
-		expect(() => stream.end()).not.toThrow()
-	})
-
-	it('keeps accepting events when a caller ignores the readiness signal', async () => {
-		const stream = openStream()
-		expect(stream.write({ event: 'token', data: 'first' })).toBe(false)
-		expect(stream.write({ event: 'token', data: 'second' })).toBe(false)
-		stream.end()
-		const text = await new Response(stream.response.body).text()
-		expect(text).toBe('event: token\ndata: first\n\nevent: token\ndata: second\n\n')
-	})
-
-	it('parks at the stream high-water mark and wakes on the next consumer pull', async () => {
-		const stream = openStream()
-		expect(stream.write({ data: 'queued' })).toBe(false)
-		let drained = false
-		const draining = stream.drain().then(() => {
-			drained = true
-		})
-		await Promise.resolve()
-		expect(drained).toBe(false)
-		const body = stream.response.body
-		expect(body).not.toBeNull()
-		if (body === null) return
-		const reader = body.getReader()
-		const first = await reader.read()
-		await draining
-		expect(drained).toBe(true)
-		expect(new TextDecoder().decode(first.value)).toBe('data: queued\n\n')
-		stream.end()
-		await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })
-	})
-
-	it('settles a parked producer when the stream ends', async () => {
-		const stream = openStream()
-		expect(stream.write({ data: 'queued' })).toBe(false)
-		const draining = stream.drain()
-		stream.end()
-		await expect(draining).resolves.toBeUndefined()
-	})
-
-	it('flips closed and becomes a safe no-op when the CONSUMER cancels the stream', async () => {
-		const stream = openStream()
-		const body = stream.response.body
-		expect(body).not.toBeNull()
-		if (body === null) return
-		const reader = body.getReader()
-		await reader.cancel()
-		expect(stream.closed).toBe(true)
-		expect(stream.write({ data: 'after-cancel' })).toBe(false)
-		await expect(stream.drain()).resolves.toBeUndefined()
 	})
 })
 

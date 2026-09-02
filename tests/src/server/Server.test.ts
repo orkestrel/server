@@ -7,7 +7,7 @@ import { once } from 'node:events'
 import http from 'node:http'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
-import { createServer, HTTPError, openStream } from '@src/server'
+import { createServer, createStream, HTTPError, isServerError } from '@src/server'
 import { createRecorder, waitForDelay } from '@orkestrel/test'
 import {
 	holdUpgrade,
@@ -24,7 +24,7 @@ const BINDS_IPV6 = await probeLoopback('::1')
 
 // src/server/Server.ts — the lifecycle facade over REAL node:http (no mocks,
 // the node src:server project). Routing outcomes themselves are the router's
-// own tests (PROPOSAL §9) — this suite covers what the server face OWNS:
+// own tests — this suite covers what the server face OWNS:
 // lifecycle, drain, upgrade fan-out, the built-in boundary, connection facts,
 // and observability.
 
@@ -101,6 +101,18 @@ describe('Server — lifecycle', () => {
 		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
 		await server.start()
 		await expect(server.start()).rejects.toThrow(/cannot start/)
+		expect(server.status).toBe('listening')
+	})
+
+	it('refuses a wrong-status start with a ServerError naming the status it refused from', async () => {
+		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		await server.start()
+		const refusal: unknown = await server.start().catch((error: unknown) => error)
+		expect(isServerError(refusal)).toBe(true)
+		if (!isServerError(refusal)) return
+		expect(refusal.code).toBe('status')
+		expect(refusal.name).toBe('ServerError')
+		expect(refusal.context).toEqual({ status: 'listening' })
 		expect(server.status).toBe('listening')
 	})
 
@@ -393,7 +405,7 @@ describe('Server — the client disconnect signal reaches streaming handlers', (
 			method: 'GET',
 			path: '/events',
 			handler: (request) => {
-				const stream = openStream()
+				const stream = createStream()
 				request.signal.addEventListener('abort', () => aborted.resolve(), { once: true })
 				stream.write({ data: 'ready' })
 				void aborted.promise.then(() => stream.end())
@@ -506,7 +518,7 @@ describe('Server — context.body() caching', () => {
 	it('caches the body so multiple middleware reads return the same value, read exactly once', async () => {
 		// `body()` is a MiddlewareContext concern — the terminal
 		// `dispatcher.handle(request, context.state)` only threads `state`, not
-		// `context` itself (PROPOSAL §5.1), so only middleware can read the body.
+		// `context` itself, so only middleware can read the body.
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({ method: 'POST', path: '/echo', handler: () => new Response('ok') })
 		let firstRead: unknown
@@ -1126,7 +1138,7 @@ describe('Server — stream backpressure', () => {
 			method: 'GET',
 			path: '/events',
 			handler: () => {
-				const stream = openStream()
+				const stream = createStream()
 				void waitForDelay(10).then(async () => {
 					const payload = 'x'.repeat(65_536)
 					let bytes = 0
@@ -1200,7 +1212,7 @@ describe('Server — stream backpressure', () => {
 			method: 'GET',
 			path: '/events',
 			handler: () => {
-				const stream = openStream()
+				const stream = createStream()
 				const payload = 'y'.repeat(32_768)
 				let unavailable = 0
 				for (let index = 0; index < 32; index += 1) {
@@ -1331,13 +1343,13 @@ describe('Server — capstone', () => {
 		expect(await response.text()).toBe('user not found')
 	})
 
-	it('an SSE route via openStream is consumed incrementally by fetch', async () => {
+	it('an SSE route via createStream is consumed incrementally by fetch', async () => {
 		const dispatcher = createDispatcher<AppState>()
 		dispatcher.add({
 			method: 'GET',
 			path: '/events',
 			handler: () => {
-				const stream = openStream()
+				const stream = createStream()
 				stream.write({ event: 'greeting', data: 'hello' })
 				void waitForDelay(30).then(() => {
 					stream.write({ event: 'greeting', data: 'world' })

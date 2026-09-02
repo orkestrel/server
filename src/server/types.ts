@@ -6,7 +6,7 @@
 //    1. The middleware seam — {@link MiddlewareContext}, {@link NextFunction},
 //       {@link MiddlewareHandler} — the frozen contract `compose` wires
 //       together and the `@orkestrel/middleware` package peer-depends on.
-//       {@link ConnectionInfo} is the adapter-injected per-request fact
+//       {@link Connection} is the adapter-injected per-request fact
 //       slice a consumer's `state` function turns into its `TState`.
 //    2. The shared substrate's data shapes — cookies ({@link CookieOptions}),
 //       tokens ({@link TokenSecret} / {@link TokenOptions}), negotiation
@@ -105,7 +105,7 @@ export type MiddlewareHandler<TState> = (
  * - `encrypted` — whether the connection is TLS, for an auto-`Secure` cookie
  *   decision ({@link CookieOptions.secure} left `undefined`).
  */
-export interface ConnectionInfo {
+export interface Connection {
 	readonly ip?: string
 	readonly encrypted: boolean
 }
@@ -152,7 +152,7 @@ export interface TokenOptions {
  *   suppresses it, and omitted/`undefined` (the default) derives it from the
  *   connection via {@link import('./helpers.js').resolveSecure} — `Secure` on
  *   a TLS connection, off over plaintext HTTP ({@link
- *   ConnectionInfo.encrypted}). A `sameSite: 'None'` cookie is ALWAYS
+ *   Connection.encrypted}). A `sameSite: 'None'` cookie is ALWAYS
  *   `Secure` regardless (the spec requires it).
  * @param sameSite - The `SameSite` directive; defaults to `'Lax'`.
  */
@@ -326,13 +326,17 @@ export interface SSEMessage {
 }
 
 /**
- * Options for the `openStream` seam.
+ * Options for a {@link StreamInterface} — how `createStream` opens the
+ * streaming response.
  *
  * @param status - The HTTP status the streaming response is opened with;
  *   defaults to `200`.
- * @param headers - Extra response headers merged with the SSE headers the
- *   seam always sets ({@link SSE_HEADERS}) — a key the seam owns is never
- *   overridden.
+ * @param headers - Extra response headers merged OVER the SSE headers the
+ *   seam always sets ({@link SSE_HEADERS}), so a caller repeating one of those
+ *   keys replaces the seam's value. Repeating it under a different casing
+ *   appends instead, because `Headers` accumulates both spellings into one
+ *   comma-joined value — spell a key exactly as {@link SSE_HEADERS} spells it
+ *   when the intent is to replace it.
  */
 export interface StreamOptions {
 	readonly status?: number
@@ -341,7 +345,7 @@ export interface StreamOptions {
 
 /**
  * A handle to write Server-Sent Events to an open, fetch-standard streaming
- * `Response` — the generic streaming surface `openStream` returns over a
+ * `Response` — the generic streaming surface `createStream` returns over a
  * `ReadableStream`.
  *
  * @remarks
@@ -472,6 +476,21 @@ import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkes
 export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'stopped'
 
 /**
+ * The machine-readable category a
+ * {@link import('./errors.js').ServerError} carries.
+ *
+ * @remarks
+ * A `ServerError` reports a lifecycle refusal the caller programmed, not a
+ * client-facing fault — {@link import('./errors.js').HTTPError} owns the
+ * latter and keys on `status` instead. The categories are disjoint, so a
+ * `catch` narrowed by {@link import('./errors.js').isServerError} reads `code`
+ * to tell them apart.
+ */
+export type ServerErrorCode =
+	/** Identifies a lifecycle call the current {@link ServerStatus} forbids. */
+	'status'
+
+/**
  * Identifies the request a server-level fault came from — its method and its
  * parsed URL.
  *
@@ -577,12 +596,12 @@ export type UpgradeHandler = (request: IncomingMessage, socket: Duplex, head: Bu
 
 /**
  * Derives a consumer's per-request `TState` from the adapter-injected
- * {@link ConnectionInfo} — `ServerOptions.state`, invoked once per request
+ * {@link Connection} — `ServerOptions.state`, invoked once per request
  * before the middleware onion runs.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  */
-export type ConnectionStateFunction<TState> = (connection: ConnectionInfo) => TState
+export type ConnectionStateFunction<TState> = (connection: Connection) => TState
 
 /**
  * Options for `createServer`.
@@ -702,11 +721,17 @@ export interface ServerInterface<TState> {
 	use(middleware: ReadonlyArray<MiddlewareHandler<TState>>): void
 	upgrade(handler: UpgradeHandler): void
 	/**
-	 * Bind the configured listener and resolve its actually-bound port.
+	 * Binds the configured listener and resolves its actually-bound port.
 	 *
 	 * @param signal - Optional caller cancellation observed only while startup
 	 *   is pending; aborting after this method resolves does not stop the server.
 	 * @returns The actually-bound TCP port
+	 *
+	 * @remarks
+	 * Rejects with a {@link import('./errors.js').ServerError} of code
+	 * `'status'` when the current {@link ServerStatus} is neither `'idle'` nor
+	 * `'stopped'`, carrying that status in its `context`. Narrow it with
+	 * {@link import('./errors.js').isServerError}.
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**

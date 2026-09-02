@@ -48,15 +48,16 @@ export const DEFAULT_BODY_LIMIT = 1_048_576
 export const DEFAULT_DECOMPRESSED_LIMIT = 16_777_216
 
 /**
- * The SSE response headers the `openStream` seam always sets.
+ * The SSE response headers a `Stream` always sets on its response.
  *
  * @remarks
  * `text/event-stream` is the media type browsers dispatch as SSE; `no-cache`
  * keeps a proxy from caching the stream; `keep-alive` holds the connection
  * open; `X-Accel-Buffering: no` opts a buffering reverse proxy (nginx) out so
  * events flush promptly rather than batching. Frozen so a consumer can read
- * but never mutate the shared default; `openStream` merges any
- * {@link import('./types.js').StreamOptions.headers} UNDER these.
+ * but never mutate the shared default; a `Stream` merges any
+ * {@link import('./types.js').StreamOptions.headers} OVER these, so a caller
+ * repeating one of these exact keys replaces its value.
  */
 export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 	'Content-Type': 'text/event-stream; charset=utf-8',

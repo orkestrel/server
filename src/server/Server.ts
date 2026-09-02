@@ -25,7 +25,7 @@ import { Emitter } from '@orkestrel/emitter'
 import { isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
 import { compose, isAddressInfo, readBody } from './helpers.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
-import { HTTPError, isHTTPError } from './errors.js'
+import { HTTPError, isHTTPError, ServerError } from './errors.js'
 
 /**
  * The HTTP server facade — an observable `node:http` lifecycle composing this
@@ -189,7 +189,11 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	start(signal?: AbortSignal): Promise<number> {
 		if (this.#status !== 'idle' && this.#status !== 'stopped') {
-			return Promise.reject(new Error(`server cannot start from '${this.#status}'`))
+			return Promise.reject(
+				new ServerError('status', `server cannot start from '${this.#status}'`, {
+					status: this.#status,
+				}),
+			)
 		}
 		this.#status = 'starting'
 		// A fresh stop signal per run, so a restarted server is not born aborted.

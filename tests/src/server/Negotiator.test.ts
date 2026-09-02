@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import type { MiddlewareContext } from '@src/server'
-import { HTTPError, Negotiator } from '@src/server'
+import type { Encoding, MiddlewareContext } from '@src/server'
+import { HTTPError, negotiateEncoding, Negotiator } from '@src/server'
 
-// §16 mirror of `src/server/Negotiator.ts` — the content-negotiation matrix
+// Mirror of `src/server/Negotiator.ts` — the content-negotiation matrix
 // (media-type precedence, wildcard, q-ties broken by server order, `406`
 // path, `format` dispatch).
 
@@ -92,6 +92,21 @@ describe('Negotiator#encoding', () => {
 	it('returns undefined when no offered coding is acceptable', () => {
 		const negotiator = new Negotiator()
 		expect(negotiator.encoding('br', ['gzip', 'deflate'])).toBeUndefined()
+	})
+
+	it('agrees with the standalone negotiateEncoding door on every axis it shares', () => {
+		const negotiator = new Negotiator()
+		const offers: readonly Encoding[] = ['gzip', 'deflate', 'identity']
+		for (const header of [
+			'gzip;q=0.4, deflate;q=0.8, *;q=0.1',
+			'gzip;q=1.0, deflate;q=1.0',
+			'br;q=1.0',
+			'*;q=0.5',
+			'',
+		]) {
+			expect(negotiator.encoding(header, offers)).toBe(negotiateEncoding(header, offers))
+		}
+		expect(negotiator.encoding('gzip;q=0.4, deflate;q=0.8, *;q=0.1', offers)).toBe('deflate')
 	})
 })
 

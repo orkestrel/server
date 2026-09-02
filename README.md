@@ -58,7 +58,7 @@ composed onion terminates in the dispatcher, so there is no second plumbing
 layer between the middleware seam and the router. The package also exports
 `HTTPError` and its subclasses, the `compose` middleware primitive,
 cookie/token/body helpers, `Negotiator` for content negotiation, and
-`openStream` for Server-Sent Events.
+`createStream` for Server-Sent Events.
 
 ## Guide
 

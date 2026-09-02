@@ -1,6 +1,13 @@
-import type { NegotiatorInterface, ServerInterface, ServerOptions } from './types.js'
+import type {
+	NegotiatorInterface,
+	ServerInterface,
+	ServerOptions,
+	StreamInterface,
+	StreamOptions,
+} from './types.js'
 import { Negotiator } from './Negotiator.js'
 import { Server } from './Server.js'
+import { Stream } from './Stream.js'
 
 /**
  * Create a {@link NegotiatorInterface} — the reusable content-negotiation
@@ -47,4 +54,28 @@ export function createNegotiator(): NegotiatorInterface {
  */
 export function createServer<TState>(options: ServerOptions<TState>): ServerInterface<TState> {
 	return new Server(options)
+}
+
+/**
+ * Creates a {@link StreamInterface} — a generic Server-Sent-Events stream whose
+ * `response` is a fetch-standard streaming `Response` a route returns.
+ *
+ * @param options - {@link StreamOptions}
+ * @returns A {@link StreamInterface} whose stream is open
+ *
+ * @example
+ * ```ts
+ * import { createStream } from '@src/server'
+ *
+ * const stream = createStream()
+ * void Promise.resolve().then(async () => {
+ * 	if (!stream.write({ event: 'token', data: 'hello' })) await stream.drain()
+ * 	stream.comment('keep-alive')
+ * 	stream.end()
+ * })
+ * // return stream.response from the route handler
+ * ```
+ */
+export function createStream(options?: StreamOptions): StreamInterface {
+	return new Stream(options)
 }
