@@ -1,5 +1,10 @@
 import type { Encoding, FormatHandlerMap, MiddlewareContext, NegotiatorInterface } from './types.js'
-import { computeLanguageQuality, matchMediaType, parseAcceptHeader, pickCoding } from './helpers.js'
+import {
+	computeLanguageQuality,
+	matchMediaType,
+	parseAcceptHeader,
+	resolveCoding,
+} from './helpers.js'
 
 /**
  * The content-negotiation machine over the weighted `Accept` family — a
@@ -44,7 +49,7 @@ export class Negotiator implements NegotiatorInterface {
 
 	encoding(header: string, available: readonly Encoding[]): Encoding | undefined {
 		if (available.length === 0) return undefined
-		return pickCoding(parseAcceptHeader(header), available)
+		return resolveCoding(parseAcceptHeader(header), available)
 	}
 
 	language(header: string, available: readonly string[]): string | undefined {

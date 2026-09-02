@@ -110,7 +110,7 @@ describe('Server — lifecycle', () => {
 		const refusal: unknown = await server.start().catch((error: unknown) => error)
 		expect(isServerError(refusal)).toBe(true)
 		if (!isServerError(refusal)) return
-		expect(refusal.code).toBe('status')
+		expect(refusal.code).toBe('STATUS')
 		expect(refusal.name).toBe('ServerError')
 		expect(refusal.context).toEqual({ status: 'listening' })
 		expect(server.status).toBe('listening')

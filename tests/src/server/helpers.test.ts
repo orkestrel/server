@@ -30,10 +30,10 @@ import {
 	parseAcceptHeader,
 	parseCookies,
 	parseRange,
-	pickCoding,
 	readBody,
 	readSignedCookie,
 	requestEncoding,
+	resolveCoding,
 	resolveOrigin,
 	resolveSecure,
 	resolveSecurityHeader,
@@ -545,7 +545,7 @@ describe('parseAcceptHeader', () => {
 	})
 })
 
-describe('computeCodingQuality / pickCoding / negotiateEncoding', () => {
+describe('computeCodingQuality / resolveCoding / negotiateEncoding', () => {
 	it('scores an exact match over a wildcard', () => {
 		const entries = parseAcceptHeader('gzip;q=0.5, *;q=0.1')
 		expect(computeCodingQuality(entries, 'gzip')).toBe(0.5)
@@ -559,18 +559,18 @@ describe('computeCodingQuality / pickCoding / negotiateEncoding', () => {
 
 	it('picks the highest-scoring offer from already parsed entries', () => {
 		const entries = parseAcceptHeader('gzip;q=0.5, deflate;q=0.9')
-		expect(pickCoding(entries, ['gzip', 'deflate'])).toBe('deflate')
+		expect(resolveCoding(entries, ['gzip', 'deflate'])).toBe('deflate')
 	})
 
 	it('picks in server preference order on a client tie', () => {
 		const entries = parseAcceptHeader('gzip;q=1.0, deflate;q=1.0')
-		expect(pickCoding(entries, ['deflate', 'gzip'])).toBe('deflate')
+		expect(resolveCoding(entries, ['deflate', 'gzip'])).toBe('deflate')
 	})
 
 	it('picks nothing from an empty offer list or an unacceptable one', () => {
 		const entries = parseAcceptHeader('br;q=1.0')
-		expect(pickCoding(entries, [])).toBeUndefined()
-		expect(pickCoding(entries, ['gzip', 'deflate'])).toBeUndefined()
+		expect(resolveCoding(entries, [])).toBeUndefined()
+		expect(resolveCoding(entries, ['gzip', 'deflate'])).toBeUndefined()
 	})
 
 	it('negotiates in server preference order on a client tie', () => {

@@ -148,10 +148,10 @@ export function isHTTPError(value: unknown): value is HTTPError {
  * ```ts
  * import { ServerError } from '@src/server'
  *
- * const error = new ServerError('status', "server cannot start from 'listening'", {
+ * const error = new ServerError('STATUS', "server cannot start from 'listening'", {
  * 	status: 'listening',
  * })
- * error.code // 'status'
+ * error.code // 'STATUS'
  * ```
  */
 export class ServerError extends Error {
@@ -188,7 +188,7 @@ export class ServerError extends Error {
  * try {
  * 	await server.start()
  * } catch (error) {
- * 	if (isServerError(error)) console.log(error.code) // 'status'
+ * 	if (isServerError(error)) console.log(error.code) // 'STATUS'
  * }
  * await server.stop()
  * ```

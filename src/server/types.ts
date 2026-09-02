@@ -488,7 +488,7 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
  */
 export type ServerErrorCode =
 	/** Identifies a lifecycle call the current {@link ServerStatus} forbids. */
-	'status'
+	'STATUS'
 
 /**
  * Identifies the request a server-level fault came from — its method and its
@@ -729,7 +729,7 @@ export interface ServerInterface<TState> {
 	 *
 	 * @remarks
 	 * Rejects with a {@link import('./errors.js').ServerError} of code
-	 * `'status'` when the current {@link ServerStatus} is neither `'idle'` nor
+	 * `'STATUS'` when the current {@link ServerStatus} is neither `'idle'` nor
 	 * `'stopped'`, carrying that status in its `context`. Narrow it with
 	 * {@link import('./errors.js').isServerError}.
 	 */

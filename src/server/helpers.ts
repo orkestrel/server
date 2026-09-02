@@ -602,7 +602,7 @@ export function parseAcceptHeader(header: string): readonly AcceptEntry[] {
 
 /**
  * Computes the client's quality (q) for one content-coding from the parsed
- * `Accept-Encoding` entries — the scoring leaf {@link pickCoding} runs over
+ * `Accept-Encoding` entries — the scoring leaf {@link resolveCoding} runs over
  * each offered coding.
  *
  * @remarks
@@ -649,11 +649,11 @@ export function computeCodingQuality(entries: readonly AcceptEntry[], coding: st
  *
  * @example
  * ```ts
- * pickCoding(parseAcceptHeader('gzip;q=1.0, deflate;q=0.8'), ['gzip', 'deflate']) // 'gzip'
- * pickCoding(parseAcceptHeader('br;q=1.0'), ['gzip']) // undefined
+ * resolveCoding(parseAcceptHeader('gzip;q=1.0, deflate;q=0.8'), ['gzip', 'deflate']) // 'gzip'
+ * resolveCoding(parseAcceptHeader('br;q=1.0'), ['gzip']) // undefined
  * ```
  */
-export function pickCoding<T extends string>(
+export function resolveCoding<T extends string>(
 	entries: readonly AcceptEntry[],
 	available: readonly T[],
 ): T | undefined {
@@ -675,7 +675,7 @@ export function pickCoding<T extends string>(
  *
  * @remarks
  * Parses the header ({@link parseAcceptHeader}) and hands the entries to
- * {@link pickCoding}, the same selection leaf `Negotiator.encoding` runs, so
+ * {@link resolveCoding}, the same selection leaf `Negotiator.encoding` runs, so
  * the two doors onto this axis cannot drift. Returns `undefined` when the
  * client accepts none of `available` (identity — no compression). TOTAL on
  * hostile input.
@@ -695,7 +695,7 @@ export function negotiateEncoding<T extends string>(
 	available: readonly T[],
 ): T | undefined {
 	if (available.length === 0) return undefined
-	return pickCoding(parseAcceptHeader(header), available)
+	return resolveCoding(parseAcceptHeader(header), available)
 }
 
 /**

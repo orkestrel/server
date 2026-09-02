@@ -190,7 +190,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	start(signal?: AbortSignal): Promise<number> {
 		if (this.#status !== 'idle' && this.#status !== 'stopped') {
 			return Promise.reject(
-				new ServerError('status', `server cannot start from '${this.#status}'`, {
+				new ServerError('STATUS', `server cannot start from '${this.#status}'`, {
 					status: this.#status,
 				}),
 			)

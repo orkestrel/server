@@ -91,20 +91,20 @@ describe('isHTTPError', () => {
 
 describe('ServerError', () => {
 	it('carries the code, the message, and its name', () => {
-		const error = new ServerError('status', "server cannot start from 'listening'")
-		expect(error.code).toBe('status')
+		const error = new ServerError('STATUS', "server cannot start from 'listening'")
+		expect(error.code).toBe('STATUS')
 		expect(error.message).toBe("server cannot start from 'listening'")
 		expect(error.name).toBe('ServerError')
 		expect(error.context).toBeUndefined()
 	})
 
 	it('carries an optional context record', () => {
-		const error = new ServerError('status', 'refused', { status: 'stopping' })
+		const error = new ServerError('STATUS', 'refused', { status: 'stopping' })
 		expect(error.context).toEqual({ status: 'stopping' })
 	})
 
 	it('is a real Error instance and not an HTTPError', () => {
-		const error = new ServerError('status', 'refused')
+		const error = new ServerError('STATUS', 'refused')
 		expect(error).toBeInstanceOf(Error)
 		expect(error).not.toBeInstanceOf(HTTPError)
 		expect(isHTTPError(error)).toBe(false)
@@ -113,7 +113,7 @@ describe('ServerError', () => {
 
 describe('isServerError', () => {
 	it('narrows a ServerError', () => {
-		expect(isServerError(new ServerError('status', 'refused'))).toBe(true)
+		expect(isServerError(new ServerError('STATUS', 'refused'))).toBe(true)
 	})
 
 	it('rejects a generic Error and an HTTPError', () => {
@@ -125,6 +125,6 @@ describe('isServerError', () => {
 		expect(isServerError(undefined)).toBe(false)
 		expect(isServerError(null)).toBe(false)
 		expect(isServerError('ServerError')).toBe(false)
-		expect(isServerError({ code: 'status', message: 'refused' })).toBe(false)
+		expect(isServerError({ code: 'STATUS', message: 'refused' })).toBe(false)
 	})
 })

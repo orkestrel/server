@@ -3,8 +3,8 @@ import { serializeEvent } from './helpers.js'
 import { SSE_HEADERS } from './constants.js'
 
 /**
- * Writes Server-Sent Events into an open, fetch-standard streaming `Response`.
- * Implements exactly {@link StreamInterface}.
+ * The Server-Sent-Events handle over an open, fetch-standard streaming
+ * `Response`. Implements exactly {@link StreamInterface}.
  *
  * @remarks
  * Builds the `Response` at construction from
