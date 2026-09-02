@@ -10,7 +10,7 @@ import { Server } from './Server.js'
 import { Stream } from './Stream.js'
 
 /**
- * Create a {@link NegotiatorInterface} — the reusable content-negotiation
+ * Creates a {@link NegotiatorInterface} — the reusable content-negotiation
  * machine over the weighted `Accept` family.
  *
  * @returns A {@link NegotiatorInterface}
@@ -29,7 +29,7 @@ export function createNegotiator(): NegotiatorInterface {
 }
 
 /**
- * Create a {@link ServerInterface} — the node face's HTTP server facade over
+ * Creates a {@link ServerInterface} — the node face's HTTP server facade over
  * a consumed `@orkestrel/router` dispatcher.
  *
  * @typeParam TState - The consumer's opaque per-request state type

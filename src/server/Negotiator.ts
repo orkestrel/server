@@ -7,7 +7,7 @@ import {
 } from './helpers.js'
 
 /**
- * The content-negotiation machine over the weighted `Accept` family — a
+ * Represents the content-negotiation machine over the weighted `Accept` family — a
  * reusable, cross-middleware ENTITY (not a middleware). Implements exactly
  * {@link NegotiatorInterface}.
  *

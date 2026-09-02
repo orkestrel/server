@@ -28,7 +28,7 @@ import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
 import { HTTPError, isHTTPError, ServerError } from './errors.js'
 
 /**
- * The HTTP server facade — an observable `node:http` lifecycle composing this
+ * Represents the HTTP server facade — an observable `node:http` lifecycle composing this
  * module's own middleware onion around a consumed `@orkestrel/router`
  * dispatcher.
  *

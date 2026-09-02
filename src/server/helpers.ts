@@ -35,7 +35,7 @@ import { ContentTooLargeError, HTTPError } from './errors.js'
 // once.
 
 /**
- * Compose an ordered chain of {@link MiddlewareHandler}s around a `terminal`
+ * Composes an ordered chain of {@link MiddlewareHandler}s around a `terminal`
  * handler into one request handler — the frozen middleware seam.
  *
  * @remarks
@@ -76,7 +76,7 @@ export function compose<TState>(
 }
 
 /**
- * Wrap one middleware layer around its downstream handler.
+ * Wraps one middleware layer around its downstream handler.
  *
  * @remarks
  * The returned handler enforces the one-call `next` invariant while preserving
@@ -123,7 +123,7 @@ export function wrapMiddleware<TState>(
 // never `as` (`AGENTS.md` § Non-negotiable rules), and total on hostile input.
 
 /**
- * Parse a raw `Cookie:` request header into a `name → value` lookup.
+ * Parses a raw `Cookie:` request header into a `name → value` lookup.
  *
  * @remarks
  * Splits on `;`; the FIRST segment keeps any leading whitespace (a genuine
@@ -160,7 +160,7 @@ export function parseCookies(header: string | undefined): Record<string, string>
 }
 
 /**
- * Whether a string is a valid RFC 6265 cookie NAME — a non-empty run of
+ * Checks whether a string is a valid RFC 6265 cookie NAME — a non-empty run of
  * cookie-token chars with NO surrounding (or interior) whitespace.
  *
  * @remarks
@@ -170,7 +170,7 @@ export function parseCookies(header: string | undefined): Record<string, string>
  * `'  __Host-x'` from reconciling into `__Host-x`. Total — never throws.
  *
  * @param value - The candidate cookie name
- * @returns `true` when `value` is a valid, whitespace-free cookie token
+ * @returns True if `value` is a valid, whitespace-free cookie token; false otherwise
  *
  * @example
  * ```ts
@@ -183,7 +183,7 @@ export function isCookieName(value: string): boolean {
 }
 
 /**
- * Decode a cookie value with `decodeURIComponent`, falling back to the raw
+ * Decodes a cookie value with `decodeURIComponent`, falling back to the raw
  * text when the value is not valid percent-encoding.
  *
  * @param raw - The raw (trimmed) cookie value
@@ -204,7 +204,7 @@ export function decodeCookieValue(raw: string): string {
 }
 
 /**
- * Whether a string is safe to interpolate as a `Set-Cookie` attribute VALUE
+ * Checks whether a string is safe to interpolate as a `Set-Cookie` attribute VALUE
  * (a `Domain` / `Path`) — the guard {@link serializeCookie} screens those two
  * attributes with before emitting them.
  *
@@ -215,7 +215,7 @@ export function decodeCookieValue(raw: string): string {
  * directive. Total — never throws (a bad value returns `false`).
  *
  * @param value - The candidate attribute value (a `Domain` or `Path`)
- * @returns `true` when `value` carries no separator / whitespace / control char
+ * @returns True if `value` carries no separator / whitespace / control char; false otherwise
  *
  * @example
  * ```ts
@@ -233,7 +233,7 @@ export function isCookieAttribute(value: string): boolean {
 }
 
 /**
- * Serialize a cookie into a `Set-Cookie` header value — `name=value` plus its attributes.
+ * Serializes a cookie into a `Set-Cookie` header value — `name=value` plus its attributes.
  *
  * @remarks
  * URL-encodes the value (the inverse of {@link parseCookies}'s decode) and
@@ -277,7 +277,7 @@ export function serializeCookie(name: string, value: string, options?: CookieOpt
 }
 
 /**
- * Resolve a cookie's effective `Secure` flag from its {@link CookieOptions}
+ * Resolves a cookie's effective `Secure` flag from its {@link CookieOptions}
  * `secure` setting and whether the request arrived over TLS.
  *
  * @remarks
@@ -336,7 +336,7 @@ export async function writeSignedCookie(
 }
 
 /**
- * Read + verify a SIGNED cookie off a request — TOTAL, returning the
+ * Reads + verifies a SIGNED cookie off a request — TOTAL, returning the
  * embedded value or `undefined` (the inverse of {@link writeSignedCookie}).
  *
  * @remarks
@@ -397,7 +397,7 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 // `signToken` throws, and only on a misconfigured (empty) secret.
 
 /**
- * Sign a value into a stateless, HMAC-SHA256 token — `<payload>.<signature>`.
+ * Signs a value into a stateless, HMAC-SHA256 token — `<payload>.<signature>`.
  *
  * @remarks
  * The payload is a base64url-encoded JSON `{ value, exp }` (`exp` is the
@@ -439,7 +439,7 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
 }
 
 /**
- * Verify a stateless token and return its embedded value — TOTAL, never throws.
+ * Verifies a stateless token and returns its embedded value — TOTAL, never throws.
  *
  * @remarks
  * The inverse of {@link signToken}: splits the token on its LAST `.` (so a
@@ -495,7 +495,7 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 }
 
 /**
- * Decode + narrow a signed token's base64url JSON payload, honoring its
+ * Decodes + narrows a signed token's base64url JSON payload, honoring its
  * expiry — the shared decode step {@link verifyToken} applies after a
  * signature match.
  *
@@ -527,7 +527,7 @@ export function decodeTokenPayload(encoded: string): string | undefined {
 }
 
 /**
- * Normalize a {@link TokenSecret} to a concrete list of USABLE secrets —
+ * Normalizes a {@link TokenSecret} to a concrete list of USABLE secrets —
  * backs both {@link signToken} and {@link verifyToken}.
  *
  * @remarks
@@ -554,7 +554,7 @@ export function normalizeSecret(secret: TokenSecret): readonly string[] {
 // `Accept-Encoding` pick.
 
 /**
- * Parse a weighted `Accept` / `Accept-Encoding` / `Accept-Language` header
+ * Parses a weighted `Accept` / `Accept-Encoding` / `Accept-Language` header
  * into its q-sorted entries.
  *
  * @remarks
@@ -699,7 +699,7 @@ export function negotiateEncoding<T extends string>(
 }
 
 /**
- * Rank + quality of one `candidate` media type against the parsed `Accept`
+ * Reports the rank + quality of one `candidate` media type against the parsed `Accept`
  * entries — the generic media-type primitive the `Negotiator`'s `negotiate`
  * uses to score each `available` candidate.
  *
@@ -791,7 +791,7 @@ export function computeLanguageQuality(entries: readonly AcceptEntry[], candidat
 }
 
 /**
- * Whether a `Content-Type` is worth compressing.
+ * Checks whether a `Content-Type` is worth compressing.
  *
  * @remarks
  * Strips any `; charset=…` parameter (lower-cased), then accepts a `text/*`
@@ -801,7 +801,7 @@ export function computeLanguageQuality(entries: readonly AcceptEntry[], candidat
  * absent/empty type is not compressible. TOTAL.
  *
  * @param type - The response `Content-Type` header value (with or without parameters)
- * @returns `true` when the type is text-shaped and worth compressing
+ * @returns True if the type is text-shaped and worth compressing; false otherwise
  *
  * @example
  * ```ts
@@ -823,7 +823,7 @@ export function isCompressibleType(type: string): boolean {
 // parser.
 
 /**
- * Compute a CONTENT `ETag` over a fully-buffered response body via WebCrypto.
+ * Computes a CONTENT `ETag` over a fully-buffered response body via WebCrypto.
  *
  * @remarks
  * Hashes `body` with SHA-256 (`crypto.subtle.digest`) and wraps the hex
@@ -850,7 +850,7 @@ export async function computeBodyETag(body: Uint8Array<ArrayBuffer>, weak = true
 }
 
 /**
- * Strip the WEAK indicator (`W/`) from an entity-tag, returning its opaque
+ * Strips the WEAK indicator (`W/`) from an entity-tag, returning its opaque
  * comparison body — the reduction {@link matchesETag} applies to both sides
  * before the RFC 7232 §2.3.2 weak comparison.
  *
@@ -868,7 +868,7 @@ export function unwrapETag(tag: string): string {
 }
 
 /**
- * Whether a request's `If-None-Match` header matches a resource's current
+ * Checks whether a request's `If-None-Match` header matches a resource's current
  * `ETag` — the RFC 7232 §2.3.2 WEAK comparison.
  *
  * @remarks
@@ -881,7 +881,7 @@ export function unwrapETag(tag: string): string {
  *
  * @param header - The raw `If-None-Match` header value
  * @param etag - The resource's current `ETag`
- * @returns `true` when the conditional matches (the caller answers `304`)
+ * @returns True if the conditional matches (the caller answers `304`); false otherwise
  *
  * @example
  * ```ts
@@ -902,7 +902,7 @@ export function matchesETag(header: string, etag: string): boolean {
 }
 
 /**
- * Parse an HTTP `Range` request header against a known resource `size` —
+ * Parses an HTTP `Range` request header against a known resource `size` —
  * TOTAL, returning a {@link RangeSpec} or `undefined`.
  *
  * @remarks
@@ -959,7 +959,7 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 // validation, and the IPv6 `/64` rate-key collapse.
 
 /**
- * Resolve the `Access-Control-Allow-Origin` value for a request.
+ * Resolves the `Access-Control-Allow-Origin` value for a request.
  *
  * @remarks
  * `'*'` and a single origin string pass straight through. An allow-list
@@ -990,7 +990,7 @@ export function resolveOrigin(
 }
 
 /**
- * Merge a `Vary` value into an existing `Vary` header without duplication.
+ * Merges a `Vary` value into an existing `Vary` header without duplication.
  *
  * @remarks
  * Splits `existing` on `,`, trims each member, and appends `value` only when
@@ -1022,7 +1022,7 @@ export function mergeVary(existing: string | undefined, value: string): string {
 }
 
 /**
- * Resolve one opt-out, value-bearing security header.
+ * Resolves one opt-out, value-bearing security header.
  *
  * @remarks
  * The shared "a `string` value, or `false` to omit, or a default when unset"
@@ -1050,7 +1050,7 @@ export function resolveSecurityHeader(
 }
 
 /**
- * Whether a client-supplied `X-Request-ID` is SAFE to echo into a response
+ * Checks whether a client-supplied `X-Request-ID` is SAFE to echo into a response
  * header + `context.state`.
  *
  * @remarks
@@ -1061,7 +1061,7 @@ export function resolveSecurityHeader(
  * TOTAL — never throws.
  *
  * @param value - The candidate incoming request id
- * @returns `true` when `value` is a safe, bounded, charset-clean correlation id
+ * @returns True if `value` is a safe, bounded, charset-clean correlation id; false otherwise
  *
  * @example
  * ```ts
@@ -1153,7 +1153,7 @@ export function computeClientKey(address: string): string {
 // reached through `createStream`.
 
 /**
- * Serialize one {@link SSEMessage} to the SSE wire.
+ * Serializes one {@link SSEMessage} to the SSE wire.
  *
  * @remarks
  * Emits an `event:`/`id:`/`retry:` line for each present field, then ONE
@@ -1192,12 +1192,12 @@ export function serializeEvent(message: SSEMessage): string {
 // the fetch-vocabulary migration).
 
 /**
- * Whether a key is a PROTOTYPE-POLLUTION vector — `__proto__`, `constructor`,
+ * Checks whether a key is a PROTOTYPE-POLLUTION vector — `__proto__`, `constructor`,
  * or `prototype` — the three keys that, assigned onto a normal object, can
  * reach and mutate `Object.prototype`.
  *
  * @param key - The candidate object key
- * @returns `true` when `key` is one of the three prototype-pollution keys
+ * @returns True if `key` is one of the three prototype-pollution keys; false otherwise
  *
  * @example
  * ```ts
@@ -1210,8 +1210,8 @@ export function isDangerousKey(key: string): boolean {
 }
 
 /**
- * Recursively STRIP the prototype-pollution keys from a parsed value IN
- * PLACE.
+ * Strips the prototype-pollution keys from a parsed value IN PLACE,
+ * recursively.
  *
  * @remarks
  * `JSON.parse('{"__proto__":{…}}')` is benign on its own — it produces an OWN,
@@ -1250,7 +1250,7 @@ export function scrubPrototype(value: unknown): unknown {
 }
 
 /**
- * Collect a `Request` body into a single `Uint8Array`, enforcing a size limit.
+ * Collects a `Request` body into a single `Uint8Array`, enforcing a size limit.
  *
  * @remarks
  * Reads `request.body` (a `ReadableStream<Uint8Array>`) chunk by chunk,
@@ -1297,7 +1297,7 @@ export async function collectRequestBody(
 }
 
 /**
- * Narrow a raw `Content-Encoding` header value to a decompressible
+ * Narrows a raw `Content-Encoding` header value to a decompressible
  * {@link Encoding} — the boundary guard {@link readBody} uses to decide
  * whether a request body needs transparent decompression.
  *
@@ -1324,8 +1324,8 @@ export function requestEncoding(header: string | null): Exclude<Encoding, 'ident
 }
 
 /**
- * Transparently decompress an already-collected, `gzip`/`deflate`-encoded
- * byte sequence via `DecompressionStream`, capping the DECOMPRESSED output —
+ * Decompresses an already-collected, `gzip`/`deflate`-encoded byte sequence
+ * transparently via `DecompressionStream`, capping the DECOMPRESSED output —
  * the zip-bomb defense.
  *
  * @remarks
@@ -1391,7 +1391,7 @@ export async function decompressRequestBody(
 }
 
 /**
- * Collect + decode a `Request` body — the shared body-collection pipeline
+ * Collects + decodes a `Request` body — the shared body-collection pipeline
  * surfaced to middleware and handlers as the middleware context's cached
  * `body()`.
  *
@@ -1447,13 +1447,13 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 // ============================================================================
 
 /**
- * Whether a `node:net` `server.address()` return is the structured
+ * Checks whether a `node:net` `server.address()` return is the structured
  * {@link AddressInfo} (carrying a numeric `port`) rather than a pipe `string`
  * or `null` — the total, never-throwing narrow `discoverPort`
  * and the `Server`'s own port resolution read the bound port through.
  *
  * @param value - The `server.address()` return (`AddressInfo | string | null`)
- * @returns `true` when `value` is an `AddressInfo` with a numeric `port`
+ * @returns True if `value` is an `AddressInfo` with a numeric `port`; false otherwise
  *
  * @example
  * ```ts
@@ -1468,7 +1468,7 @@ export function isAddressInfo(value: unknown): value is AddressInfo {
 }
 
 /**
- * Bind and close a throwaway TCP server to resolve one available port.
+ * Binds and closes a throwaway TCP server to resolve one available port.
  *
  * @param port - The requested port, with `0` selecting an ephemeral port
  * @returns The bound port after the probe server has closed
@@ -1492,8 +1492,8 @@ export async function probePort(port: number): Promise<number> {
 }
 
 /**
- * Find a FREE TCP port — bind a throwaway `node:net` server, read the
- * OS-assigned port, close it, and resolve that port.
+ * Finds a FREE TCP port — binds a throwaway `node:net` server, reads the
+ * OS-assigned port, closes it, and resolves that port.
  *
  * @remarks
  * With no `preferred` it binds port `0` (an ephemeral OS-assigned free port)

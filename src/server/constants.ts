@@ -8,11 +8,14 @@ import type { Encoding } from './types.js'
 // static serving, multipart) stay OUT of this file; they belong to that
 // package's own `constants.ts`.
 
-/** Default graceful-stop deadline (ms) the server gives in-flight requests on `stop()`. */
+/**
+ * Names the default graceful-stop deadline (ms) the server gives in-flight
+ * requests on `stop()`.
+ */
 export const DEFAULT_DRAIN_MS = 10_000
 
 /**
- * The `Symbol.for`-keyed brand `HTTPError` carries so `isHTTPError` recognizes
+ * Names the `Symbol.for`-keyed brand `HTTPError` carries so `isHTTPError` recognizes
  * an instance thrown by ANOTHER copy of this package (the dual-package
  * hazard — a version-skewed or workspace-linked duplicate install), where
  * `instanceof` alone fails because the two copies' `HTTPError` constructors
@@ -26,11 +29,11 @@ export const DEFAULT_DRAIN_MS = 10_000
  */
 export const HTTP_ERROR_BRAND = Symbol.for('@orkestrel/server.HTTPError')
 
-/** Default maximum request body size (bytes) `readBody` accepts before a 413. */
+/** Names the default maximum request body size (bytes) `readBody` accepts before a 413. */
 export const DEFAULT_BODY_LIMIT = 1_048_576
 
 /**
- * Default maximum DECOMPRESSED request body size (bytes) — the zip-bomb cap
+ * Names the default maximum DECOMPRESSED request body size (bytes) — the zip-bomb cap
  * the body pipeline's byte-counting `TransformStream` enforces when
  * transparently decompressing a `Content-Encoding` request body.
  *
@@ -48,7 +51,7 @@ export const DEFAULT_BODY_LIMIT = 1_048_576
 export const DEFAULT_DECOMPRESSED_LIMIT = 16_777_216
 
 /**
- * The SSE response headers a `Stream` always sets on its response.
+ * Holds the SSE response headers a `Stream` always sets on its response.
  *
  * @remarks
  * `text/event-stream` is the media type browsers dispatch as SSE; `no-cache`
@@ -67,7 +70,7 @@ export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 })
 
 /**
- * The strict charset `isValidRequestId` requires an incoming `X-Request-ID`
+ * Defines the strict charset `isValidRequestId` requires an incoming `X-Request-ID`
  * to match — `^[A-Za-z0-9_-]{1,200}$` — so a CRLF / log-injection / oversized
  * / control-char-bearing incoming id is REJECTED (a fresh id is minted
  * instead) rather than ever riding into a response header or `context.state`.
@@ -76,7 +79,7 @@ export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-]{1,200}$/)
 
 /**
- * The set of bare `Content-Type`s `isCompressibleType` treats as
+ * Holds the set of bare `Content-Type`s `isCompressibleType` treats as
  * COMPRESSIBLE, beyond the `text/*` prefix + structured-suffix (`+json` /
  * `+xml`) rules that helper also applies.
  *
@@ -106,7 +109,7 @@ export const COMPRESSIBLE_TYPES: ReadonlySet<string> = Object.freeze(
 )
 
 /**
- * The default {@link Encoding} content-codings the substrate offers, in
+ * Lists the default {@link Encoding} content-codings the substrate offers, in
  * PREFERENCE order — `gzip` / `deflate`.
  *
  * @remarks

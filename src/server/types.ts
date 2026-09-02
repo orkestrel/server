@@ -18,7 +18,7 @@
 // ============================================================================
 
 /**
- * The composition context — plain data, one per request, shared by every
+ * Represents the composition context — plain data, one per request, shared by every
  * middleware AND (as `state`) by the route handlers behind the dispatcher.
  *
  * @typeParam TState - The consumer's opaque per-request state type
@@ -52,7 +52,7 @@ export interface MiddlewareContext<TState> {
 }
 
 /**
- * The downstream continuation a {@link MiddlewareHandler} invokes to run the
+ * Represents the downstream continuation a {@link MiddlewareHandler} invokes to run the
  * rest of the onion.
  *
  * @remarks
@@ -68,7 +68,7 @@ export interface MiddlewareContext<TState> {
 export type NextFunction = (request?: Request) => Promise<Response>
 
 /**
- * One link in the middleware onion — runs around the rest of the chain.
+ * Represents one link in the middleware onion — runs around the rest of the chain.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  *
@@ -94,7 +94,7 @@ export type MiddlewareHandler<TState> = (
 ) => Response | Promise<Response>
 
 /**
- * The per-request connection facts the server face injects — the ONLY data
+ * Represents the per-request connection facts the server face injects — the ONLY data
  * that genuinely exists solely on the socket, surfaced so middleware and a
  * consumer's `state` factory stay core-pure.
  *
@@ -111,7 +111,7 @@ export interface Connection {
 }
 
 /**
- * A secret (or rotation list) for signing + verifying a stateless, HMAC-signed
+ * Represents a secret (or rotation list) for signing + verifying a stateless, HMAC-signed
  * token.
  *
  * @remarks
@@ -140,7 +140,7 @@ export interface TokenOptions {
 }
 
 /**
- * The `Set-Cookie` attributes for `serializeCookie` (and any signed-cookie
+ * Represents the `Set-Cookie` attributes for `serializeCookie` (and any signed-cookie
  * transport built over it).
  *
  * @param path - The `Path` directive; defaults to `'/'`.
@@ -166,9 +166,9 @@ export interface CookieOptions {
 }
 
 /**
- * One parsed entry of a weighted `Accept` / `Accept-Encoding` / `Accept-Language`
- * header — a value and its quality weight, the element type `parseAcceptHeader`
- * returns (sorted by `q` descending).
+ * Represents one parsed entry of a weighted `Accept` / `Accept-Encoding` /
+ * `Accept-Language` header — a value and its quality weight, the element type
+ * `parseAcceptHeader` returns (sorted by `q` descending).
  *
  * @remarks
  * `value` is the lower-cased token (`text/html`, `gzip`, `en-us`, or a
@@ -199,7 +199,7 @@ export interface MediaMatch {
 }
 
 /**
- * A content-coding the substrate compresses / decompresses with — the
+ * Represents a content-coding the substrate compresses / decompresses with — the
  * `Content-Encoding` / `Accept-Encoding` token vocabulary it understands.
  *
  * @remarks
@@ -213,7 +213,7 @@ export interface MediaMatch {
 export type Encoding = 'gzip' | 'deflate' | 'identity'
 
 /**
- * A map of media type → handler for {@link NegotiatorInterface.format} — the
+ * Represents a map of media type → handler for {@link NegotiatorInterface.format} — the
  * content-negotiation dispatch table.
  *
  * @typeParam TState - The consumer's opaque per-request state type
@@ -236,7 +236,7 @@ export type FormatHandlerMap<TState> = Readonly<
 >
 
 /**
- * Content negotiation over the weighted `Accept` family — a reusable,
+ * Represents content negotiation over the weighted `Accept` family — a reusable,
  * cross-middleware machine (not itself a middleware).
  *
  * @remarks
@@ -258,7 +258,7 @@ export type FormatHandlerMap<TState> = Readonly<
  */
 export interface NegotiatorInterface {
 	/**
-	 * Pick the best `available` value for a weighted `Accept`-style `header` —
+	 * Picks the best `available` value for a weighted `Accept`-style `header` —
 	 * the generic media-type primitive (`encoding` / `language` build on it).
 	 *
 	 * @param header - The raw weighted header value (e.g. `text/html, application/json;q=0.9`)
@@ -267,7 +267,7 @@ export interface NegotiatorInterface {
 	 */
 	negotiate(header: string, available: readonly string[]): string | undefined
 	/**
-	 * Pick the best `available` content-coding for an `Accept-Encoding` header
+	 * Picks the best `available` content-coding for an `Accept-Encoding` header
 	 * — `negotiate` scoped to codings (a bare `*` wildcard ⇒ the first `available`).
 	 *
 	 * @param header - The raw `Accept-Encoding` header value (e.g. `gzip;q=1.0, deflate;q=0.8`)
@@ -276,7 +276,7 @@ export interface NegotiatorInterface {
 	 */
 	encoding(header: string, available: readonly Encoding[]): Encoding | undefined
 	/**
-	 * Pick the best `available` language for an `Accept-Language` header —
+	 * Picks the best `available` language for an `Accept-Language` header —
 	 * `negotiate` with a language-prefix match (`en` accepts `en-US`) and a
 	 * bare `*` wildcard.
 	 *
@@ -286,9 +286,9 @@ export interface NegotiatorInterface {
 	 */
 	language(header: string, available: readonly string[]): string | undefined
 	/**
-	 * Dispatch to the handler whose media type the client most prefers — read
-	 * the request `Accept`, negotiate against `handlers`' keys, and invoke the
-	 * winner; `406` when none is acceptable.
+	 * Dispatches to the handler whose media type the client most prefers —
+	 * reads the request `Accept`, negotiates against `handlers`' keys, and
+	 * invokes the winner; `406` when none is acceptable.
 	 *
 	 * @typeParam TState - The consumer's opaque per-request state type
 	 * @param request - The in-flight `Request`
@@ -304,7 +304,7 @@ export interface NegotiatorInterface {
 }
 
 /**
- * One Server-Sent Event to serialize to the wire.
+ * Represents one Server-Sent Event to serialize to the wire.
  *
  * @remarks
  * - `data` — the event payload (required). Serialized as one or more `data:`
@@ -318,9 +318,9 @@ export interface NegotiatorInterface {
  */
 export interface SSEMessage {
 	readonly data: string
-	/** Must be a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
 	readonly event?: string
-	/** Must be a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
 	readonly id?: string
 	readonly retry?: number
 }
@@ -344,7 +344,7 @@ export interface StreamOptions {
 }
 
 /**
- * A handle to write Server-Sent Events to an open, fetch-standard streaming
+ * Represents a handle to write Server-Sent Events to an open, fetch-standard streaming
  * `Response` — the generic streaming surface `createStream` returns over a
  * `ReadableStream`.
  *
@@ -372,28 +372,28 @@ export interface StreamOptions {
  * until it receives the response.
  */
 export interface StreamInterface {
-	/** The streaming `Response` to return from the route handler. */
+	/** Holds the streaming `Response` to return from the route handler. */
 	readonly response: Response
-	/** Whether the underlying stream is done (ended, or the consumer disconnected). */
+	/** Reports whether the underlying stream is done (ended, or the consumer disconnected). */
 	readonly closed: boolean
 	/**
-	 * Serialize + enqueue one {@link SSEMessage} to the wire.
+	 * Serializes + enqueues one {@link SSEMessage} to the wire.
 	 *
 	 * @param message - The event to send (its `data` split on `\n` into `data:` lines)
-	 * @returns `true` when the process-local stream queue has capacity after
-	 *   accepting the event; `false` when the queue is full or the stream is
-	 *   closed. A `false` event was still accepted unless `closed` was already
+	 * @returns True if the process-local stream queue has capacity after
+	 *   accepting the event; false otherwise — the queue is full or the stream
+	 *   is closed. A `false` event was still accepted unless `closed` was already
 	 *   `true`; await {@link drain} before producing another event.
 	 */
 	write(message: SSEMessage): boolean
 	/**
-	 * Write a `: text` SSE comment line — a keep-alive a conforming parser ignores.
+	 * Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores.
 	 *
 	 * @param text - The comment text (sent after the `: ` prefix)
 	 */
 	comment(text: string): void
 	/**
-	 * Park until the process-local stream queue has capacity again.
+	 * Parks until the process-local stream queue has capacity again.
 	 *
 	 * @returns A promise that resolves when a consumer pull restores positive
 	 *   desired size, or immediately when capacity is already available or the
@@ -401,12 +401,12 @@ export interface StreamInterface {
 	 *   not prove that a remote peer consumed the queued bytes.
 	 */
 	drain(): Promise<void>
-	/** End the stream, completing the response (a no-op once already `closed`). */
+	/** Ends the stream, completing the response (a no-op once already `closed`). */
 	end(): void
 }
 
 /**
- * The parsed outcome of an HTTP `Range` request header.
+ * Represents the parsed outcome of an HTTP `Range` request header.
  *
  * @remarks
  * A `Range: bytes=start-end` against a known resource `size` resolves to ONE
@@ -464,7 +464,7 @@ import type { DispatcherInterface } from '@orkestrel/router'
 import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkestrel/emitter'
 
 /**
- * The `Server`'s lifecycle state.
+ * Represents the `Server`'s lifecycle state.
  *
  * @remarks
  * `idle` (never started, or a fresh instance) → `starting` (binding the
@@ -476,7 +476,7 @@ import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkes
 export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'stopped'
 
 /**
- * The machine-readable category a
+ * Represents the machine-readable category a
  * {@link import('./errors.js').ServerError} carries.
  *
  * @remarks
@@ -522,7 +522,7 @@ export interface ResponseRecord {
 }
 
 /**
- * The `Server`'s observable lifecycle events.
+ * Represents the `Server`'s observable lifecycle events.
  *
  * @remarks
  * - `start` — `listen()` resolved; carries the actually-bound port (an
@@ -563,7 +563,7 @@ export type ServerEventMap = {
 }
 
 /**
- * A raw `node:http` protocol-upgrade claimant — registered via
+ * Represents a raw `node:http` protocol-upgrade claimant — registered via
  * {@link ServerInterface.upgrade}.
  *
  * @remarks
@@ -589,8 +589,8 @@ export type ServerEventMap = {
  * @param request - The raw `node:http` upgrade request
  * @param socket - The raw, now-detached `Duplex` connection
  * @param head - The first packet of the upgraded stream, if any
- * @returns `true` to CLAIM the socket (this handler now owns it), `false` to
- *   decline and let a later handler try
+ * @returns True if the handler CLAIMS the socket (this handler now owns
+ *   it); false otherwise, declining so a later handler can try
  */
 export type UpgradeHandler = (request: IncomingMessage, socket: Duplex, head: Buffer) => boolean
 
@@ -685,7 +685,7 @@ export interface ServerOptions<TState> {
 }
 
 /**
- * The HTTP server facade — an observable `node:http` lifecycle that composes
+ * Represents the HTTP server facade — an observable `node:http` lifecycle that composes
  * a middleware onion (this module's own middleware seam) around a consumed
  * `@orkestrel/router` {@link DispatcherInterface}.
  *
@@ -713,7 +713,7 @@ export interface ServerInterface<TState> {
 	readonly id: string
 	readonly status: ServerStatus
 	readonly port: number | undefined
-	/** The bound listener address, or `undefined` while no listener is active. */
+	/** Holds the bound listener address, or `undefined` while no listener is active. */
 	readonly address: AddressInfo | undefined
 	readonly dispatcher: DispatcherInterface<TState>
 	readonly emitter: EmitterInterface<ServerEventMap>
@@ -735,7 +735,7 @@ export interface ServerInterface<TState> {
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**
-	 * Stop gracefully: refuse new connections, fire the stop signal, drain, close.
+	 * Stops gracefully: refuses new connections, fires the stop signal, drains, closes.
 	 *
 	 * @remarks
 	 * Drainable work is every in-flight request PLUS every upgraded socket a
@@ -750,7 +750,7 @@ export interface ServerInterface<TState> {
 	 */
 	stop(): Promise<void>
 	/**
-	 * Tear down for good: force-close the listener and every socket, then the emitter.
+	 * Tears down for good: force-closes the listener and every socket, then the emitter.
 	 *
 	 * @returns Resolves once nothing is left open; idempotent from any state
 	 */

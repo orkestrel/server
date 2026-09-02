@@ -28,7 +28,7 @@ import { isNumber, isString } from '@orkestrel/contract'
 import { HTTP_ERROR_BRAND } from './constants.js'
 
 /**
- * An error a handler (or middleware) throws to produce an HTTP response of a
+ * Represents an error a handler (or middleware) throws to produce an HTTP response of a
  * specific status.
  *
  * @remarks
@@ -69,7 +69,7 @@ export class HTTPError extends Error {
 }
 
 /**
- * The {@link HTTPError} thrown when a request body exceeds the body
+ * Represents the {@link HTTPError} thrown when a request body exceeds the body
  * pipeline's size limit — a `413 Content Too Large`.
  *
  * @remarks
@@ -97,11 +97,11 @@ export class ContentTooLargeError extends HTTPError {
 }
 
 /**
- * Narrow an unknown caught value to an {@link HTTPError} (including its
+ * Narrows an unknown caught value to an {@link HTTPError} (including its
  * subclasses, e.g. {@link ContentTooLargeError}).
  *
  * @param value - The value to test (typically a `catch` binding)
- * @returns `true` when `value` is an {@link HTTPError}
+ * @returns True if `value` is an {@link HTTPError}; false otherwise
  *
  * @remarks
  * Tries `instanceof` first, then falls back to a total structural check for
@@ -133,7 +133,7 @@ export function isHTTPError(value: unknown): value is HTTPError {
 }
 
 /**
- * The error the `Server` raises when a lifecycle call cannot run from the
+ * Represents the error the `Server` raises when a lifecycle call cannot run from the
  * status the entity is in.
  *
  * @remarks
