@@ -69,6 +69,9 @@ export class Negotiator implements NegotiatorInterface {
 	}
 
 	/**
+	 * Dispatches the request to the handler its `Accept` header negotiates,
+	 * answering 406 when none matches.
+	 *
 	 * @remarks
 	 * Errors thrown by the negotiated handler propagate UNMODIFIED — the
 	 * server boundary classifies them, never this negotiator.
