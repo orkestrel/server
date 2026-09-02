@@ -65,7 +65,7 @@ cookie/token/body helpers, `Negotiator` for content negotiation, and
 For the full surface — the middleware seam, `HTTPError` vocabulary, shared
 substrate (cookies, tokens, negotiation, ETag/Range, security headers, SSE,
 body pipeline), and the `Server` lifecycle entity — see
-[`guides/src/server.md`](guides/src/server.md).
+[`guides/server.md`](guides/server.md).
 
 ## Package
 
