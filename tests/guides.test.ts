@@ -3,6 +3,16 @@
 // package's own, and are the only part a sibling package changes.
 
 import { describe, expect, it } from 'vitest'
+import { createDispatcher } from '@orkestrel/router'
+import {
+	createNegotiator,
+	createServer,
+	decodeTokenPayload,
+	decompressRequestBody,
+	signToken,
+	verifyToken,
+} from '@src/server'
+import { buildContext } from './setup.js'
 import {
 	computeSymbolKey,
 	createGuide,
@@ -117,7 +127,7 @@ for (const entry of manifest) {
 				.map((fence) => fence.code)
 			const names = guide
 				.surface()
-				.filter((symbol) => symbol.kind === 'function')
+				.filter((symbol) => symbol.keyword === 'function')
 				.map((symbol) => symbol.name)
 			expect(findUnexampled(names, fences, source.examples())).toEqual([])
 		})
@@ -168,3 +178,76 @@ for (const entry of manifest) {
 		})
 	})
 }
+
+// Each case in this block transcribes one flagship fence of `guides/server.md` and asserts the value that
+// fence's comment claims. Name resolution is not a behavioural proof, so a fence documenting a
+// value the code contradicts passes every preceding parity assertion and only fails here. Change a
+// fence, change the transcription beside it. Each transcription imports through `@src/server`
+// where the fence imports through `@orkestrel/server`, because the barrel is the same surface and
+// the published specifier does not resolve inside this workspace.
+
+describe('guide fences', () => {
+	it('the substrate fence negotiates the media type, coding, and language its comments claim', () => {
+		const negotiator = createNegotiator()
+		expect(
+			negotiator.negotiate('text/html, application/json;q=0.9', ['application/json', 'text/html']),
+		).toBe('text/html')
+		expect(negotiator.encoding('gzip;q=1.0, deflate;q=0.8', ['gzip', 'deflate'])).toBe('gzip')
+		expect(negotiator.language('en-US, en;q=0.8, fr;q=0.5', ['en', 'fr'])).toBe('en')
+	})
+
+	it('the substrate fence dispatches its format handler', async () => {
+		const negotiator = createNegotiator()
+		const response = await negotiator.format(
+			new Request('http://x'),
+			buildContext<Record<string, never>>({}),
+			{
+				'application/json': (_request, _context) => Response.json({ ok: true }),
+			},
+		)
+		await expect(response.json()).resolves.toEqual({ ok: true })
+	})
+
+	it('the substrate fence resolves a bad token to undefined and round-trips a signed payload', async () => {
+		await expect(verifyToken('bad.token', 'secret')).resolves.toBeUndefined()
+		const token = await signToken('client', { secret: 'shh' })
+		const encoded = requireValue(token.split('.')[0], 'signToken emitted no payload segment')
+		expect(decodeTokenPayload(encoded)).toBe('client')
+	})
+
+	it('the substrate fence decompresses its capped gzip body', async () => {
+		const gzipped = new Uint8Array(
+			await new Response(
+				new Blob(['hi']).stream().pipeThrough(new CompressionStream('gzip')),
+			).arrayBuffer(),
+		)
+		const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)
+		expect(new TextDecoder().decode(body)).toBe('hi')
+	})
+
+	it('the Quickstart fence reaches listening and then stopped', async () => {
+		interface State {
+			readonly requestId: string
+		}
+		const dispatcher = createDispatcher<State>()
+		dispatcher.add({ method: 'GET', path: '/health', handler: () => new Response('ok') })
+		const server = createServer<State>({
+			dispatcher,
+			state: () => ({ requestId: crypto.randomUUID() }),
+		})
+		server.use(async (_request, context, next) => {
+			const response = await next()
+			response.headers.set('X-Request-ID', context.state.requestId)
+			return response
+		})
+		try {
+			const port = await server.start()
+			expect(server.status).toBe('listening')
+			expect(port).toBeGreaterThan(0)
+			await server.stop()
+			expect(server.status).toBe('stopped')
+		} finally {
+			await server.destroy()
+		}
+	})
+})

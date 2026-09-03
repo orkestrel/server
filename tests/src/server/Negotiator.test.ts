@@ -1,19 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { Encoding, MiddlewareContext } from '@src/server'
+import type { Encoding } from '@src/server'
 import { HTTPError, negotiateEncoding, Negotiator } from '@src/server'
+import { buildContext } from '../../setup.js'
 
 // Mirror of `src/server/Negotiator.ts` — the content-negotiation matrix
 // (media-type precedence, wildcard, q-ties broken by server order, `406`
 // path, `format` dispatch).
-
-function buildContext<TState>(state: TState): MiddlewareContext<TState> {
-	return {
-		url: new URL('http://localhost/'),
-		method: 'GET',
-		state,
-		body: async () => undefined,
-	}
-}
 
 describe('Negotiator#negotiate', () => {
 	it('picks an exact match over a subtype wildcard and an any-range', () => {
@@ -92,6 +84,12 @@ describe('Negotiator#encoding', () => {
 	it('returns undefined when no offered coding is acceptable', () => {
 		const negotiator = new Negotiator()
 		expect(negotiator.encoding('br', ['gzip', 'deflate'])).toBeUndefined()
+	})
+
+	it('diverges from negotiate on an empty header: undefined, not the first offered coding', () => {
+		const negotiator = new Negotiator()
+		expect(negotiator.encoding('', ['gzip', 'deflate'])).toBeUndefined()
+		expect(negotiator.negotiate('', ['gzip', 'deflate'])).toBe('gzip')
 	})
 
 	it('agrees with the standalone negotiateEncoding door on every axis it shares', () => {

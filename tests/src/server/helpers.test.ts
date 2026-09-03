@@ -16,11 +16,11 @@ import {
 	decompressRequestBody,
 	discoverPort,
 	HTTPError,
-	isAddressInfo,
 	isCompressibleType,
 	isCookieAttribute,
 	isCookieName,
 	isDangerousKey,
+	isServerError,
 	isValidRequestId,
 	matchesETag,
 	matchMediaType,
@@ -29,10 +29,10 @@ import {
 	normalizeSecret,
 	parseAcceptHeader,
 	parseCookies,
+	parseEncoding,
 	parseRange,
 	readBody,
 	readSignedCookie,
-	requestEncoding,
 	resolveCoding,
 	resolveOrigin,
 	resolveSecure,
@@ -45,15 +45,7 @@ import {
 	verifyToken,
 	writeSignedCookie,
 } from '@src/server'
-
-function buildContext<TState>(state: TState): MiddlewareContext<TState> {
-	return {
-		url: new URL('http://localhost/'),
-		method: 'GET',
-		state,
-		body: async () => undefined,
-	}
-}
+import { buildContext } from '../../setup.js'
 
 async function gzip(text: string): Promise<Uint8Array<ArrayBuffer>> {
 	const source = new ReadableStream<Uint8Array<ArrayBuffer>>({
@@ -112,7 +104,7 @@ describe('compose', () => {
 		])
 	})
 
-	it('rejects a second call to the same next()', async () => {
+	it('rejects a second call to the same next() with a ServerError of code NEXT', async () => {
 		const doubleNext: MiddlewareHandler<Record<string, never>> = async (
 			_request,
 			_context,
@@ -122,9 +114,16 @@ describe('compose', () => {
 			return next()
 		}
 		const handle = compose([doubleNext], async () => new Response('ok'))
-		await expect(handle(new Request('http://localhost/'), buildContext({}))).rejects.toThrow(
-			'next() was already called by this middleware',
-		)
+		let caught: unknown
+		try {
+			await handle(new Request('http://localhost/'), buildContext({}))
+		} catch (error) {
+			caught = error
+		}
+		if (!isServerError(caught))
+			throw new Error(`expected a ServerError, received ${String(caught)}`)
+		expect(caught.code).toBe('NEXT')
+		expect(caught.message).toBe('next() was already called by this middleware')
 	})
 
 	it('rejects the second of two CONCURRENT next() calls from the same middleware', async () => {
@@ -642,25 +641,25 @@ describe('computeLanguageQuality', () => {
 	})
 })
 
-describe('requestEncoding', () => {
+describe('parseEncoding', () => {
 	it('recognizes gzip', () => {
-		expect(requestEncoding('gzip')).toBe('gzip')
+		expect(parseEncoding('gzip')).toBe('gzip')
 	})
 
 	it('recognizes deflate', () => {
-		expect(requestEncoding('deflate')).toBe('deflate')
+		expect(parseEncoding('deflate')).toBe('deflate')
 	})
 
 	it('is undefined for identity', () => {
-		expect(requestEncoding('identity')).toBeUndefined()
+		expect(parseEncoding('identity')).toBeUndefined()
 	})
 
 	it('is undefined for an unsupported coding (br)', () => {
-		expect(requestEncoding('br')).toBeUndefined()
+		expect(parseEncoding('br')).toBeUndefined()
 	})
 
 	it('is undefined for an absent header', () => {
-		expect(requestEncoding(null)).toBeUndefined()
+		expect(parseEncoding(null)).toBeUndefined()
 	})
 })
 
@@ -691,6 +690,14 @@ describe('computeBodyETag / matchesETag / unwrapETag', () => {
 		const etag = await computeBodyETag(new TextEncoder().encode('hello'), false)
 		expect(etag.startsWith('W/')).toBe(false)
 		expect(etag.startsWith('"')).toBe(true)
+	})
+
+	it('wraps the canonical lowercase SHA-256 hex of the body, two digits per byte', async () => {
+		// The expected digest is the published SHA-256 of the ASCII text `hello`,
+		// so the assertion compares against a declaration rather than re-deriving
+		// the answer the way the source derives it.
+		const etag = await computeBodyETag(new TextEncoder().encode('hello'), false)
+		expect(etag).toBe('"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"')
 	})
 
 	it('matches weak-vs-strong per RFC 7232 §2.3.2', () => {
@@ -998,19 +1005,6 @@ describe('decompressRequestBody', () => {
 })
 
 // ── Node-bound port helpers (real sockets, no mocks) ─────────────────────────
-
-describe('isAddressInfo', () => {
-	it('accepts an AddressInfo-shaped record with a numeric port', () => {
-		expect(isAddressInfo({ address: '127.0.0.1', family: 'IPv4', port: 4000 })).toBe(true)
-	})
-
-	it('rejects null, a pipe string, and a record with a non-numeric port', () => {
-		expect(isAddressInfo(null)).toBe(false)
-		expect(isAddressInfo('/tmp/pipe')).toBe(false)
-		expect(isAddressInfo({ port: '4000' })).toBe(false)
-		expect(isAddressInfo(undefined)).toBe(false)
-	})
-})
 
 describe('discoverPort', () => {
 	it('resolves a free, non-zero ephemeral port with no preferred argument', async () => {

@@ -1,4 +1,3 @@
-import type { AddressInfo } from 'node:net'
 import type {
 	AcceptEntry,
 	BodyOptions,
@@ -14,15 +13,16 @@ import type {
 } from './types.js'
 import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
-import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
-import { isNumber, isRecord, isString, parseJSON } from '@orkestrel/contract'
+import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
+import { isRecord, isString, parseJSON } from '@orkestrel/contract'
 import {
 	COMPRESSIBLE_TYPES,
 	DEFAULT_BODY_LIMIT,
 	DEFAULT_DECOMPRESSED_LIMIT,
 	REQUEST_ID_PATTERN,
 } from './constants.js'
-import { ContentTooLargeError, HTTPError } from './errors.js'
+import { ContentTooLargeError, HTTPError, ServerError } from './errors.js'
+import { isAddressInfo } from './validators.js'
 
 // The middleware seam's composition engine — a pure function, not a class:
 // `compose` has no instance state, so it lives here rather than as an entity.
@@ -103,7 +103,10 @@ export function wrapMiddleware<TState>(
 		let called = false
 		return Promise.resolve(
 			layer(request, context, (nextRequest?: Request): Promise<Response> => {
-				if (called) return Promise.reject(new Error('next() was already called by this middleware'))
+				if (called)
+					return Promise.reject(
+						new ServerError('NEXT', 'next() was already called by this middleware'),
+					)
 				called = true
 				return next(nextRequest ?? request, context)
 			}),
@@ -120,7 +123,7 @@ export function wrapMiddleware<TState>(
 // verifyToken(parseCookies(...)[name], secret)` — so a cookie is just a
 // `signToken` value in a `Set-Cookie`, with the SAME secret rotation + tamper
 // rejection. Every reader narrows untrusted request input with `typeof`,
-// never `as` (`AGENTS.md` § Non-negotiable rules), and total on hostile input.
+// never `as`, and remains total on hostile input.
 
 /**
  * Parses a raw `Cookie:` request header into a `name → value` lookup.
@@ -287,7 +290,10 @@ export function serializeCookie(name: string, value: string, options?: CookieOpt
  * gets `Secure` automatically while local-dev HTTP still works.
  *
  * @param secure - The {@link CookieOptions} `secure` setting
- * @param encrypted - The connection's TLS flag ({@link import('./types.js').Connection.encrypted})
+ * @param encrypted - The connection's TLS flag
+ *   ({@link import('./types.js').Connection.encrypted}). If `true`, an omitted
+ *   `secure` resolves to `Secure`; if `false`, an omitted `secure` resolves to
+ *   no `Secure` attribute.
  * @returns The concrete `Secure` flag to emit
  *
  * @example
@@ -450,9 +456,8 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
  * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
  * retired), accepting the token on the first match (the
  * rotation path). It then decodes + narrows the payload (`isRecord` +
- * `typeof`, never `as` — `AGENTS.md` § Non-negotiable rules) and, when an
- * expiry was bound in,
- * rejects an expired token. ANY failure — a malformed token, a bad signature,
+ * `typeof`, never `as`) and, when an expiry was bound in, rejects an expired
+ * token. ANY failure — a malformed token, a bad signature,
  * a hostile/non-JSON payload, an empty secret list, or an elapsed expiry —
  * yields `undefined` rather than throwing.
  *
@@ -502,9 +507,8 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
  * @remarks
  * Decodes the payload with `@orkestrel/codec`'s `decodeBase64URL` (total — a
  * non-canonical base64url segment answers `undefined` rather than throwing),
- * reads it as UTF-8 JSON, narrows it to a record with a string `value`
- * (`AGENTS.md` § Non-negotiable rules — never `as`), and rejects an expired
- * `exp`. TOTAL — any
+ * reads it as UTF-8 JSON, narrows it to a record with a string `value` without
+ * `as`, and rejects an expired `exp`. TOTAL — any
  * decode/shape/expiry failure yields `undefined`; only `JSON.parse` still
  * throws, and its `catch` answers `undefined` too.
  *
@@ -833,7 +837,8 @@ export function isCompressibleType(type: string): boolean {
  * (`"<hash>"`, byte-identity) when `weak` is `false`.
  *
  * @param body - The full (uncompressed) response body to hash
- * @param weak - `true` for a weak `W/"…"` validator (the default), `false` for a strong `"…"` one
+ * @param weak - If `true` (the default), returns a weak `W/"…"` validator; if
+ *   `false`, returns a strong `"…"` one.
  * @returns The `ETag` header value
  *
  * @example
@@ -843,9 +848,7 @@ export function isCompressibleType(type: string): boolean {
  */
 export async function computeBodyETag(body: Uint8Array<ArrayBuffer>, weak = true): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', body)
-	const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
-		'',
-	)
+	const hex = encodeHex(new Uint8Array(digest))
 	return weak ? `W/"${hex}"` : `"${hex}"`
 }
 
@@ -1233,7 +1236,7 @@ export function isDangerousKey(key: string): boolean {
  */
 export function scrubPrototype(value: unknown): unknown {
 	if (Array.isArray(value)) {
-		for (const item of value) scrubPrototype(item)
+		for (const member of value) scrubPrototype(member)
 		return value
 	}
 	if (isRecord(value)) {
@@ -1297,8 +1300,8 @@ export async function collectRequestBody(
 }
 
 /**
- * Narrows a raw `Content-Encoding` header value to a decompressible
- * {@link Encoding} — the boundary guard {@link readBody} uses to decide
+ * Parses a raw `Content-Encoding` header value into a decompressible
+ * {@link Encoding} — the boundary {@link readBody} coerces through to decide
  * whether a request body needs transparent decompression.
  *
  * @remarks
@@ -1313,11 +1316,11 @@ export async function collectRequestBody(
  *
  * @example
  * ```ts
- * requestEncoding('gzip') // 'gzip'
- * requestEncoding('br') // undefined — unsupported by DecompressionStream
+ * parseEncoding('gzip') // 'gzip'
+ * parseEncoding('br') // undefined — unsupported by DecompressionStream
  * ```
  */
-export function requestEncoding(header: string | null): Exclude<Encoding, 'identity'> | undefined {
+export function parseEncoding(header: string | null): Exclude<Encoding, 'identity'> | undefined {
 	if (!isString(header)) return undefined
 	const value = header.trim().toLowerCase()
 	return value === 'gzip' || value === 'deflate' ? value : undefined
@@ -1407,9 +1410,15 @@ export async function decompressRequestBody(
  * scrubPrototype}); any other type decodes as UTF-8 text; an empty body
  * decodes to `undefined`.
  *
+ * A malformed JSON body is total: it decodes to `undefined` rather than
+ * throwing, so a handler that must reject one checks for `undefined` itself.
+ * That makes `undefined` the answer for two distinct inputs, and nothing in the
+ * returned value tells them apart.
+ *
  * @param request - The `Request` to read the body from
  * @param options - The {@link BodyOptions} `limit` + `decompression` caps
- * @returns The parsed JSON value, the raw text, or `undefined` for an empty body
+ * @returns The parsed JSON value, the raw text, or `undefined` — for an empty
+ *   body, and for an `application/json` body whose text is not valid JSON
  * @throws {ContentTooLargeError} When the wire body or decompressed output exceeds its cap
  * @throws {HTTPError} When the compressed body is corrupt (400)
  *
@@ -1422,7 +1431,7 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 	const limit = options?.limit ?? DEFAULT_BODY_LIMIT
 	const decompression = options?.decompression ?? DEFAULT_DECOMPRESSED_LIMIT
 	const wire = await collectRequestBody(request, limit)
-	const encoding = requestEncoding(request.headers.get('content-encoding'))
+	const encoding = parseEncoding(request.headers.get('content-encoding'))
 	const bytes =
 		encoding === undefined ? wire : await decompressRequestBody(wire, encoding, decompression)
 	if (bytes.length === 0) return undefined
@@ -1439,7 +1448,7 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 
 // ============================================================================
 //  The node face — pure helpers. Every function here is genuinely
-//  node-bound (a `node:net` probe, an `AddressInfo` narrow) — everything
+//  node-bound (a `node:net` probe) — everything
 //  fetch/string-pure lives above in this same file and is consumed, never
 //  duplicated (the socket-encrypted narrow and the `Request`/`Response`
 //  conversion are `@orkestrel/router`'s `isEncryptedSocket` / `buildRequest` /
@@ -1447,31 +1456,17 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 // ============================================================================
 
 /**
- * Checks whether a `node:net` `server.address()` return is the structured
- * {@link AddressInfo} (carrying a numeric `port`) rather than a pipe `string`
- * or `null` — the total, never-throwing narrow `discoverPort`
- * and the `Server`'s own port resolution read the bound port through.
- *
- * @param value - The `server.address()` return (`AddressInfo | string | null`)
- * @returns True if `value` is an `AddressInfo` with a numeric `port`; false otherwise
- *
- * @example
- * ```ts
- * import { isAddressInfo } from '@src/server'
- *
- * isAddressInfo({ address: '127.0.0.1', family: 'IPv4', port: 4000 }) // true
- * isAddressInfo(null) // false
- * ```
- */
-export function isAddressInfo(value: unknown): value is AddressInfo {
-	return isRecord(value) && isNumber(value.port)
-}
-
-/**
  * Binds and closes a throwaway TCP server to resolve one available port.
+ *
+ * @remarks
+ * The probe always closes, including on the rejection path. A listener whose
+ * address is not an {@link import('node:net').AddressInfo} — a pipe listener,
+ * which a numeric `port` cannot request — has no port to report, so this
+ * rejects rather than substituting a number.
  *
  * @param port - The requested port, with `0` selecting an ephemeral port
  * @returns The bound port after the probe server has closed
+ * @throws {TypeError} When the bound listener's address carries no numeric port
  *
  * @example
  * ```ts
@@ -1484,11 +1479,14 @@ export async function probePort(port: number): Promise<number> {
 	probe.listen(port)
 	await listening
 	const address = probe.address()
-	const resolved = isAddressInfo(address) ? address.port : 0
 	const closed = once(probe, 'close')
 	probe.close()
 	await closed
-	return resolved
+	// This branch is unreachable through `listen(port)` and exists for the other members of `address()`'s union.
+	if (!isAddressInfo(address)) {
+		throw new TypeError('server bound a listener with no resolvable AddressInfo')
+	}
+	return address.port
 }
 
 /**
@@ -1503,11 +1501,16 @@ export async function probePort(port: number): Promise<number> {
  * port. It binds then immediately closes a probe server, so the returned
  * port is free at the instant of the probe (an inherent TOCTOU race — bind it
  * promptly). Rejects only on an unexpected listen error other than a taken
- * `preferred` port (e.g. a permission fault).
+ * `preferred` port (e.g. a permission fault). A listener whose address is not
+ * an {@link import('node:net').AddressInfo} — a pipe listener, which this
+ * package's options cannot request — rejects with a `TypeError` rather than
+ * reporting `0`, because `0` is this package's own request for an ephemeral
+ * port and never means an unknown one.
  *
  * @param preferred - An optional port to try first; taken (`EADDRINUSE`) ⇒
  *   fall back to an ephemeral port
  * @returns A free TCP port number
+ * @throws {TypeError} When the bound listener's address carries no numeric port
  *
  * @example
  * ```ts

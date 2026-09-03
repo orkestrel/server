@@ -27,13 +27,11 @@ describe('Stream', () => {
 		expect(stream.response.headers.get('cache-control')).toBe('no-cache')
 	})
 
-	it('lets a caller repeating a seam-owned key REPLACE it, and a re-cased one APPEND', () => {
-		const replaced = new Stream({ headers: { 'Content-Type': 'text/plain' } })
-		expect(replaced.response.headers.get('content-type')).toBe('text/plain')
-		const appended = new Stream({ headers: { 'content-type': 'text/plain' } })
-		expect(appended.response.headers.get('content-type')).toBe(
-			'text/event-stream; charset=utf-8, text/plain',
-		)
+	it('lets a caller repeating a seam-owned key REPLACE it in any casing', () => {
+		const exact = new Stream({ headers: { 'Content-Type': 'text/plain' } })
+		expect(exact.response.headers.get('content-type')).toBe('text/plain')
+		const recased = new Stream({ headers: { 'content-type': 'text/plain' } })
+		expect(recased.response.headers.get('content-type')).toBe('text/plain')
 	})
 
 	it('is a safe no-op once ended', async () => {

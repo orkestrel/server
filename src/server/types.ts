@@ -1,7 +1,7 @@
 // ============================================================================
 //  The middleware seam + substrate — type definitions, the source of truth for
-//  this half of the package. Two families, both `readonly` (`AGENTS.md`
-//  § Non-negotiable rules), both fetch/string-pure (no `node:*`, no DOM):
+//  this half of the package. Two families, both `readonly`, both
+//  fetch/string-pure (no `node:*`, no DOM):
 //
 //    1. The middleware seam — {@link MiddlewareContext}, {@link NextFunction},
 //       {@link MiddlewareHandler} — the frozen contract `compose` wires
@@ -268,11 +268,20 @@ export interface NegotiatorInterface {
 	negotiate(header: string, available: readonly string[]): string | undefined
 	/**
 	 * Picks the best `available` content-coding for an `Accept-Encoding` header
-	 * — `negotiate` scoped to codings (a bare `*` wildcard ⇒ the first `available`).
+	 * — the coding axis of the same q-value parser (a bare `*` wildcard ⇒ the
+	 * first `available`).
 	 *
 	 * @param header - The raw `Accept-Encoding` header value (e.g. `gzip;q=1.0, deflate;q=0.8`)
 	 * @param available - The codings the server offers, in preference order
 	 * @returns The best acceptable coding, or `undefined` when none is
+	 *
+	 * @remarks
+	 * An absent, empty, or unparseable header resolves to `undefined` — no
+	 * compression — rather than to the first offered coding, because an absent
+	 * `Accept-Encoding` makes identity the correct answer.
+	 * {@link NegotiatorInterface.negotiate} and
+	 * {@link NegotiatorInterface.language} fall back to the first offered value
+	 * instead.
 	 */
 	encoding(header: string, available: readonly Encoding[]): Encoding | undefined
 	/**
@@ -332,11 +341,8 @@ export interface SSEMessage {
  * @param status - The HTTP status the streaming response is opened with;
  *   defaults to `200`.
  * @param headers - Extra response headers merged OVER the SSE headers the
- *   seam always sets ({@link SSE_HEADERS}), so a caller repeating one of those
- *   keys replaces the seam's value. Repeating it under a different casing
- *   appends instead, because `Headers` accumulates both spellings into one
- *   comma-joined value — spell a key exactly as {@link SSE_HEADERS} spells it
- *   when the intent is to replace it.
+ *   seam always sets ({@link SSE_HEADERS}); a caller repeating one of those
+ *   keys replaces the seam's value, in any casing.
  */
 export interface StreamOptions {
 	readonly status?: number
@@ -480,15 +486,17 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
  * {@link import('./errors.js').ServerError} carries.
  *
  * @remarks
- * A `ServerError` reports a lifecycle refusal the caller programmed, not a
- * client-facing fault — {@link import('./errors.js').HTTPError} owns the
- * latter and keys on `status` instead. The categories are disjoint, so a
- * `catch` narrowed by {@link import('./errors.js').isServerError} reads `code`
+ * A `ServerError` reports a call the caller programmed and the substrate
+ * refuses, not a client-facing fault — {@link import('./errors.js').HTTPError}
+ * owns the latter and keys on `status` instead. The categories are disjoint, so
+ * a `catch` narrowed by {@link import('./errors.js').isServerError} reads `code`
  * to tell them apart.
  */
 export type ServerErrorCode =
 	/** Identifies a lifecycle call the current {@link ServerStatus} forbids. */
-	'STATUS'
+	| 'STATUS'
+	/** Identifies a middleware that called its `next` a second time within one invocation. */
+	| 'NEXT'
 
 /**
  * Identifies the request a server-level fault came from — its method and its
@@ -573,8 +581,7 @@ export type ServerEventMap = {
  * on the `error` event) and the fan-out continues; if NONE claim it, the
  * socket is destroyed so an unhandled upgrade never leaks a dangling
  * connection. `request` / `socket` / `head` are node's own raw values, handed
- * over verbatim — no assertion at this boundary (`AGENTS.md`
- * § Non-negotiable rules).
+ * over verbatim — no assertion at this boundary.
  *
  * A CLAIMED socket is TRACKED until it closes. The handler still owns it —
  * the server only watches — but `stop()` now drains that socket like an
@@ -710,15 +717,37 @@ export interface ServerOptions<TState> {
  * hidden-unless-`expose` `500`) so a handler error can never crash the process.
  */
 export interface ServerInterface<TState> {
+	/** Holds the instance's correlation id, minted once per `Server` and stable for its lifetime. */
 	readonly id: string
+	/** Reports the current lifecycle phase — see {@link ServerStatus}. */
 	readonly status: ServerStatus
+	/**
+	 * Holds the bound listener's TCP port — the `port` of {@link address} — or
+	 * `undefined` while no listener is active.
+	 */
 	readonly port: number | undefined
 	/** Holds the bound listener address, or `undefined` while no listener is active. */
 	readonly address: AddressInfo | undefined
+	/** Holds the `@orkestrel/router` dispatcher the composed middleware onion terminates into. */
 	readonly dispatcher: DispatcherInterface<TState>
+	/** Holds the lifecycle emitter over {@link ServerEventMap}. */
 	readonly emitter: EmitterInterface<ServerEventMap>
+	/**
+	 * Appends one middleware, or an array of them in order, to the onion.
+	 *
+	 * @param middleware - One handler, or the ordered array of handlers to append
+	 *
+	 * @remarks
+	 * Callable before or after `start()`; an appended handler runs on the next
+	 * request the composed onion serves.
+	 */
 	use(middleware: MiddlewareHandler<TState>): void
 	use(middleware: ReadonlyArray<MiddlewareHandler<TState>>): void
+	/**
+	 * Registers a protocol-upgrade claimant that runs in registration order.
+	 *
+	 * @param handler - The claimant; the first to return `true` claims the socket
+	 */
 	upgrade(handler: UpgradeHandler): void
 	/**
 	 * Binds the configured listener and resolves its actually-bound port.
@@ -731,7 +760,10 @@ export interface ServerInterface<TState> {
 	 * Rejects with a {@link import('./errors.js').ServerError} of code
 	 * `'STATUS'` when the current {@link ServerStatus} is neither `'idle'` nor
 	 * `'stopped'`, carrying that status in its `context`. Narrow it with
-	 * {@link import('./errors.js').isServerError}.
+	 * {@link import('./errors.js').isServerError}. A listener whose address is
+	 * not an `AddressInfo` — a pipe listener, which this package's options
+	 * cannot request — closes the partial listener and rejects with a
+	 * `TypeError` rather than reporting `0`.
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**

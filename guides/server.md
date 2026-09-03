@@ -8,8 +8,8 @@
 > binding `node:http` via `@orkestrel/router`'s adapter helpers, the upgrade
 > seam, connection-fact injection, and `discoverPort`. The server
 > **consumes** `@orkestrel/router` — routing, matching, and dispatch are that
-> package's, never re-implemented here (`AGENTS.md` § Design laws —
-> mechanism, not product policy). Source: [`src/server`](../src/server). Surfaced through the
+> package's, never re-implemented here — mechanism, not product policy. Source:
+> [`src/server`](../src/server). Surfaced through the
 > `@orkestrel/server` barrel (aliased `@src/server` inside this repo).
 
 ## Surface
@@ -70,7 +70,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 | `DEFAULT_DRAIN_MS`           | const | Default graceful-stop deadline (ms) `stop()` gives in-flight requests and claimed upgraded sockets.                                            |
 | `DEFAULT_BODY_LIMIT`         | const | Default maximum request body size (bytes) `readBody` accepts before a 413.                                                                     |
 | `DEFAULT_DECOMPRESSED_LIMIT` | const | Default maximum DECOMPRESSED body size (bytes) — the zip-bomb cap.                                                                             |
-| `SSE_HEADERS`                | const | The SSE response headers a `Stream` merges under any caller `headers` — a caller repeating one of these exact keys replaces its value.         |
+| `SSE_HEADERS`                | const | The SSE response headers a `Stream` merges under any caller `headers` — a caller repeating one of these keys replaces its value.               |
 | `REQUEST_ID_PATTERN`         | const | The strict charset `isValidRequestId` requires an `X-Request-ID` to match.                                                                     |
 | `COMPRESSIBLE_TYPES`         | const | The bare `Content-Type`s `isCompressibleType` treats as compressible.                                                                          |
 | `HTTP_ERROR_BRAND`           | const | The `Symbol.for`-interned brand `HTTPError` carries so `isHTTPError` recognizes an instance across package copies. Not a field to set by hand. |
@@ -78,52 +78,52 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 
 ### Helpers
 
-| API                      | Kind     | Summary                                                                                                                                     |
-| ------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `compose`                | function | Compose an ordered middleware chain around a `terminal` handler (the frozen seam).                                                          |
-| `wrapMiddleware`         | function | Wrap one middleware layer around its downstream handler while enforcing the one-call `next` invariant.                                      |
-| `parseCookies`           | function | Parse a raw `Cookie:` header into a `name → value` lookup.                                                                                  |
-| `isCookieName`           | function | Whether a string is a valid RFC 6265 cookie name (no whitespace).                                                                           |
-| `decodeCookieValue`      | function | Decode a cookie value, falling back to raw text on malformed escapes.                                                                       |
-| `isCookieAttribute`      | function | Whether a string is safe to interpolate as a `Domain`/`Path` attribute value.                                                               |
-| `serializeCookie`        | function | Serialize a cookie into a `Set-Cookie` header value with its attributes.                                                                    |
-| `resolveSecure`          | function | Resolve a cookie's effective `Secure` flag from its setting + the TLS fact.                                                                 |
-| `writeSignedCookie`      | function | Write a SIGNED cookie (`signToken` + `Set-Cookie`).                                                                                         |
-| `readSignedCookie`       | function | Read + verify a SIGNED cookie off a request — total, returns `undefined` on any failure.                                                    |
-| `clearCookie`            | function | Clear a cookie via an immediately-expiring `Set-Cookie`.                                                                                    |
-| `signToken`              | function | Sign a value into a stateless, HMAC-SHA256 token.                                                                                           |
-| `verifyToken`            | function | Verify a stateless token and return its embedded value — total, never throws.                                                               |
-| `decodeTokenPayload`     | function | Decode + narrow a signed token's payload, honoring its expiry.                                                                              |
-| `normalizeSecret`        | function | Normalize a `TokenSecret` to a concrete list of usable secrets.                                                                             |
-| `parseAcceptHeader`      | function | Parse a weighted `Accept`-family header into its q-sorted entries.                                                                          |
-| `computeCodingQuality`   | function | The client's quality for one content-coding from parsed `Accept-Encoding` entries.                                                          |
-| `resolveCoding`          | function | Pick the highest-scoring offered coding from parsed entries — the leaf both encoding doors run.                                             |
-| `negotiateEncoding`      | function | Select the best content-coding for a raw `Accept-Encoding` header.                                                                          |
-| `matchMediaType`         | function | Rank + quality of one candidate media type against parsed `Accept` entries.                                                                 |
-| `computeLanguageQuality` | function | The client's quality for one candidate language from parsed `Accept-Language` entries.                                                      |
-| `isCompressibleType`     | function | Whether a `Content-Type` is worth compressing.                                                                                              |
-| `computeBodyETag`        | function | Compute a content `ETag` over a fully-buffered response body via WebCrypto.                                                                 |
-| `unwrapETag`             | function | Strip the weak indicator (`W/`) from an entity-tag.                                                                                         |
-| `matchesETag`            | function | Whether a request's `If-None-Match` matches a resource's current `ETag` (RFC 7232 weak comparison).                                         |
-| `parseRange`             | function | Parse an HTTP `Range` header against a known resource size — total.                                                                         |
-| `resolveOrigin`          | function | Resolve the `Access-Control-Allow-Origin` value for a request.                                                                              |
-| `mergeVary`              | function | Merge a `Vary` value into an existing `Vary` header without duplication.                                                                    |
-| `resolveSecurityHeader`  | function | Resolve one opt-out, value-bearing security header.                                                                                         |
-| `isValidRequestId`       | function | Whether a client-supplied `X-Request-ID` is safe to echo back.                                                                              |
-| `computeIPv6Network`     | function | Compute the `/64` network of a full IPv6 address, or `undefined`.                                                                           |
-| `computeClientKey`       | function | Collapse a client IP into its rate-limit bucket key (IPv6 `/64`, IPv4 unchanged).                                                           |
-| `serializeEvent`         | function | Serialize one `SSEMessage` to the SSE wire.                                                                                                 |
-| `isDangerousKey`         | function | Whether a key is a prototype-pollution vector (`__proto__`/`constructor`/`prototype`).                                                      |
-| `scrubPrototype`         | function | Recursively strip prototype-pollution keys from a parsed value in place.                                                                    |
-| `collectRequestBody`     | function | Collect a `Request` body into one `Uint8Array`, enforcing a size limit.                                                                     |
-| `requestEncoding`        | function | Narrow a raw `Content-Encoding` header to a decompressible `Encoding`.                                                                      |
-| `decompressRequestBody`  | function | Transparently decompress a collected body, capping decompressed output (the zip-bomb defense).                                              |
-| `readBody`               | function | Collect + decode a `Request` body — the pipeline behind `context.body()`.                                                                   |
-| `isHTTPError`            | function | Narrow an unknown caught value to an `HTTPError` (including subclasses) — recognized across package copies via a structural brand fallback. |
-| `isServerError`          | function | Narrow an unknown caught value to a `ServerError` — the code-bearing lifecycle refusal.                                                     |
-| `isAddressInfo`          | function | Whether a `node:net` address is the structured `AddressInfo` shape.                                                                         |
-| `probePort`              | function | Bind and close one throwaway TCP server to resolve an available port.                                                                       |
-| `discoverPort`           | function | Find a free TCP port — try a `preferred` one first, else an ephemeral port.                                                                 |
+| API                      | Kind     | Summary                                                                                                                                                     |
+| ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `compose`                | function | Compose an ordered middleware chain around a `terminal` handler (the frozen seam).                                                                          |
+| `wrapMiddleware`         | function | Wrap one middleware layer around its downstream handler while enforcing the one-call `next` invariant.                                                      |
+| `parseCookies`           | function | Parse a raw `Cookie:` header into a `name → value` lookup.                                                                                                  |
+| `isCookieName`           | function | Whether a string is a valid RFC 6265 cookie name (no whitespace).                                                                                           |
+| `decodeCookieValue`      | function | Decode a cookie value, falling back to raw text on malformed escapes.                                                                                       |
+| `isCookieAttribute`      | function | Whether a string is safe to interpolate as a `Domain`/`Path` attribute value.                                                                               |
+| `serializeCookie`        | function | Serialize a cookie into a `Set-Cookie` header value with its attributes.                                                                                    |
+| `resolveSecure`          | function | Resolve a cookie's effective `Secure` flag from its setting + the TLS fact.                                                                                 |
+| `writeSignedCookie`      | function | Write a SIGNED cookie (`signToken` + `Set-Cookie`).                                                                                                         |
+| `readSignedCookie`       | function | Read + verify a SIGNED cookie off a request — total, returns `undefined` on any failure.                                                                    |
+| `clearCookie`            | function | Clear a cookie by setting an immediately-expiring `Set-Cookie`.                                                                                             |
+| `signToken`              | function | Sign a value into a stateless, HMAC-SHA256 token.                                                                                                           |
+| `verifyToken`            | function | Verify a stateless token and return its embedded value — total, never throws.                                                                               |
+| `decodeTokenPayload`     | function | Decode + narrow a signed token's payload, honoring its expiry.                                                                                              |
+| `normalizeSecret`        | function | Normalize a `TokenSecret` to a concrete list of usable secrets.                                                                                             |
+| `parseAcceptHeader`      | function | Parse a weighted `Accept`-family header into its q-sorted entries.                                                                                          |
+| `computeCodingQuality`   | function | The client's quality for one content-coding from parsed `Accept-Encoding` entries.                                                                          |
+| `resolveCoding`          | function | Pick the highest-scoring offered coding from parsed entries — the leaf both encoding doors run.                                                             |
+| `negotiateEncoding`      | function | Select the best content-coding for a raw `Accept-Encoding` header.                                                                                          |
+| `matchMediaType`         | function | Rank + quality of one candidate media type against parsed `Accept` entries.                                                                                 |
+| `computeLanguageQuality` | function | The client's quality for one candidate language from parsed `Accept-Language` entries.                                                                      |
+| `isCompressibleType`     | function | Whether a `Content-Type` is worth compressing.                                                                                                              |
+| `computeBodyETag`        | function | Compute a content `ETag` over a fully-buffered response body by using WebCrypto.                                                                            |
+| `unwrapETag`             | function | Strip the weak indicator (`W/`) from an entity-tag.                                                                                                         |
+| `matchesETag`            | function | Whether a request's `If-None-Match` matches a resource's current `ETag` (RFC 7232 weak comparison).                                                         |
+| `parseRange`             | function | Parse an HTTP `Range` header against a known resource size — total.                                                                                         |
+| `resolveOrigin`          | function | Resolve the `Access-Control-Allow-Origin` value for a request.                                                                                              |
+| `mergeVary`              | function | Merge a `Vary` value into an existing `Vary` header without duplication.                                                                                    |
+| `resolveSecurityHeader`  | function | Resolve one opt-out, value-bearing security header.                                                                                                         |
+| `isValidRequestId`       | function | Whether a client-supplied `X-Request-ID` is safe to echo back.                                                                                              |
+| `computeIPv6Network`     | function | Compute the `/64` network of a full IPv6 address, or `undefined`.                                                                                           |
+| `computeClientKey`       | function | Collapse a client IP into its rate-limit bucket key (IPv6 `/64`, IPv4 unchanged).                                                                           |
+| `serializeEvent`         | function | Serialize one `SSEMessage` to the SSE wire.                                                                                                                 |
+| `isDangerousKey`         | function | Whether a key is a prototype-pollution vector (`__proto__`/`constructor`/`prototype`).                                                                      |
+| `scrubPrototype`         | function | Recursively strip prototype-pollution keys from a parsed value in place.                                                                                    |
+| `collectRequestBody`     | function | Collect a `Request` body into one `Uint8Array`, enforcing a size limit.                                                                                     |
+| `parseEncoding`          | function | Parse a raw `Content-Encoding` header into a decompressible `Encoding`.                                                                                     |
+| `decompressRequestBody`  | function | Transparently decompress a collected body, capping decompressed output (the zip-bomb defense).                                                              |
+| `readBody`               | function | Collect + decode a `Request` body — the pipeline behind `context.body()`; an empty body and a malformed `application/json` body both decode to `undefined`. |
+| `isHTTPError`            | function | Narrow an unknown caught value to an `HTTPError` (including subclasses) — recognized across package copies through a structural brand fallback.             |
+| `isServerError`          | function | Narrow an unknown caught value to a `ServerError` — the code-bearing refusal of a call the caller programmed.                                               |
+| `isAddressInfo`          | function | Whether a `node:net` address is the structured `AddressInfo` shape.                                                                                         |
+| `probePort`              | function | Bind and close one throwaway TCP server to resolve an available port.                                                                                       |
+| `discoverPort`           | function | Find a free TCP port — try a `preferred` one first, else an ephemeral port.                                                                                 |
 
 ### Entities
 
@@ -131,7 +131,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 | ---------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------- |
 | `HTTPError`            | class | An error a handler throws to produce an HTTP response of a specific status.                                                 |
 | `ContentTooLargeError` | class | The `HTTPError` (413) thrown when a request body exceeds its size limit.                                                    |
-| `ServerError`          | class | The code-bearing error a `Server` raises when its status forbids a lifecycle call.                                          |
+| `ServerError`          | class | The code-bearing error raised when a caller programmed a call the entity refuses — `'STATUS'` or `'NEXT'`.                  |
 | `Negotiator`           | class | The content-negotiation machine over the weighted `Accept` family; implements `NegotiatorInterface`.                        |
 | `Server`               | class | The `node:http` lifecycle entity composing the middleware onion around a consumed dispatcher; implements `ServerInterface`. |
 | `Stream`               | class | The Server-Sent-Events handle over a streaming `Response`; implements `StreamInterface`.                                    |
@@ -158,7 +158,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 | `RangeSpec`               | type      | `{ satisfiable: true; start; end } \| { satisfiable: false }` — a parsed `Range`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `BodyOptions`             | interface | `{ limit?; decompression? }` — caps for `readBody`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `ServerStatus`            | type      | `'idle' \| 'starting' \| 'listening' \| 'stopping' \| 'stopped'` — the lifecycle states.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `ServerErrorCode`         | type      | `'STATUS'` — the machine-readable category a `ServerError` carries.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ServerErrorCode`         | type      | `'STATUS' \| 'NEXT'` — the machine-readable category a `ServerError` carries: a lifecycle call the status forbids, or a middleware calling its `next` twice.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `RequestLine`             | interface | `{ method; url }` — the request a server-level fault came from.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `ResponseRecord`          | interface | `{ method; pathname; status; ms }` — one finished request, the `response` event's payload.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `ServerEventMap`          | type      | `{ start; request; upgrade; error; stop; drain; response }` — the `Server`'s event map. `error`'s second element and `report`'s second parameter are an OPTIONAL `RequestLine` — present for a request-pipeline fault, `undefined` for an upgrade-path fault (no fetch `Request` exists there). `response` fires with one `ResponseRecord` for every request reaching the middleware pipeline (success or outer-boundary error path) — not for one rejected at the inner `buildRequest` boundary (plain `400`, no parsed `Request` to derive facts from). `drain` carries `(pending, upgraded)` — the requests still in flight and the upgraded sockets still attached when the drain settled; both `0` means the close that followed was clean, either non-zero means it was forced. |
@@ -188,6 +188,11 @@ instance-method surface.
 its sibling axes over the same q-value parser; `format` is the dispatcher —
 it reads the request `Accept`, negotiates a `FormatHandlerMap`'s keys, and
 invokes the winner, or answers `406`.
+
+The axes diverge on an absent, empty, or unparseable header. `encoding`
+resolves to `undefined` — no compression — rather than to the first offered
+coding, because an absent `Accept-Encoding` makes identity the correct answer;
+`negotiate` and `language` fall back to the first offered value instead.
 
 | Method      | Returns                 | Behavior                                                                    |
 | ----------- | ----------------------- | --------------------------------------------------------------------------- |
@@ -247,16 +252,16 @@ These invariants hold across `src/server` ↔ `server.md`.
    `NegotiatorInterface`'s, `StreamInterface`'s, and `ServerInterface`'s public
    methods — exhaustive, both directions — and `Negotiator` / `Stream` /
    `Server` expose the same public methods, no more.
-3. **Status machine + bound address + restart-fresh-abort.** `idle → starting → listening →
-stopping → stopped`; `start()` from `listening`/`starting`/`stopping`
-   rejects with a `ServerError` of code `'STATUS'`, carrying that status in its
-   `context` and narrowed by `isServerError`; each `start()` mints a FRESH stop
-   signal, so a restarted server is
-   never born aborted; `address` is the real bound `AddressInfo` after a
-   successful start and `undefined` before start and after stop or destroy;
-   `stop()`/`destroy()` are idempotent no-ops from a state with nothing to tear
-   down; `EADDRINUSE` rejects `start()` outright — no
-   silent ephemeral fallback (use `discoverPort` up front for a guaranteed-free
+3. **Status machine + bound address + restart-fresh-abort.**
+   `idle → starting → listening → stopping → stopped`; `start()` from
+   `listening`/`starting`/`stopping` rejects with a `ServerError` of code
+   `'STATUS'`, carrying that status in its `context` and narrowed by
+   `isServerError`; each `start()` mints a FRESH stop signal, so a restarted
+   server is never born aborted; `address` is the real bound `AddressInfo`
+   after a successful start and `undefined` before start and after stop or
+   destroy; `stop()`/`destroy()` are idempotent no-ops from a state with
+   nothing to tear down; `EADDRINUSE` rejects `start()` outright — no silent
+   ephemeral fallback (use `discoverPort` up front for a guaranteed-free
    port).
 4. **Startup is bounded and caller-cancellable.** `start(signal?)` observes
    caller cancellation only while binding; `timeouts.start` independently
@@ -274,7 +279,7 @@ stopping → stopped`; `start()` from `listening`/`starting`/`stopping`
    only when the deadline fired with work still pending (or on `destroy()`).
    Drainable work is every in-flight REQUEST plus every upgraded SOCKET a
    handler claimed, because a long-lived upgraded connection is work a
-   graceful stop should let finish rather than cut mid-frame. `drain` carries
+   graceful stop lets finish rather than cuts mid-frame. `drain` carries
    both counts, so a caller can tell a clean stop from a forced one. This is
    also what makes `stop()` and `destroy()` ALWAYS resolve: node detaches an
    upgraded socket from its own connection set, so neither
@@ -346,10 +351,12 @@ stopping → stopped`; `start()` from `listening`/`starting`/`stopping`
 10. **Seam semantics: returning onion.** Each `MiddlewareHandler` receives a
     `next` that, called, runs the downstream chain and resolves its `Response`;
     NOT calling it short-circuits with the middleware's own `Response`; a
-    SECOND call to the same `next` within one invocation REJECTS (the
-    double-`next` guard) — a middleware can transform the request
-    (`next(newRequest)`), transform the response (mutate after `await next()`),
-    or short-circuit, but never fork the chain.
+    SECOND call to the same `next` within one invocation REJECTS with a
+    `ServerError` of code `'NEXT'` (the double-`next` guard) — a middleware can
+    transform the request (`next(newRequest)`), transform the response (mutate
+    after `await next()`), or short-circuit, but never fork the chain. That
+    rejection escapes into the request boundary, which carries no `status` for
+    it and answers a generic 500.
 11. **The bag IS the router's state.** `compose`'s `terminal` is
     `(request, context) => dispatcher.handle(request, context.state)` — the
     exact object every middleware wrote into `context.state` is what a route
@@ -401,7 +408,7 @@ stopping → stopped`; `start()` from `listening`/`starting`/`stopping`
 19. **SSE producers can cooperate with real process-local transport
     backpressure.** `StreamInterface.write` returns `true` only while the
     underlying `ReadableStream` controller retains positive desired size after
-    accepting the event. A `false` result means the producer should await
+    accepting the event. A `false` result tells a cooperative producer to await
     `drain()`; that promise parks without polling until a consumer pull restores
     capacity, or stream closure settles the wait. Because the router response
     pump stops pulling while `ServerResponse.write` is backpressured, a slow TCP
@@ -628,15 +635,20 @@ await verifyToken('bad.token', 'secret') // undefined — total, never throws
 const token = await signToken('client', { secret: 'shh' })
 decodeTokenPayload(token.split('.')[0]) // 'client' — the shared decode step verifyToken applies after a signature match
 
-const gzipped = new Uint8Array(await new Response('hi').arrayBuffer())
-await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression — the zip-bomb defense
+const gzipped = new Uint8Array(
+	await new Response(
+		new Blob(['hi']).stream().pipeThrough(new CompressionStream('gzip')),
+	).arrayBuffer(),
+)
+const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)
+new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb defense
 ```
 
 ### Practices
 
 - **The server consumes the router, never re-implements it** — bring your own
-  `DispatcherInterface`; this package owns zero route matching (`AGENTS.md`
-  § Design laws — mechanism, not product policy).
+  `DispatcherInterface`; this package owns zero route matching — mechanism,
+  not product policy.
 - **Mount CORS before anything that could short-circuit an `OPTIONS`** — the
   ordering idiom above; the dispatcher's own auto-`OPTIONS` runs LAST.
 - **Read `context.body()` through the cache, never `request.body` directly**
@@ -663,12 +675,16 @@ await decompressRequestBody(gzipped, 'gzip', 1_048_576) // capped decompression 
   request substitution, response transformation), cookie parse/serialize/
   attribute-injection guards, `resolveSecure`, `clearCookie` (expiry and
   accumulation), `computeCodingQuality`/`resolveCoding`/`negotiateEncoding`,
-  `isAddressInfo` narrowing, and `discoverPort` (default, preferred, and
+  the `ETag` hex digest, and `discoverPort` (default, preferred, and
   taken-preferred-falls-back cases).
+- [`tests/src/server/validators.test.ts`](../tests/src/server/validators.test.ts) —
+  `isAddressInfo` narrowing over every shape `node:net`'s `server.address()`
+  returns.
 - [`tests/src/server/Negotiator.test.ts`](../tests/src/server/Negotiator.test.ts) —
   `negotiate`/`encoding`/`language`/`format`: exact vs subtype-wildcard vs
   any-range precedence, `;q=0` rejection semantics, q-tie server-order
-  break, `format`'s 406 fallback and handler dispatch, and the proof that
+  break, `format`'s 406 fallback and handler dispatch, the empty-header
+  divergence between `encoding` and `negotiate`, and the proof that
   `encoding` and `negotiateEncoding` agree because they run one selection leaf.
 - [`tests/src/server/Stream.test.ts`](../tests/src/server/Stream.test.ts) —
   the opened SSE response and its header merge order, the serialized wire for

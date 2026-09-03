@@ -10,8 +10,8 @@ import { SSE_HEADERS } from './constants.js'
  * Builds the `Response` at construction from
  * {@link import('./constants.js').SSE_HEADERS} with any `options.headers`
  * merged OVER them, at `options.status` (default `200`). A caller repeating one
- * of those keys therefore replaces the seam's value, and repeating it under a
- * different casing appends to it. The instance owns the stream's
+ * of those keys therefore replaces the seam's value, in any casing. The
+ * instance owns the stream's
  * controller, its text encoder, the closed flag, and the parked producer's
  * wakeup, so the whole handle is one entity rather than a closure over four
  * bindings.
@@ -63,7 +63,12 @@ export class Stream implements StreamInterface {
 			pull: this.#pull.bind(this),
 			cancel: this.#cancel.bind(this),
 		})
-		const headers = new Headers({ ...SSE_HEADERS, ...options?.headers })
+		// `Headers.set` matches a field name case-insensitively and replaces every
+		// existing value, so any spelling of a seam-owned key wins. An object
+		// spread would resolve the collision case-sensitively and leave `Headers`
+		// to append the re-cased spelling into one comma-joined value.
+		const headers = new Headers(SSE_HEADERS)
+		for (const [name, value] of Object.entries(options?.headers ?? {})) headers.set(name, value)
 		this.#response = new Response(body, { status: options?.status ?? 200, headers })
 	}
 

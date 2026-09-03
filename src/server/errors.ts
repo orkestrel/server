@@ -17,11 +17,14 @@
 // `message`) — so a foreign-copy instance the guard accepts can never crash
 // the boundary that trusts it.
 //
-// `ServerError` is the other half of the vocabulary and never reaches that
-// boundary: it reports a lifecycle call the CALLER programmed wrong, so it
-// keys on a `ServerErrorCode` rather than a `status`, and `isServerError`
-// narrows it with a plain `instanceof`. No error boundary consumes it across
-// package copies, so it carries no cross-copy brand.
+// `ServerError` is the other half of the vocabulary: it reports a call the
+// CALLER programmed wrong, so it keys on a `ServerErrorCode` rather than a
+// `status`, and `isServerError` narrows it with a plain `instanceof`. A
+// `'STATUS'` lifecycle refusal is raised to the caller that invoked the
+// lifecycle method; a `'NEXT'` double-`next` refusal escapes its middleware
+// into the request boundary, which finds no `status` on it and renders a
+// generic 500. No error boundary consumes it across package copies, so it
+// carries no cross-copy brand.
 
 import type { ServerErrorCode } from './types.js'
 import { isNumber, isString } from '@orkestrel/contract'
@@ -39,7 +42,8 @@ import { HTTP_ERROR_BRAND } from './constants.js'
  * deliberate signal), unlike a generic throw whose message is hidden unless
  * `expose` is set. Subclass it (as {@link ContentTooLargeError} does) for
  * specific statuses, or throw it directly. Narrow a caught value with
- * {@link isHTTPError}.
+ * {@link isHTTPError}. The machine-readable discriminator is `status`; there is
+ * no separate `code`.
  *
  * @example
  * ```ts
@@ -133,16 +137,18 @@ export function isHTTPError(value: unknown): value is HTTPError {
 }
 
 /**
- * Represents the error the `Server` raises when a lifecycle call cannot run from the
- * status the entity is in.
+ * Represents the error this package raises when a caller programmed a call the
+ * entity refuses.
  *
  * @remarks
  * Carries a machine-readable {@link ServerErrorCode} and an optional `context`
- * record naming the offending facts. This is a PROGRAMMER error — the caller
- * asked for a transition the status machine forbids — so it never reaches the
- * request error boundary and never carries an HTTP `status`; throw an
- * {@link HTTPError} for a client-facing fault instead. Narrow a caught value
- * with {@link isServerError}.
+ * record naming the offending facts. This is a PROGRAMMER error, so it carries
+ * no HTTP `status`: a `'STATUS'` lifecycle refusal is raised to the caller that
+ * invoked the lifecycle method, and a `'NEXT'` double-`next` refusal escapes its
+ * middleware into the request boundary, which reaches it as a generic 500 with
+ * the message hidden unless `expose` is set. Throw an {@link HTTPError} for a
+ * client-facing fault instead. Narrow a caught value with
+ * {@link isServerError}.
  *
  * @example
  * ```ts

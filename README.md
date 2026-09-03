@@ -16,8 +16,8 @@ npm install @orkestrel/server
 
 ## Requirements
 
-- Node.js >= 24
-- ESM-only (no CommonJS build)
+- Node.js >= 22.12.0, matching the `engines` field in `package.json`
+- ESM and CommonJS builds
 
 ## Usage
 

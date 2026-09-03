@@ -1,8 +1,8 @@
 import type { Encoding } from './types.js'
 
 // The substrate's tunable defaults — only the constants with a real consumer
-// inside THIS package (`AGENTS.md` § Design laws: a capability arrives with
-// its first real consumer, never speculatively). Each is frozen or declared
+// inside THIS package: a capability arrives with its first real consumer,
+// never speculatively. Each is frozen or declared
 // readonly, so a consumer reads but never mutates the shared default. The
 // defaults only `@orkestrel/middleware` needs (rate limiting, CSRF, sessions,
 // static serving, multipart) stay OUT of this file; they belong to that
@@ -60,7 +60,7 @@ export const DEFAULT_DECOMPRESSED_LIMIT = 16_777_216
  * events flush promptly rather than batching. Frozen so a consumer can read
  * but never mutate the shared default; a `Stream` merges any
  * {@link import('./types.js').StreamOptions.headers} OVER these, so a caller
- * repeating one of these exact keys replaces its value.
+ * repeating one of these keys replaces its value.
  */
 export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 	'Content-Type': 'text/event-stream; charset=utf-8',

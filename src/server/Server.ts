@@ -23,7 +23,8 @@ import { createTimeout } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
 import { isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
-import { compose, isAddressInfo, readBody } from './helpers.js'
+import { compose, readBody } from './helpers.js'
+import { isAddressInfo } from './validators.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
 import { HTTPError, isHTTPError, ServerError } from './errors.js'
 
@@ -80,7 +81,7 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   routes it to the `error` OPTION (not the domain `error` event).
  */
 export class Server<TState> implements ServerInterface<TState> {
-	readonly id = crypto.randomUUID()
+	readonly #id: string
 	readonly #dispatcher: DispatcherInterface<TState>
 	readonly #state: ConnectionStateFunction<TState>
 	readonly #middleware: Array<MiddlewareHandler<TState>>
@@ -138,6 +139,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			if (value !== undefined && (!isInteger(value) || value < 0))
 				throw new TypeError(`ServerOptions.sockets.${name} must be a non-negative integer`)
 		}
+		this.#id = crypto.randomUUID()
 		this.#dispatcher = options.dispatcher
 		this.#state = options.state
 		this.#middleware = options.middleware === undefined ? [] : [...options.middleware]
@@ -153,6 +155,10 @@ export class Server<TState> implements ServerInterface<TState> {
 			...(options.on === undefined ? {} : { on: options.on }),
 			...(options.error === undefined ? {} : { error: options.error }),
 		})
+	}
+
+	get id(): string {
+		return this.#id
 	}
 
 	get status(): ServerStatus {
@@ -369,15 +375,6 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#emitter.emit('upgrade', request, handled)
 	}
 
-	// Resolve the bound port from the server's address, narrowed via a guard
-	// (an `AddressInfo` carries a numeric `port`; a string / null address has
-	// none). No assertion — an unresolvable address yields `0`.
-	#resolvePort(server: NodeHTTPServer): number {
-		const address = server.address()
-		if (isAddressInfo(address)) return address.port
-		return 0
-	}
-
 	async #listen(server: NodeHTTPServer, signal?: AbortSignal): Promise<number> {
 		const deadline =
 			this.#timeouts.start === undefined ? undefined : createTimeout({ ms: this.#timeouts.start })
@@ -388,6 +385,10 @@ export class Server<TState> implements ServerInterface<TState> {
 				? undefined
 				: addAbortListener(startup, () => binding.abort(startup.reason))
 		let listening: Promise<unknown[]> | undefined
+		// The bound port, read inside the `try` so an address carrying none takes
+		// the same cleanup path a failed bind takes. `0` is this package's request
+		// for an ephemeral port, so it can never stand in for an unknown one.
+		let port: number
 		try {
 			signal?.throwIfAborted()
 			deadline?.start()
@@ -403,6 +404,12 @@ export class Server<TState> implements ServerInterface<TState> {
 				})
 			}
 			await listening
+			const address = server.address()
+			// This branch is unreachable through `listen(port)` and exists for the other members of `address()`'s union.
+			if (!isAddressInfo(address)) {
+				throw new TypeError('server bound a listener with no resolvable AddressInfo')
+			}
+			port = address.port
 		} catch (error) {
 			const expired = deadline?.expired === true
 			const cancelled = startup?.aborted === true
@@ -428,7 +435,6 @@ export class Server<TState> implements ServerInterface<TState> {
 			relay?.[Symbol.dispose]()
 			deadline?.clear()
 		}
-		const port = this.#resolvePort(server)
 		this.#port = port
 		this.#status = 'listening'
 		this.#emitter.emit('start', port)

@@ -1,3 +1,4 @@
+import type { MiddlewareContext } from '@src/server'
 import { afterEach, vi } from 'vitest'
 
 // ── Environment-agnostic base setup ───────────────────────────────────────────
@@ -13,3 +14,30 @@ import { afterEach, vi } from 'vitest'
 afterEach(() => {
 	vi.restoreAllMocks()
 })
+
+/**
+ * Builds the per-request {@link MiddlewareContext} a middleware, negotiator, or
+ * guide-fence proof drives — a fixed `GET http://localhost/` request with an
+ * empty body and the caller's own state bag.
+ *
+ * @typeParam TState - The consumer's opaque per-request state type
+ * @param state - The state bag the returned context carries, passed through by
+ *   identity
+ * @returns A context over `http://localhost/` whose `method` is `'GET'` and
+ *   whose `body()` resolves `undefined`
+ *
+ * @example
+ * ```ts
+ * import { buildContext } from '../../setup.js'
+ *
+ * buildContext({ userId: 'me' }).state.userId // 'me'
+ * ```
+ */
+export function buildContext<TState>(state: TState): MiddlewareContext<TState> {
+	return {
+		url: new URL('http://localhost/'),
+		method: 'GET',
+		state,
+		body: async () => undefined,
+	}
+}
