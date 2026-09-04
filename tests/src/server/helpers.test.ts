@@ -157,7 +157,7 @@ describe('compose', () => {
 		expect(terminalRan).toBe(false)
 	})
 
-	it('substitutes the downstream request via next(newRequest)', async () => {
+	it('substitutes the downstream request by using next(newRequest)', async () => {
 		let seenUrl = ''
 		const substitute: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) =>
 			next(new Request('http://localhost/substituted'))

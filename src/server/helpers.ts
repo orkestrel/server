@@ -246,7 +246,7 @@ export function isCookieAttribute(value: string): boolean {
  * with {@link isCookieAttribute} and THROW an {@link HTTPError} on an
  * injection attempt (a programmer misconfiguration — never a silent drop). A `sameSite: 'None'` cookie is ALWAYS `Secure` regardless of
  * the `secure` option (the spec requires it); an un-resolved `undefined`
- * `secure` here falls to OFF — request-aware callers resolve it first via
+ * `secure` here falls to OFF — request-aware callers resolve it first through
  * {@link resolveSecure}.
  *
  * @param name - The cookie name
@@ -397,7 +397,7 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 // payload a base64url JSON `{ value, exp? }`, the signature an HMAC-SHA256 of
 // the payload under the secret. Signing always uses the FIRST secret (a
 // rotation list's current head); verifying accepts ANY secret in the list,
-// via `crypto.subtle.verify` — constant-time internally, so the old
+// through `crypto.subtle.verify` — constant-time internally, so the old
 // `safeCompare` is RETIRED, never ported. `verifyToken` is TOTAL (never
 // throws — adversarial input returns `undefined`); only
 // `signToken` throws, and only on a misconfigured (empty) secret.
@@ -409,7 +409,7 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
  * The payload is a base64url-encoded JSON `{ value, exp }` (`exp` is the
  * absolute expiry instant `Date.now() + ttl` when `options.ttl` is set, so
  * the expiry is HMAC-COVERED — a client cannot extend it without invalidating
- * the signature), signed via `crypto.subtle.sign('HMAC', …)` under the FIRST
+ * the signature), signed by using `crypto.subtle.sign('HMAC', …)` under the FIRST
  * {@link TokenSecret} (the current secret, or the head of a rotation list).
  * Blank/whitespace-only secrets are IGNORED ({@link normalizeSecret}); a
  * misconfigured secret with no usable entry THROWS an {@link HTTPError}
@@ -452,7 +452,7 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
  * value containing dots survives), decodes the signature with
  * `@orkestrel/codec`'s `decodeBase64URL` — a signature that is not canonical
  * base64url is refused there, before any key import — and checks the payload's
- * HMAC-SHA256 signature against EACH {@link TokenSecret} candidate via
+ * HMAC-SHA256 signature against EACH {@link TokenSecret} candidate through
  * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
  * retired), accepting the token on the first match (the
  * rotation path). It then decodes + narrows the payload (`isRecord` +
@@ -827,7 +827,7 @@ export function isCompressibleType(type: string): boolean {
 // parser.
 
 /**
- * Computes a CONTENT `ETag` over a fully-buffered response body via WebCrypto.
+ * Computes a CONTENT `ETag` over a fully-buffered response body by using WebCrypto.
  *
  * @remarks
  * Hashes `body` with SHA-256 (`crypto.subtle.digest`) and wraps the hex
@@ -879,7 +879,7 @@ export function unwrapETag(tag: string): string {
  * listed tag matches), or the `*` wildcard (matches ANY current
  * representation — only a list of exactly `*` is the wildcard). Comparison is
  * WEAK: `W/"abc"` and `"abc"` are equal (both sides' weak prefix is stripped
- * via {@link unwrapETag} before comparing the opaque body). TOTAL — a
+ * through {@link unwrapETag} before comparing the opaque body). TOTAL — a
  * malformed/empty header matches nothing, never throws.
  *
  * @param header - The raw `If-None-Match` header value
@@ -1328,7 +1328,7 @@ export function parseEncoding(header: string | null): Exclude<Encoding, 'identit
 
 /**
  * Decompresses an already-collected, `gzip`/`deflate`-encoded byte sequence
- * transparently via `DecompressionStream`, capping the DECOMPRESSED output —
+ * transparently through `DecompressionStream`, capping the DECOMPRESSED output —
  * the zip-bomb defense.
  *
  * @remarks
@@ -1405,7 +1405,7 @@ export async function decompressRequestBody(
  * through the zip-bomb-capped pipe ({@link decompressRequestBody}, capped at
  * `options.decompression`, default {@link
  * import('./constants.js').DEFAULT_DECOMPRESSED_LIMIT}), then decodes by
- * content type: `application/json` is parsed via `@orkestrel/contract`'s
+ * content type: `application/json` is parsed by using `@orkestrel/contract`'s
  * `parseJSON` and scrubbed of prototype-pollution keys ({@link
  * scrubPrototype}); any other type decodes as UTF-8 text; an empty body
  * decodes to `undefined`.

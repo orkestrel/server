@@ -12,7 +12,7 @@
 // even though they are structurally identical. `isHTTPError` therefore tries
 // `instanceof` first (the common, cheap case) and falls back to a total
 // structural check keyed by a `Symbol.for`-interned brand (`HTTP_ERROR_BRAND`,
-// shared across every copy via the global symbol registry) plus the exact
+// shared across every copy through the global symbol registry) plus the exact
 // fields the server's boundary reads off a recognized error (`status`,
 // `message`) — so a foreign-copy instance the guard accepts can never crash
 // the boundary that trusts it.
@@ -112,7 +112,7 @@ export class ContentTooLargeError extends HTTPError {
  * an instance built by a DIFFERENT copy of this package (the dual-package
  * hazard — version skew, a linked workspace duplicate) whose `HTTPError`
  * constructor is a distinct object from this copy's: the value must carry
- * the cross-copy brand (interned via `Symbol.for`, so every copy resolves the
+ * the cross-copy brand (interned by using `Symbol.for`, so every copy resolves the
  * same key) AND expose the exact fields the server's error boundary reads off
  * a recognized `HTTPError` — a numeric `status` and a string `message`. A
  * plain object that merely carries a `status` WITHOUT the brand is rejected.

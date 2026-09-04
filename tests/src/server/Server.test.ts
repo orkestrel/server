@@ -1343,7 +1343,7 @@ describe('Server — capstone', () => {
 		expect(await response.text()).toBe('user not found')
 	})
 
-	it('an SSE route via createStream is consumed incrementally by fetch', async () => {
+	it('an SSE route through createStream is consumed incrementally by fetch', async () => {
 		const dispatcher = createDispatcher<AppState>()
 		dispatcher.add({
 			method: 'GET',

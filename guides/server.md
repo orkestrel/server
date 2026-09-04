@@ -3,9 +3,9 @@
 > This package's ONE guide, covering its single published surface: the middleware seam (`compose`,
 > `MiddlewareContext`/`NextFunction`/`MiddlewareHandler`), the `HTTPError`
 > vocabulary, the shared substrate (cookies, WebCrypto tokens, content
-> negotiation via `Negotiator`, ETag/Range, security primitives, SSE, and the
+> negotiation through `Negotiator`, ETag/Range, security primitives, SSE, and the
 > body pipeline), and the deliberately node-bound `Server` lifecycle entity
-> binding `node:http` via `@orkestrel/router`'s adapter helpers, the upgrade
+> binding `node:http` through `@orkestrel/router`'s adapter helpers, the upgrade
 > seam, connection-fact injection, and `discoverPort`. The server
 > **consumes** `@orkestrel/router` — routing, matching, and dispatch are that
 > package's, never re-implemented here — mechanism, not product policy. Source:
@@ -346,7 +346,7 @@ These invariants hold across `src/server` ↔ `server.md`.
    `verifyToken` is TOTAL (malformed / tampered / expired / empty-rotation all
    yield `undefined`, never throw); the expiry is HMAC-COVERED inside the
    signed payload; a `TokenSecret` rotation list signs with the FIRST secret
-   and verifies against ANY; comparison is constant-time via
+   and verifies against ANY; comparison is constant-time through
    `crypto.subtle.verify` (the old `safeCompare` is retired, not ported).
 10. **Seam semantics: returning onion.** Each `MiddlewareHandler` receives a
     `next` that, called, runs the downstream chain and resolves its `Response`;
@@ -368,7 +368,7 @@ These invariants hold across `src/server` ↔ `server.md`.
     client key explicitly in `state` or in middleware.
 13. **The stop signal is observable inside a handler.** The `Request`'s
     `signal` (already tied to client disconnect by the router's
-    `buildRequest`) is LINKED, via `@orkestrel/abort`'s `linkSignal`, to the
+    `buildRequest`) is LINKED, through `@orkestrel/abort`'s `linkSignal`, to the
     server's per-run stop signal — so a handler awaiting `request.signal`
     observes EITHER the client disconnecting OR the server calling `stop()`,
     closing the old design's latent gap.

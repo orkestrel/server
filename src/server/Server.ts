@@ -50,15 +50,15 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   busy-loop), then closes → `stopped`, forcing whatever the deadline caught
  *   still open. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
- *   `close`); a `Request` is built via the router's `buildRequest`, its
- *   `signal` LINKED to this run's stop signal via `@orkestrel/abort`'s
+ *   `close`); a `Request` is built through the router's `buildRequest`, its
+ *   `signal` LINKED to this run's stop signal through `@orkestrel/abort`'s
  *   `linkSignal` (a fresh `Request` is constructed with the linked signal —
  *   `buildRequest`'s own abort, armed by BOTH request-side and response-side
- *   teardown, composes with the server's stop signal via `AbortSignal.any`,
- *   so a handler awaiting `request.signal` observes BOTH); `context.state` is built via
+ *   teardown, composes with the server's stop signal through `AbortSignal.any`,
+ *   so a handler awaiting `request.signal` observes BOTH); `context.state` is built through
  *   {@link ServerOptions.state} from the connection facts; the composed
  *   middleware onion runs, terminating in `dispatcher.handle`; the result is
- *   written back via `sendResponse`.
+ *   written back through `sendResponse`.
  * - **The built-in boundary** wraps the WHOLE per-request chain, including
  *   setup: `buildRequest` runs behind its own inner boundary that maps a
  *   throw (e.g. a malformed `Host` header) to a silent `400` with no

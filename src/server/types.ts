@@ -75,7 +75,7 @@ export type NextFunction = (request?: Request) => Promise<Response>
  * @remarks
  * Transform the request (call `next(newRequest)`), transform the response
  * (`await next()` then modify the result), short-circuit (return a `Response`
- * without calling `next`), or thread data via `context.state` — no mutable
+ * without calling `next`), or thread data through `context.state` — no mutable
  * framework object anywhere, only fetch-standard `Request`/`Response`.
  *
  * @example
@@ -150,7 +150,7 @@ export interface TokenOptions {
  * @param httpOnly - The `HttpOnly` directive; defaults to `true`.
  * @param secure - The `Secure` directive: `true` forces it, `false`
  *   suppresses it, and omitted/`undefined` (the default) derives it from the
- *   connection via {@link import('./helpers.js').resolveSecure} — `Secure` on
+ *   connection through {@link import('./helpers.js').resolveSecure} — `Secure` on
  *   a TLS connection, off over plaintext HTTP ({@link
  *   Connection.encrypted}). A `sameSite: 'None'` cookie is ALWAYS
  *   `Secure` regardless (the spec requires it).
@@ -571,7 +571,7 @@ export type ServerEventMap = {
 }
 
 /**
- * Represents a raw `node:http` protocol-upgrade claimant — registered via
+ * Represents a raw `node:http` protocol-upgrade claimant — registered through
  * {@link ServerInterface.upgrade}.
  *
  * @remarks
@@ -621,7 +621,7 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   is never implicitly trusted here; a deployment behind a trusted proxy
  *   derives its own client key in this function or in middleware.
  * @param middleware - Initial middleware, run in array order (outer-first);
- *   more may be added later via `use`.
+ *   more may be added later by using `use`.
  * @param host - The network interface `start()` binds to (`node:http`
  *   `server.listen`'s host). Omitted ⇒ node's default (all interfaces).
  * @param port - The TCP port `start()` binds to. Omitted or `0` ⇒ an
@@ -709,10 +709,10 @@ export interface ServerOptions<TState> {
  * connections, fires the stop signal so in-flight handlers can observe it,
  * drains in-flight requests and claimed upgraded sockets up to the configured
  * deadline, then closes — forcing whatever is left. `destroy()` is the final
- * idempotent teardown. Per request: a `Request` is built via the router's
+ * idempotent teardown. Per request: a `Request` is built through the router's
  * `buildRequest` (its signal linked to the server's stop signal), the composed
  * middleware onion runs terminating in `dispatcher.handle`, and the result is
- * written back via `sendResponse` — every escaping throw is caught by the
+ * written back through `sendResponse` — every escaping throw is caught by the
  * built-in boundary (`HTTPError` → its status; anything else → a
  * hidden-unless-`expose` `500`) so a handler error can never crash the process.
  */

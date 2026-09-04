@@ -44,7 +44,7 @@ export const DEFAULT_BODY_LIMIT = 1_048_576
  * output would exceed this, BEFORE the full bomb is materialized, so the
  * inflation can never exhaust memory. Defaults to `16 MiB` — a generous
  * ceiling for a legitimate compressed JSON / form body, far below an OOM. A
- * consumer raises it via {@link import('./types.js').BodyOptions}
+ * consumer raises it through {@link import('./types.js').BodyOptions}
  * `decompression` for a workload that genuinely ships larger decompressed
  * bodies.
  */
