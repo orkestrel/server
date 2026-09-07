@@ -19,7 +19,7 @@
 
 /**
  * Represents the composition context — plain data, one per request, shared by every
- * middleware AND (as `state`) by the route handlers behind the dispatcher.
+ * middleware and, as `state`, by the route handlers behind the dispatcher.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  *
@@ -28,7 +28,7 @@
  *   a middleware never re-parses it).
  * - `method` — the raw request verb; the dispatcher (not this seam) narrows it
  *   to a known {@link import('@orkestrel/router').Method}.
- * - `state` — THE shared bag threaded from the adapter's `state` factory,
+ * - `state` — the shared bag threaded from the adapter's `state` factory,
  *   through every middleware, into `dispatcher.handle`'s `state` — the same
  *   object a route handler reads as `context.state`.
  * - `body()` — lazily collect the request body (byte-limited, transparently
@@ -53,12 +53,12 @@ export interface MiddlewareContext<TState> {
 
 /**
  * Represents the downstream continuation a {@link MiddlewareHandler} invokes to run the
- * rest of the onion.
+ * rest of the onion — guarded so a second call within one invocation rejects.
  *
  * @remarks
  * Call it (optionally with a substituted `Request`) to run the downstream
  * chain and receive its `Response`; omit the call entirely to short-circuit
- * with a `Response` built by this middleware instead. A SECOND call rejects
+ * with a `Response` built by this middleware instead. A second call rejects
  * (the double-`next` guard) — each middleware runs the chain at most once.
  *
  * @param request - An optional replacement `Request` to hand downstream
@@ -94,7 +94,7 @@ export type MiddlewareHandler<TState> = (
 ) => Response | Promise<Response>
 
 /**
- * Represents the per-request connection facts the server face injects — the ONLY data
+ * Represents the per-request connection facts the server face injects — the only data
  * that genuinely exists solely on the socket, surfaced so middleware and a
  * consumer's `state` factory stay core-pure.
  *
@@ -111,14 +111,14 @@ export interface Connection {
 }
 
 /**
- * Represents a secret (or rotation list) for signing + verifying a stateless, HMAC-signed
- * token.
+ * Represents a secret, or a `[current, ...older]` rotation list, for signing and
+ * verifying a stateless, HMAC-signed token.
  *
  * @remarks
  * A single `string` is the lone secret. A `readonly string[]` is a rotation
  * list in `[current, ...older]` order: `signToken` always signs with the
- * FIRST (current) secret, while `verifyToken` accepts a token signed by ANY
- * secret in the list — so a key rotates by prepending the new one and keeping
+ * first (current) secret, while `verifyToken` accepts a token signed by any
+ * secret in the list — so a key rotates by prepending the fresh one and keeping
  * the old until every outstanding token has expired, with zero downtime.
  */
 export type TokenSecret = string | readonly string[]
@@ -384,7 +384,9 @@ export interface StreamInterface {
 	/** Reports whether the underlying stream is done (ended, or the consumer disconnected). */
 	readonly closed: boolean
 	/**
-	 * Serializes + enqueues one {@link SSEMessage} to the wire.
+	 * Serializes and enqueues one {@link SSEMessage} to the wire, reporting whether the
+	 * process-local queue still has capacity afterward — `false` also once the stream
+	 * is closed.
 	 *
 	 * @param message - The event to send (its `data` split on `\n` into `data:` lines)
 	 * @returns True if the process-local stream queue has capacity after
@@ -394,13 +396,16 @@ export interface StreamInterface {
 	 */
 	write(message: SSEMessage): boolean
 	/**
-	 * Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores.
+	 * Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores,
+	 * and a no-op once the stream is closed.
 	 *
 	 * @param text - The comment text (sent after the `: ` prefix)
 	 */
 	comment(text: string): void
 	/**
-	 * Parks until the process-local stream queue has capacity again.
+	 * Parks until the process-local stream queue has capacity again — resolving on the
+	 * consumer pull that restores it, or immediately when capacity is already available
+	 * or the stream is closed, and never polling.
 	 *
 	 * @returns A promise that resolves when a consumer pull restores positive
 	 *   desired size, or immediately when capacity is already available or the
@@ -408,7 +413,10 @@ export interface StreamInterface {
 	 *   not prove that a remote peer consumed the queued bytes.
 	 */
 	drain(): Promise<void>
-	/** Ends the stream, completing the response (a no-op once already `closed`). */
+	/**
+	 * Ends the stream, completing the response — a no-op once already `closed`, and it
+	 * settles any parked producer.
+	 */
 	end(): void
 }
 
@@ -484,7 +492,9 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
 
 /**
  * Represents the machine-readable category a
- * {@link import('./errors.js').ServerError} carries.
+ * {@link import('./errors.js').ServerError} carries — `'STATUS'` for a lifecycle
+ * call the current status forbids, `'NEXT'` for a middleware that called its `next`
+ * a second time.
  *
  * @remarks
  * A `ServerError` reports a call the caller programmed and the substrate
@@ -612,7 +622,9 @@ export type UpgradeHandler = (request: IncomingMessage, socket: Duplex, head: Bu
 export type ConnectionStateFunction<TState> = (connection: Connection) => TState
 
 /**
- * Options for `createServer`.
+ * Options for `createServer` — the dispatcher and per-request state factory the
+ * server requires, plus its listener, drain, boundary, timeout, socket-cap, and
+ * emitter knobs.
  *
  * @param dispatcher - The `@orkestrel/router` {@link DispatcherInterface} the
  *   composed middleware onion terminates into — bring-your-own router (the
@@ -626,12 +638,12 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  * @param host - The network interface `start()` binds to (`node:http`
  *   `server.listen`'s host). Omitted ⇒ node's default (all interfaces).
  * @param port - The TCP port `start()` binds to. Omitted or `0` ⇒ an
- *   EPHEMERAL, OS-assigned free port (the default); `start()` always resolves
+ *   ephemeral, OS-assigned free port (the default); `start()` always resolves
  *   the actually-bound port. A port already in use rejects `start()` with
  *   `EADDRINUSE` — no silent ephemeral fallback (use `discoverPort` to pick a
  *   guaranteed-free port up front).
  * @param drain - The graceful-stop deadline in milliseconds: on `stop()` the
- *   server stops accepting new connections and gives in-flight requests AND
+ *   server stops accepting new connections and gives in-flight requests and
  *   claimed upgraded sockets this long to finish before forcing every
  *   remaining socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be a
  *   non-negative finite number. A long-lived upgraded socket that nothing
@@ -734,7 +746,8 @@ export interface ServerInterface<TState> {
 	/** Holds the lifecycle emitter over {@link ServerEventMap}. */
 	readonly emitter: EmitterInterface<ServerEventMap>
 	/**
-	 * Appends one middleware, or an array of them in order, to the onion.
+	 * Appends one middleware, or an array of them in order, to the onion, outer-to-inner
+	 * in call order.
 	 *
 	 * @param middleware - One handler, or the ordered array of handlers to append
 	 *
@@ -745,13 +758,15 @@ export interface ServerInterface<TState> {
 	use(middleware: MiddlewareHandler<TState>): void
 	use(middleware: ReadonlyArray<MiddlewareHandler<TState>>): void
 	/**
-	 * Registers a protocol-upgrade claimant that runs in registration order.
+	 * Registers an {@link UpgradeHandler} claimant that runs in registration order; a
+	 * claimed socket is tracked until it closes.
 	 *
 	 * @param handler - The claimant; the first to return `true` claims the socket
 	 */
 	upgrade(handler: UpgradeHandler): void
 	/**
-	 * Binds the configured listener and resolves its actually-bound port.
+	 * Binds the configured `host` and `port`, or an ephemeral port, under an optional
+	 * caller `AbortSignal`, and resolves the actually-bound port.
 	 *
 	 * @param signal - Optional caller cancellation observed only while startup
 	 *   is pending; aborting after this method resolves does not stop the server.
@@ -768,10 +783,11 @@ export interface ServerInterface<TState> {
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**
-	 * Stops gracefully: refuses new connections, fires the stop signal, drains, closes.
+	 * Stops gracefully: refuses new connections, fires the stop signal, drains in-flight
+	 * requests and claimed upgraded sockets up to the `drain` deadline, then closes.
 	 *
 	 * @remarks
-	 * Drainable work is every in-flight request PLUS every upgraded socket a
+	 * Drainable work is every in-flight request plus every upgraded socket a
 	 * handler claimed. The drain parks on that work reaching zero or the
 	 * `drain` deadline expiring, emits `drain` with both remaining counts, and
 	 * then closes — dropping idle keep-alive sockets on a clean drain, and
@@ -783,7 +799,8 @@ export interface ServerInterface<TState> {
 	 */
 	stop(): Promise<void>
 	/**
-	 * Tears down for good: force-closes the listener and every socket, then the emitter.
+	 * Tears down for good: force-closes the listener and every socket, then the emitter —
+	 * terminal and idempotent from any state.
 	 *
 	 * @returns Resolves once nothing is left open; idempotent from any state
 	 */

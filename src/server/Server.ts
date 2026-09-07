@@ -31,35 +31,35 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
 /**
  * Represents the HTTP server facade — an observable `node:http` lifecycle composing this
  * module's own middleware onion around a consumed `@orkestrel/router`
- * dispatcher.
+ * dispatcher. Implements exactly {@link ServerInterface}.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  *
  * @remarks
  * - **Lifecycle.** `start(signal?)` builds the underlying `node:http`
  *   server, binds the configured {@link ServerOptions.host} / {@link
- *   ServerOptions.port} (omitted/`0` port ⇒ EPHEMERAL, resolved from the
+ *   ServerOptions.port} (omitted/`0` port ⇒ ephemeral, resolved from the
  *   bound address), exposes that {@link AddressInfo} through `address`, observes
  *   caller cancellation plus the configured `timeouts.start` deadline while the
  *   bind is pending, and transitions `idle → starting → listening`. A
  *   cancelled or expired bind closes its partial server and resets to `idle` for
  *   another start. `stop()` transitions
  *   to `stopping`: refuses new connections, fires a fresh-per-run stop signal
- *   so in-flight handlers observe cancellation, drains in-flight requests AND
+ *   so in-flight handlers observe cancellation, drains in-flight requests and
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
  *   busy-loop), then closes → `stopped`, forcing whatever the deadline caught
  *   still open. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
- *   `signal` LINKED to this run's stop signal through `@orkestrel/abort`'s
+ *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
  *   `linkSignal` (a fresh `Request` is constructed with the linked signal —
- *   `buildRequest`'s own abort, armed by BOTH request-side and response-side
+ *   `buildRequest`'s own abort, armed by request-side and response-side
  *   teardown, composes with the server's stop signal through `AbortSignal.any`,
- *   so a handler awaiting `request.signal` observes BOTH); `context.state` is built through
+ *   so a handler awaiting `request.signal` observes either); `context.state` is built through
  *   {@link ServerOptions.state} from the connection facts; the composed
  *   middleware onion runs, terminating in `dispatcher.handle`; the result is
  *   written back through `sendResponse`.
- * - **The built-in boundary** wraps the WHOLE per-request chain, including
+ * - **The built-in boundary** wraps the whole per-request chain, including
  *   setup: `buildRequest` runs behind its own inner boundary that maps a
  *   throw (for example, a malformed `Host` header) to a silent `400` with no
  *   `error` emit; everything after (`Request` reconstruction, connection
@@ -73,12 +73,12 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  * - **Upgrade fan-out** — verbatim old semantics (first-claimer-wins, a
  *   throwing handler is treated as declined and surfaced on `error`, an
  *   unclaimed upgrade destroys the socket), bound per-run to this instance.
- *   A CLAIMED socket joins `#upgraded` until it closes: the claimant still
+ *   A claimed socket joins `#upgraded` until it closes: the claimant still
  *   owns it, and the tracking exists because node detaches an upgraded socket
  *   from the set its own close calls walk, so nothing else can end it.
  * - **Observable.** Owns an {@link Emitter} over {@link ServerEventMap}
  *   exposed as `readonly emitter`; the emitter isolates a listener throw and
- *   routes it to the `error` OPTION (not the domain `error` event).
+ *   routes it to the `error` option rather than to the domain `error` event.
  */
 export class Server<TState> implements ServerInterface<TState> {
 	readonly #id: string

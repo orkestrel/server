@@ -35,18 +35,18 @@ import { isAddressInfo } from './validators.js'
 // once.
 
 /**
- * Composes an ordered chain of {@link MiddlewareHandler}s around a `terminal`
+ * Composes an ordered chain of {@link MiddlewareHandler} layers around a `terminal`
  * handler into one request handler — the frozen middleware seam.
  *
  * @remarks
- * `middleware[0]` runs OUTERMOST: it is invoked first, and its call to `next`
- * runs `middleware[1]`, and so on until the LAST middleware's `next` invokes
+ * `middleware[0]` runs outermost: it is invoked first, and its call to `next`
+ * runs `middleware[1]`, and so on until the last middleware's `next` invokes
  * `terminal`. Each middleware's `next` may be called with a substituted
  * `Request` (the downstream chain then sees that request instead of the
  * original), called with no argument (the original request continues
- * downstream), or NOT called at all (a short-circuit — the middleware's own
+ * downstream), or not called at all (a short-circuit — the middleware's own
  * returned `Response` is sent, and everything downstream never runs). A
- * SECOND call to the same `next` within one middleware invocation REJECTS —
+ * second call to the same `next` within one middleware invocation rejects —
  * each link runs the chain at most once, so a middleware cannot fork the
  * request into two divergent downstream runs.
  *
@@ -76,7 +76,8 @@ export function compose<TState>(
 }
 
 /**
- * Wraps one middleware layer around its downstream handler.
+ * Wraps one middleware layer around its downstream handler, enforcing the one-call
+ * `next` invariant.
  *
  * @remarks
  * The returned handler enforces the one-call `next` invariant while preserving
@@ -163,8 +164,8 @@ export function parseCookies(header: string | undefined): Record<string, string>
 }
 
 /**
- * Checks whether a string is a valid RFC 6265 cookie NAME — a non-empty run of
- * cookie-token chars with NO surrounding (or interior) whitespace.
+ * Checks whether a string is a valid RFC 6265 cookie name — a non-empty run of
+ * cookie-token characters with no surrounding or interior whitespace.
  *
  * @remarks
  * A cookie name is an RFC 7230 `token`: `^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$` —
@@ -207,9 +208,9 @@ export function decodeCookieValue(raw: string): string {
 }
 
 /**
- * Checks whether a string is safe to interpolate as a `Set-Cookie` attribute VALUE
- * (a `Domain` / `Path`) — the guard {@link serializeCookie} screens those two
- * attributes with before emitting them.
+ * Checks whether a string is safe to interpolate as a `Set-Cookie` attribute value —
+ * the guard {@link serializeCookie} applies to a `Domain` and a `Path` before it
+ * emits them.
  *
  * @remarks
  * Rejects a value carrying a `;` (splits attributes), a `,` (can split a
@@ -309,7 +310,7 @@ export function resolveSecure(secure: boolean | undefined, encrypted: boolean): 
 }
 
 /**
- * Writes a SIGNED cookie — HMAC-signs `value` with {@link signToken} and
+ * Writes a signed cookie — HMAC-signs `value` with {@link signToken} and
  * appends it as a `Set-Cookie` (the inverse of {@link readSignedCookie}).
  *
  * @remarks
@@ -342,13 +343,13 @@ export async function writeSignedCookie(
 }
 
 /**
- * Reads + verifies a SIGNED cookie off a request — TOTAL, returning the
+ * Reads and verifies a signed cookie off a request — total, returning the
  * embedded value or `undefined` (the inverse of {@link writeSignedCookie}).
  *
  * @remarks
  * Parses the `Cookie` header ({@link parseCookies}), takes the named cookie,
  * and verifies it with {@link verifyToken} against `secret` (a rotation list
- * accepts a cookie signed by any of its secrets). ANY failure — an absent
+ * accepts a cookie signed by any of its secrets). Any failure — an absent
  * cookie, a tampered value, a wrong secret — yields `undefined`, never throws.
  *
  * @param request - The `Request` to read the `Cookie` header from
@@ -445,19 +446,19 @@ export async function signToken(value: string, options: TokenOptions): Promise<s
 }
 
 /**
- * Verifies a stateless token and returns its embedded value — TOTAL, never throws.
+ * Verifies a stateless token and returns its embedded value — total, never throws.
  *
  * @remarks
- * The inverse of {@link signToken}: splits the token on its LAST `.` (so a
+ * The inverse of {@link signToken}: splits the token on its last `.` (so a
  * value containing dots survives), decodes the signature with
  * `@orkestrel/codec`'s `decodeBase64URL` — a signature that is not canonical
  * base64url is refused there, before any key import — and checks the payload's
- * HMAC-SHA256 signature against EACH {@link TokenSecret} candidate through
+ * HMAC-SHA256 signature against each {@link TokenSecret} candidate through
  * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
  * retired), accepting the token on the first match (the
  * rotation path). It then decodes + narrows the payload (`isRecord` +
  * `typeof`, never `as`) and, when an expiry was bound in, rejects an expired
- * token. ANY failure — a malformed token, a bad signature,
+ * token. Any failure — a malformed token, a bad signature,
  * a hostile/non-JSON payload, an empty secret list, or an elapsed expiry —
  * yields `undefined` rather than throwing.
  *
@@ -500,7 +501,7 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 }
 
 /**
- * Decodes + narrows a signed token's base64url JSON payload, honoring its
+ * Decodes and narrows a signed token's base64url JSON payload, honoring its
  * expiry — the shared decode step {@link verifyToken} applies after a
  * signature match.
  *
@@ -508,7 +509,7 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
  * Decodes the payload with `@orkestrel/codec`'s `decodeBase64URL` (total — a
  * non-canonical base64url segment answers `undefined` rather than throwing),
  * reads it as UTF-8 JSON, narrows it to a record with a string `value` without
- * `as`, and rejects an expired `exp`. TOTAL — any
+ * `as`, and rejects an expired `exp`. Total — any
  * decode/shape/expiry failure yields `undefined`; only `JSON.parse` still
  * throws, and its `catch` answers `undefined` too.
  *
@@ -531,13 +532,13 @@ export function decodeTokenPayload(encoded: string): string | undefined {
 }
 
 /**
- * Normalizes a {@link TokenSecret} to a concrete list of USABLE secrets —
- * backs both {@link signToken} and {@link verifyToken}.
+ * Normalizes a {@link TokenSecret} to a concrete list of usable secrets — the list
+ * behind both {@link signToken} and {@link verifyToken}.
  *
  * @remarks
  * A single string becomes a one-element list; a rotation list is copied. Any
- * blank/whitespace-only entry is DROPPED (`.trim()` is used only for that
- * emptiness test; each kept secret is stored VERBATIM). The first kept
+ * blank/whitespace-only entry is dropped (`.trim()` is used only for that
+ * emptiness test; each kept secret is stored verbatim). The first kept
  * element is the signing secret; all kept are accepted on verify.
  *
  * @param secret - The {@link TokenSecret} (a single string, or a rotation list)
@@ -634,7 +635,8 @@ export function computeCodingQuality(entries: readonly AcceptEntry[], coding: st
 
 /**
  * Picks the highest-scoring content-coding the server offers against already
- * parsed `Accept-Encoding` entries.
+ * parsed `Accept-Encoding` entries — the shared selection leaf behind
+ * {@link negotiateEncoding} and a `Negotiator`'s `encoding` axis.
  *
  * @remarks
  * The single selection leaf behind both doors onto this axis —
@@ -642,9 +644,9 @@ export function computeCodingQuality(entries: readonly AcceptEntry[], coding: st
  * entity — so the scoring loop has one implementation. Scores each `available`
  * coding with {@link computeCodingQuality} and keeps the highest; a strict `>`
  * keeps the earlier-offered coding on a client-side tie, which is what makes
- * `available` the SERVER's preference order. An empty `available` list, and a
+ * `available` the server's preference order. An empty `available` list, and a
  * list the client rejects outright, both yield `undefined` (identity — no
- * compression). TOTAL on hostile input.
+ * compression). Total on hostile input.
  *
  * @typeParam T - The coding string type (so a `readonly Encoding[]` returns an `Encoding`)
  * @param entries - The parsed {@link AcceptEntry} list
@@ -703,7 +705,7 @@ export function negotiateEncoding<T extends string>(
 }
 
 /**
- * Reports the rank + quality of one `candidate` media type against the parsed `Accept`
+ * Reports the rank and quality of one `candidate` media type against the parsed `Accept`
  * entries — the generic media-type primitive the `Negotiator`'s `negotiate`
  * uses to score each `available` candidate.
  *
@@ -827,13 +829,13 @@ export function isCompressibleType(type: string): boolean {
 // parser.
 
 /**
- * Computes a CONTENT `ETag` over a fully-buffered response body by using WebCrypto.
+ * Computes a content `ETag` over a fully-buffered response body by using WebCrypto.
  *
  * @remarks
  * Hashes `body` with SHA-256 (`crypto.subtle.digest`) and wraps the hex
- * digest as a WEAK validator (`W/"<hash>"`) when `weak` is `true` — the
- * default, encoding-AGNOSTIC, so the tag survives a downstream content
- * re-encoding (gzip) and still matches on revalidation — or a STRONG one
+ * digest as a weak validator (`W/"<hash>"`) when `weak` is `true` — the
+ * default, encoding-agnostic, so the tag survives a downstream content
+ * re-encoding (gzip) and still matches on revalidation — or a strong one
  * (`"<hash>"`, byte-identity) when `weak` is `false`.
  *
  * @param body - The full (uncompressed) response body to hash
@@ -853,8 +855,8 @@ export async function computeBodyETag(body: Uint8Array<ArrayBuffer>, weak = true
 }
 
 /**
- * Strips the WEAK indicator (`W/`) from an entity-tag, returning its opaque
- * comparison body — the reduction {@link matchesETag} applies to both sides
+ * Strips the weak indicator (`W/`) from an entity-tag, returning its opaque
+ * comparison body — the reduction {@link matchesETag} applies to each side
  * before the RFC 7232 §2.3.2 weak comparison.
  *
  * @param tag - One entity-tag (`W/"<body>"` or `"<body>"`)
@@ -872,14 +874,14 @@ export function unwrapETag(tag: string): string {
 
 /**
  * Checks whether a request's `If-None-Match` header matches a resource's current
- * `ETag` — the RFC 7232 §2.3.2 WEAK comparison.
+ * `ETag` — the RFC 7232 §2.3.2 weak comparison.
  *
  * @remarks
- * `If-None-Match` is a COMMA-separated LIST of entity-tags (matches if ANY
- * listed tag matches), or the `*` wildcard (matches ANY current
+ * `If-None-Match` is a comma-separated list of entity-tags (matches if any
+ * listed tag matches), or the `*` wildcard (matches any current
  * representation — only a list of exactly `*` is the wildcard). Comparison is
- * WEAK: `W/"abc"` and `"abc"` are equal (both sides' weak prefix is stripped
- * through {@link unwrapETag} before comparing the opaque body). TOTAL — a
+ * weak: `W/"abc"` and `"abc"` are equal (each side's weak prefix is stripped
+ * through {@link unwrapETag} before comparing the opaque body). Total — a
  * malformed/empty header matches nothing, never throws.
  *
  * @param header - The raw `If-None-Match` header value
@@ -906,17 +908,17 @@ export function matchesETag(header: string, etag: string): boolean {
 
 /**
  * Parses an HTTP `Range` request header against a known resource `size` —
- * TOTAL, returning a {@link RangeSpec} or `undefined`.
+ * total, returning a {@link RangeSpec} or `undefined`.
  *
  * @remarks
  * Handles the three single-range `bytes=` forms — closed (`start-end`), open
  * (`start-`), and suffix (`-suffixLength`) — clamping the window to
- * `[0, size - 1]` (the HTTP INCLUSIVE-end convention). Returns
+ * `[0, size - 1]` (the HTTP inclusive-end convention). Returns
  * `{ satisfiable: true, start, end }` for an overlapping range,
  * `{ satisfiable: false }` for a range wholly past the resource, and
- * `undefined` for the "serve the whole resource" case: an ABSENT header, a
- * non-`bytes` unit, a MULTI-range header (`a-b, c-d` — refused outright, not
- * supported), or any malformed/non-finite bound. NEVER throws on a hostile
+ * `undefined` for the "serve the whole resource" case: an absent header, a
+ * non-`bytes` unit, a multi-range header (`a-b, c-d` — refused outright, not
+ * supported), or any malformed/non-finite bound. Never throws on a hostile
  * header.
  *
  * @param header - The raw `Range` header value
@@ -1053,15 +1055,15 @@ export function resolveSecurityHeader(
 }
 
 /**
- * Checks whether a client-supplied `X-Request-ID` is SAFE to echo into a response
- * header + `context.state`.
+ * Checks whether a client-supplied `X-Request-ID` is safe to echo into a response
+ * header and `context.state`.
  *
  * @remarks
- * A request id is echoed RAW into a response header and log lines, so an
+ * A request id is echoed raw into a response header and log lines, so an
  * untrusted one is a header-injection + log-injection + DoS vector. This
  * refuses anything off {@link import('./constants.js').REQUEST_ID_PATTERN}
  * (`^[A-Za-z0-9_-]{1,200}$` — no whitespace, no control chars, no CR/LF).
- * TOTAL — never throws.
+ * Total — never throws.
  *
  * @param value - The candidate incoming request id
  * @returns True if `value` is a safe, bounded, charset-clean correlation id; false otherwise
@@ -1127,11 +1129,11 @@ export function computeIPv6Network(address: string): string | undefined {
 }
 
 /**
- * Collapses a client IP into its rate-limit BUCKET key — an IPv6 address to
+ * Collapses a client IP into its rate-limit bucket key — an IPv6 address to
  * its `/64` network, an IPv4 (or IPv4-mapped) address unchanged.
  *
  * @remarks
- * A residential/mobile IPv6 user is routinely handed a WHOLE `/64`, so a
+ * A residential/mobile IPv6 user is routinely handed a whole `/64`, so a
  * per-`/128` rate limit is trivially bypassed by rotating host bits — the
  * real identity is the `/64` network. Delegates the IPv6 collapse to
  * {@link computeIPv6Network}; anything it returns `undefined` for (an IPv4 address,
@@ -1195,9 +1197,9 @@ export function serializeEvent(message: SSEMessage): string {
 // the fetch-vocabulary migration).
 
 /**
- * Checks whether a key is a PROTOTYPE-POLLUTION vector — `__proto__`, `constructor`,
- * or `prototype` — the three keys that, assigned onto a normal object, can
- * reach and mutate `Object.prototype`.
+ * Checks whether a key is a prototype-pollution vector — `__proto__`,
+ * `constructor`, or `prototype`, each of which can reach and mutate
+ * `Object.prototype` when it is assigned onto a normal object.
  *
  * @param key - The candidate object key
  * @returns True if `key` is one of the three prototype-pollution keys; false otherwise
@@ -1213,12 +1215,11 @@ export function isDangerousKey(key: string): boolean {
 }
 
 /**
- * Strips the prototype-pollution keys from a parsed value IN PLACE,
- * recursively.
+ * Strips the prototype-pollution keys from a parsed value in place, recursively.
  *
  * @remarks
- * `JSON.parse('{"__proto__":{…}}')` is benign on its own — it produces an OWN,
- * enumerable `__proto__` DATA property — but that own key becomes a
+ * `JSON.parse('{"__proto__":{…}}')` is benign on its own — it produces an own,
+ * enumerable `__proto__` data property — but that own key becomes a
  * pollution gadget the moment a downstream deep-merge copies it onto a live
  * object. This walks the value and `delete`s any own {@link isDangerousKey}
  * key at every depth, recursing into nested objects + array elements.
@@ -1328,12 +1329,12 @@ export function parseEncoding(header: string | null): Exclude<Encoding, 'identit
 
 /**
  * Decompresses an already-collected, `gzip`/`deflate`-encoded byte sequence
- * transparently through `DecompressionStream`, capping the DECOMPRESSED output —
+ * transparently through `DecompressionStream`, capping the decompressed output —
  * the zip-bomb defense.
  *
  * @remarks
  * Pipes `bytes` through `DecompressionStream(encoding)` and a byte-counting
- * `TransformStream` that ABORTS the pipe the INSTANT the running decompressed
+ * `TransformStream` that aborts the pipe the instant the running decompressed
  * total exceeds `cap` — fail-before-materialize, since `DecompressionStream`
  * has no `maxOutputLength` knob. A cap breach surfaces
  * as a {@link ContentTooLargeError} (413); a genuinely corrupt/truncated
@@ -1394,9 +1395,10 @@ export async function decompressRequestBody(
 }
 
 /**
- * Collects + decodes a `Request` body — the shared body-collection pipeline
+ * Collects and decodes a `Request` body — the shared body-collection pipeline
  * surfaced to middleware and handlers as the middleware context's cached
- * `body()`.
+ * `body()`. An empty body and a malformed `application/json` body each decode to
+ * `undefined`.
  *
  * @remarks
  * Collects the wire body capped at `options.limit` bytes ({@link
@@ -1407,13 +1409,11 @@ export async function decompressRequestBody(
  * import('./constants.js').DEFAULT_DECOMPRESSED_LIMIT}), then decodes by
  * content type: `application/json` is parsed by using `@orkestrel/contract`'s
  * `parseJSON` and scrubbed of prototype-pollution keys ({@link
- * scrubPrototype}); any other type decodes as UTF-8 text; an empty body
- * decodes to `undefined`.
+ * scrubPrototype}); any other type decodes as UTF-8 text.
  *
- * A malformed JSON body is total: it decodes to `undefined` rather than
- * throwing, so a handler that must reject one checks for `undefined` itself.
- * That makes `undefined` the answer for two distinct inputs, and nothing in the
- * returned value tells them apart.
+ * A malformed JSON body is total: it decodes rather than throwing, so a handler
+ * that must reject one checks for `undefined` itself, and nothing in the returned
+ * value tells an empty body from a malformed one.
  *
  * @param request - The `Request` to read the body from
  * @param options - The {@link BodyOptions} `limit` + `decompression` caps
@@ -1490,13 +1490,14 @@ export async function probePort(port: number): Promise<number> {
 }
 
 /**
- * Finds a FREE TCP port — binds a throwaway `node:net` server, reads the
- * OS-assigned port, closes it, and resolves that port.
+ * Finds a free TCP port — binds a throwaway `node:net` server on a `preferred`
+ * port where one is given and on an ephemeral port otherwise, reads the bound
+ * port, closes the server, and resolves that port.
  *
  * @remarks
  * With no `preferred` it binds port `0` (an ephemeral OS-assigned free port)
- * and returns it. With a `preferred` port it tries THAT port first and
- * returns it when free; if already in use (`EADDRINUSE`) it FALLS BACK to an
+ * and returns it. With a `preferred` port it tries that port first and
+ * returns it when free; if already in use (`EADDRINUSE`) it falls back to an
  * ephemeral free port rather than rejecting — a caller always gets a usable
  * port. It binds then immediately closes a probe server, so the returned
  * port is free at the instant of the probe (an inherent TOCTOU race — bind it

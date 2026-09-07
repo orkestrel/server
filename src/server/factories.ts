@@ -15,13 +15,48 @@ import { Stream } from './Stream.js'
  *
  * @returns A {@link NegotiatorInterface}
  *
- * @example
+ * @example Substrate direct use — tokens, cookies, negotiation
  * ```ts
- * import { createNegotiator } from '@src/server'
+ * import type { MiddlewareContext } from '@orkestrel/server'
+ * import {
+ * 	createNegotiator,
+ * 	decodeTokenPayload,
+ * 	decompressRequestBody,
+ * 	readSignedCookie,
+ * 	signToken,
+ * 	verifyToken,
+ * 	writeSignedCookie,
+ * } from '@orkestrel/server'
+ *
+ * declare const context: MiddlewareContext<Record<string, never>>
  *
  * const negotiator = createNegotiator()
- * negotiator.negotiate('text/html, application/json;q=0.9', ['application/json', 'text/html'])
- * // 'text/html'
+ * negotiator.negotiate('text/html, application/json;q=0.9', ['application/json', 'text/html']) // 'text/html'
+ * negotiator.encoding('gzip;q=1.0, deflate;q=0.8', ['gzip', 'deflate']) // 'gzip'
+ * negotiator.language('en-US, en;q=0.8, fr;q=0.5', ['en', 'fr']) // 'en'
+ * await negotiator.format(new Request('http://x'), context, {
+ * 	'application/json': (_request, _context) => Response.json({ ok: true }),
+ * })
+ *
+ * const headers = new Headers()
+ * await writeSignedCookie(headers, 'session', 'user-1', 'secret')
+ * const value = await readSignedCookie(
+ * 	new Request('http://x', { headers: { cookie: 'session=abc' } }),
+ * 	'session',
+ * 	'secret',
+ * )
+ * await verifyToken('bad.token', 'secret') // undefined — total, never throws
+ *
+ * const token = await signToken('client', { secret: 'shh' })
+ * decodeTokenPayload(token.split('.')[0]) // 'client' — the shared decode step verifyToken applies after a signature match
+ *
+ * const gzipped = new Uint8Array(
+ * 	await new Response(
+ * 		new Blob(['hi']).stream().pipeThrough(new CompressionStream('gzip')),
+ * 	).arrayBuffer(),
+ * )
+ * const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)
+ * new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb defense
  * ```
  */
 export function createNegotiator(): NegotiatorInterface {

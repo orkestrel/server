@@ -38,7 +38,7 @@ import { HTTP_ERROR_BRAND } from './constants.js'
  * Carries the HTTP `status` to send and an optional `context` record (the
  * offending field / value). The server's built-in error boundary catches it
  * and renders a response of `status` with the error's `message` as the body
- * — so an `HTTPError`'s message is ALWAYS client-facing (it is the handler's
+ * — so an `HTTPError`'s message is always client-facing (it is the handler's
  * deliberate signal), unlike a generic throw whose message is hidden unless
  * `expose` is set. Subclass it (as {@link ContentTooLargeError} does) for
  * specific statuses, or throw it directly. Narrow a caught value with
@@ -101,21 +101,22 @@ export class ContentTooLargeError extends HTTPError {
 }
 
 /**
- * Narrows an unknown caught value to an {@link HTTPError} (including its
- * subclasses, for example {@link ContentTooLargeError}).
+ * Narrows an unknown caught value to an {@link HTTPError}, including a subclass such
+ * as {@link ContentTooLargeError}, and recognizes an instance from another copy of
+ * this package through a structural brand fallback.
  *
  * @param value - The value to test (typically a `catch` binding)
  * @returns True if `value` is an {@link HTTPError}; false otherwise
  *
  * @remarks
  * Tries `instanceof` first, then falls back to a total structural check for
- * an instance built by a DIFFERENT copy of this package (the dual-package
+ * an instance built by a different copy of this package (the dual-package
  * hazard — version skew, a linked workspace duplicate) whose `HTTPError`
  * constructor is a distinct object from this copy's: the value must carry
  * the cross-copy brand (interned by using `Symbol.for`, so every copy resolves the
- * same key) AND expose the exact fields the server's error boundary reads off
+ * same key) and expose the exact fields the server's error boundary reads off
  * a recognized `HTTPError` — a numeric `status` and a string `message`. A
- * plain object that merely carries a `status` WITHOUT the brand is rejected.
+ * plain object that merely carries a `status` without the brand is rejected.
  *
  * @example
  * ```ts
@@ -138,11 +139,11 @@ export function isHTTPError(value: unknown): value is HTTPError {
 
 /**
  * Represents the error this package raises when a caller programmed a call the
- * entity refuses.
+ * entity refuses, carrying `'STATUS'` or `'NEXT'` as its code.
  *
  * @remarks
  * Carries a machine-readable {@link ServerErrorCode} and an optional `context`
- * record naming the offending facts. This is a PROGRAMMER error, so it carries
+ * record naming the offending facts. This is a programmer error, so it carries
  * no HTTP `status`: a `'STATUS'` lifecycle refusal is raised to the caller that
  * invoked the lifecycle method, and a `'NEXT'` double-`next` refusal escapes its
  * middleware into the request boundary, which reaches it as a generic 500 with
@@ -173,13 +174,14 @@ export class ServerError extends Error {
 }
 
 /**
- * Narrows an unknown caught value to a {@link ServerError}.
+ * Narrows an unknown caught value to a {@link ServerError} — the code-bearing refusal
+ * of a call the caller programmed.
  *
  * @param value - The value to test (typically a `catch` binding)
  * @returns True if `value` is a {@link ServerError}; false otherwise
  *
  * @remarks
- * Recognizes an instance built by THIS copy of the package. A `ServerError`
+ * Recognizes an instance built by this copy of the package. A `ServerError`
  * is raised by a `Server` to the caller that invoked it directly, so both sides
  * hold the same copy and the cross-copy brand {@link isHTTPError} needs has no
  * consumer here.

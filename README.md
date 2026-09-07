@@ -1,12 +1,16 @@
 # @orkestrel/server
 
-A typed HTTP server for the `@orkestrel` line — composes an `@orkestrel/router`
-dispatcher behind a managed lifecycle (start/stop/drain/destroy) over a node
-adapter seam, with a middleware onion, response observability, and a shared
-substrate for cookies, tokens, content negotiation, and SSE. Built to sit
-beside `@orkestrel/router` (routing, matching, and dispatch), `@orkestrel/contract`
-(validation), `@orkestrel/emitter` (observable lifecycle), and `@orkestrel/abort`
-(cancellation). Part of the `@orkestrel` line.
+> A typed HTTP server for the `@orkestrel` line: a node-bound `Server` lifecycle entity
+> that composes a middleware onion around a consumed `@orkestrel/router` dispatcher,
+> beside the `HTTPError` vocabulary and a shared substrate for cookies, WebCrypto
+> tokens, content negotiation, ETag and Range, security headers, Server-Sent Events,
+> and the body pipeline.
+
+Hand `createServer` a dispatcher and a per-request state factory, call `start()`, and
+call `stop()` when the process winds down. Built to sit beside `@orkestrel/router`
+(routing, matching, and dispatch), `@orkestrel/contract` (validation),
+`@orkestrel/emitter` (observable lifecycle), and `@orkestrel/abort` (cancellation).
+Part of the `@orkestrel` line.
 
 ## Install
 

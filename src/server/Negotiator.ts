@@ -8,13 +8,13 @@ import {
 
 /**
  * Represents the content-negotiation machine over the weighted `Accept` family — a
- * reusable, cross-middleware ENTITY (not a middleware). Implements exactly
+ * reusable, cross-middleware entity rather than a middleware. Implements exactly
  * {@link NegotiatorInterface}.
  *
  * @remarks
  * `negotiate` is the generic media-type primitive (exact / subtype-wildcard /
  * any-range, q-sorted, `;q=0` rejected); `encoding` / `language` are its
- * sibling axes and REUSE the same {@link parseAcceptHeader} q-value parser the
+ * sibling axes and reuse the same {@link parseAcceptHeader} q-value parser the
  * rest of the substrate uses — one parser, never two. `format` reads the
  * request `Accept`, negotiates a {@link FormatHandlerMap}'s keys, and invokes
  * the winner — or answers `406 Not Acceptable`.
