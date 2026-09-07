@@ -61,7 +61,7 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   written back through `sendResponse`.
  * - **The built-in boundary** wraps the WHOLE per-request chain, including
  *   setup: `buildRequest` runs behind its own inner boundary that maps a
- *   throw (e.g. a malformed `Host` header) to a silent `400` with no
+ *   throw (for example, a malformed `Host` header) to a silent `400` with no
  *   `error` emit; everything after (`Request` reconstruction, connection
  *   facts, `state`, the composed onion, and `dispatcher.handle`) runs
  *   behind the outer boundary — a thrown `HTTPError` renders as its status +
@@ -270,7 +270,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	// and write the result back — every escaping throw is caught so the
 	// process can never crash on an unhandled handler (or malformed request)
 	// error. `buildRequest` runs behind its OWN inner boundary: a throw there
-	// (e.g. a malformed `Host` header) maps to a silent `400`, never `error`.
+	// (for example, a malformed `Host` header) maps to a silent `400`, never
+	// `error`.
 	async #accept(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		let raw: Request
 		try {

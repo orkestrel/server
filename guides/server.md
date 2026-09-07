@@ -295,7 +295,7 @@ These invariants hold across `src/server` ↔ `server.md`.
 6. **The built-in boundary is lifecycle machinery, not policy — one seam
    that spans setup AND dispatch.** The `Server` wraps the WHOLE per-request
    lifecycle in two nested phases of the same boundary. The innermost phase
-   covers only `buildRequest`: a malformed request (e.g. an unparsable `Host`)
+   covers only `buildRequest`: a malformed request (for example, an unparsable `Host`)
    answers a plain `400`, with no `error` emit, no `report` call, and no
    `response` emit, since nothing downstream ever ran and no parsed `Request`
    exists yet to derive its facts from. The outer phase covers everything
@@ -393,7 +393,7 @@ These invariants hold across `src/server` ↔ `server.md`.
     `'Internal Server Error'` string unless `expose` is explicitly `true`; an
     `HTTPError`'s own `message` is ALWAYS client-facing (it is the handler's
     deliberate signal), independent of `expose`.
-18. **`isHTTPError` recognizes an `HTTPError` across package copies, not just
+18. **`isHTTPError` recognizes an `HTTPError` across package copies, not only
     `instanceof`.** A version-skewed or workspace-linked duplicate install of
     this package produces a SECOND, distinct `HTTPError` constructor —
     `instanceof` fails across the two copies even though the thrown value is

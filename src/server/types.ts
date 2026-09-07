@@ -199,8 +199,9 @@ export interface MediaMatch {
 }
 
 /**
- * Represents a content-coding the substrate compresses / decompresses with — the
- * `Content-Encoding` / `Accept-Encoding` token vocabulary it understands.
+ * Represents a content-coding the substrate compresses / decompresses with. The listed
+ * codings are the `Content-Encoding` and `Accept-Encoding` token vocabulary the substrate
+ * understands.
  *
  * @remarks
  * `gzip` / `deflate` map to `CompressionStream` / `DecompressionStream`
@@ -261,7 +262,7 @@ export interface NegotiatorInterface {
 	 * Picks the best `available` value for a weighted `Accept`-style `header` —
 	 * the generic media-type primitive (`encoding` / `language` build on it).
 	 *
-	 * @param header - The raw weighted header value (e.g. `text/html, application/json;q=0.9`)
+	 * @param header - The raw weighted header value (for example `text/html, application/json;q=0.9`)
 	 * @param available - The values the server can produce, in preference (tie-break) order
 	 * @returns The best acceptable value, or `undefined` when none is
 	 */
@@ -271,7 +272,7 @@ export interface NegotiatorInterface {
 	 * — the coding axis of the same q-value parser (a bare `*` wildcard ⇒ the
 	 * first `available`).
 	 *
-	 * @param header - The raw `Accept-Encoding` header value (e.g. `gzip;q=1.0, deflate;q=0.8`)
+	 * @param header - The raw `Accept-Encoding` header value (for example `gzip;q=1.0, deflate;q=0.8`)
 	 * @param available - The codings the server offers, in preference order
 	 * @returns The best acceptable coding, or `undefined` when none is
 	 *
@@ -289,7 +290,7 @@ export interface NegotiatorInterface {
 	 * `negotiate` with a language-prefix match (`en` accepts `en-US`) and a
 	 * bare `*` wildcard.
 	 *
-	 * @param header - The raw `Accept-Language` header value (e.g. `en-US, en;q=0.8, fr;q=0.5`)
+	 * @param header - The raw `Accept-Language` header value (for example `en-US, en;q=0.8, fr;q=0.5`)
 	 * @param available - The languages the server offers, in preference order
 	 * @returns The best acceptable language, or `undefined` when none is
 	 */
@@ -545,7 +546,7 @@ export interface ResponseRecord {
  *   the per-request path; `undefined` for an upgrade-handler throw (no fetch
  *   `Request` exists on that path — only a raw `IncomingMessage`) or a listen
  *   failure.
- * - `stop` — `stop()` began (status just moved to `'stopping'`). An upgrade
+ * - `stop` — `stop()` began (status moved to `'stopping'`). An upgrade
  *   handler that owns a long-lived socket closes it from here, so the drain
  *   below settles instead of running out the deadline.
  * - `drain` — the graceful drain settled (deadline hit or all finished);
@@ -556,8 +557,8 @@ export interface ResponseRecord {
  *   that reaches the middleware pipeline (the success path and the
  *   outer-boundary error path); carries the method, parsed pathname, final
  *   status, and elapsed time in milliseconds. A request rejected at the
- *   `buildRequest` INNER boundary (a plain `400`, e.g. a malformed `Host`
- *   header) emits no `response` — no parsed `Request` exists yet to derive
+ *   `buildRequest` INNER boundary (a plain `400`, for example a malformed
+ *   `Host` header) emits no `response` — no parsed `Request` exists yet to derive
  *   its facts from.
  */
 export type ServerEventMap = {

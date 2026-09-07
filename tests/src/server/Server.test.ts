@@ -648,7 +648,7 @@ describe('Server — graceful drain with an upgraded socket', () => {
 		expect(claimed).toHaveLength(1)
 		expect(claimed[0]?.destroyed).toBe(true)
 		// The peer really lost the connection — the cut reached the wire, not
-		// just the server's own bookkeeping.
+		// only the server's own bookkeeping.
 		await held.closed
 		expect(held.done).toBe(true)
 		// Stated as the relationship rather than one run's numbers: the held

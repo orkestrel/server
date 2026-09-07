@@ -120,7 +120,7 @@ export function wrapMiddleware<TState>(
 // pair reuses the shipped HMAC token primitives rather than a second HMAC
 // scheme: `writeSignedCookie` is `serializeCookie(name, await signToken(value,
 // { secret }))` appended to a `Headers`, and `readSignedCookie` is `await
-// verifyToken(parseCookies(...)[name], secret)` — so a cookie is just a
+// verifyToken(parseCookies(...)[name], secret)` — so a cookie is a
 // `signToken` value in a `Set-Cookie`, with the SAME secret rotation + tamper
 // rejection. Every reader narrows untrusted request input with `typeof`,
 // never `as`, and remains total on hostile input.
@@ -717,7 +717,7 @@ export function negotiateEncoding<T extends string>(
  * rank tie the highest `q` wins.
  *
  * @param entries - The parsed {@link AcceptEntry} list
- * @param candidate - The candidate media type to score (e.g. `'text/html'`)
+ * @param candidate - The candidate media type to score (for example `'text/html'`)
  * @returns The {@link MediaMatch} for the best matching entry, or `undefined` when nothing matches
  *
  * @example
@@ -766,7 +766,7 @@ export function matchMediaType(
  * is an explicit rejection).
  *
  * @param entries - The parsed {@link AcceptEntry} list
- * @param candidate - The candidate language tag to score (e.g. `'en-US'`)
+ * @param candidate - The candidate language tag to score (for example `'en-US'`)
  * @returns The client's quality for `candidate` in `[0, 1]` (`0` ⇒ not acceptable)
  *
  * @example
@@ -1501,7 +1501,7 @@ export async function probePort(port: number): Promise<number> {
  * port. It binds then immediately closes a probe server, so the returned
  * port is free at the instant of the probe (an inherent TOCTOU race — bind it
  * promptly). Rejects only on an unexpected listen error other than a taken
- * `preferred` port (e.g. a permission fault). A listener whose address is not
+ * `preferred` port (for example, a permission fault). A listener whose address is not
  * an {@link import('node:net').AddressInfo} — a pipe listener, which this
  * package's options cannot request — rejects with a `TypeError` rather than
  * reporting `0`, because `0` is this package's own request for an ephemeral

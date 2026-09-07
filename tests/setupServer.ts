@@ -10,18 +10,18 @@ import { resolveRoot } from '@orkestrel/test'
 // helpers for the server face's real-socket tests (no mocks — a real
 // `node:http` server on an ephemeral port, closed by every caller).
 
-/** The workspace root, anchored from this setup file's own location. */
+/** Holds the workspace root, anchored from this setup file's own location. */
 export const WORKSPACE_ROOT = fileURLToPath(resolveRoot(import.meta))
 
-/** The outcome of a raw `upgradeRequest` probe: whether a handler claimed the socket. */
+/** Reports the outcome of a raw `upgradeRequest` probe: whether a handler claimed the socket. */
 export interface UpgradeOutcomeInterface {
 	readonly claimed: boolean
 	readonly status: number
 }
 
 /**
- * Send a raw, hand-written HTTP request over a bare `node:net` socket and
- * resolve with whatever bytes come back — the real-socket probe for
+ * Sends a raw, hand-written HTTP request over a bare `node:net` socket and
+ * resolves with whatever bytes come back — the real-socket probe for
  * malformed-request vectors (a bad `Host` header) that `fetch` would refuse
  * to send (no mocks, a genuinely raw wire payload).
  *
@@ -52,7 +52,7 @@ export function rawRequest(port: number, raw: string): Promise<string> {
 	})
 }
 
-/** A real HTTP response socket whose readable side starts paused. */
+/** Represents a real HTTP response socket whose readable side starts paused. */
 export interface PausedResponseInterface {
 	/** Resolves when the peer closes the response connection. */
 	readonly closed: Promise<void>
@@ -65,7 +65,7 @@ export interface PausedResponseInterface {
 }
 
 /**
- * Open a real HTTP request over TCP while parking the response reader.
+ * Opens a real HTTP request over TCP while parking the response reader.
  *
  * @remarks
  * Connects to `127.0.0.1`, pauses the socket's readable side before sending
@@ -110,7 +110,7 @@ export async function openPausedResponse(
 }
 
 /**
- * Probe whether a real TCP connection is dropped before it can carry data.
+ * Probes whether a real TCP connection is dropped before it can carry data.
  *
  * @remarks
  * Connects to `127.0.0.1:port` and observes the socket directly. A close or
@@ -167,7 +167,7 @@ export async function probeLoopback(host: string): Promise<boolean> {
 	}
 }
 
-/** A client-side upgraded connection deliberately left open — see {@link holdUpgrade}. */
+/** Represents a client-side upgraded connection deliberately left open — see {@link holdUpgrade}. */
 export interface HeldUpgradeInterface {
 	/** Resolves when the connection closes, from either end. */
 	readonly closed: Promise<void>
@@ -178,7 +178,7 @@ export interface HeldUpgradeInterface {
 }
 
 /**
- * Complete a real protocol upgrade and KEEP the socket open — the long-lived
+ * Completes a real protocol upgrade and KEEPS the socket open — the long-lived
  * connection a WebSocket peer holds, for the tests that ask what `stop()` does
  * while one is attached.
  *

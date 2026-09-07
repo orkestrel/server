@@ -102,7 +102,7 @@ export class ContentTooLargeError extends HTTPError {
 
 /**
  * Narrows an unknown caught value to an {@link HTTPError} (including its
- * subclasses, e.g. {@link ContentTooLargeError}).
+ * subclasses, for example {@link ContentTooLargeError}).
  *
  * @param value - The value to test (typically a `catch` binding)
  * @returns True if `value` is an {@link HTTPError}; false otherwise
@@ -180,7 +180,7 @@ export class ServerError extends Error {
  *
  * @remarks
  * Recognizes an instance built by THIS copy of the package. A `ServerError`
- * is raised by a `Server` to the caller that just invoked it, so both sides
+ * is raised by a `Server` to the caller that invoked it directly, so both sides
  * hold the same copy and the cross-copy brand {@link isHTTPError} needs has no
  * consumer here.
  *
