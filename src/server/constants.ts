@@ -1,11 +1,11 @@
 import type { Encoding } from './types.js'
 
 // The substrate's tunable defaults — only the constants with a real consumer
-// inside THIS package: a capability arrives with its first real consumer,
+// inside this package: a capability arrives with its first real consumer,
 // never speculatively. Each is frozen or declared
 // readonly, so a consumer reads but never mutates the shared default. The
 // defaults only `@orkestrel/middleware` needs (rate limiting, CSRF, sessions,
-// static serving, multipart) stay OUT of this file; they belong to that
+// static serving, multipart) stay out of this file; they belong to that
 // package's own `constants.ts`.
 
 /**

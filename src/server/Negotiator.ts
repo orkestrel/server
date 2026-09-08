@@ -73,7 +73,7 @@ export class Negotiator implements NegotiatorInterface {
 	 * answering 406 when none matches.
 	 *
 	 * @remarks
-	 * Errors thrown by the negotiated handler propagate UNMODIFIED — the
+	 * Errors thrown by the negotiated handler propagate unmodified — the
 	 * server boundary classifies them, never this negotiator.
 	 */
 	async format<TState>(

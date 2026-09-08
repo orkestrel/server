@@ -256,8 +256,8 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#emitter.destroy()
 	}
 
-	// Track the request for draining FIRST — before anything that can throw —
-	// so the sync listener itself never throws; the rest of setup (which CAN
+	// Track the request for draining first — before anything that can throw —
+	// so the sync listener itself never throws; the rest of setup (which can
 	// throw on a malformed request) is deferred into the async `#accept`
 	// entry, kept behind the built-in boundary.
 	#handle(message: IncomingMessage, response: ServerResponse): void {
@@ -270,7 +270,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	// Build the fetch `Request` + `MiddlewareContext`, run the composed onion,
 	// and write the result back — every escaping throw is caught so the
 	// process can never crash on an unhandled handler (or malformed request)
-	// error. `buildRequest` runs behind its OWN inner boundary: a throw there
+	// error. `buildRequest` runs behind its own inner boundary: a throw there
 	// (for example, a malformed `Host` header) maps to a silent `400`, never
 	// `error`.
 	async #accept(message: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -356,8 +356,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Fan a raw protocol-upgrade out to the registered handlers in
-	// registration order: the FIRST to return `true` CLAIMS the socket. A
-	// throwing handler is treated as DECLINED — surfaced on `error` — and the
+	// registration order: the first to return `true` claims the socket. A
+	// throwing handler is treated as declined — surfaced on `error` — and the
 	// fan-out continues so a later handler can still claim. Unclaimed ⇒ the
 	// socket is destroyed so an unhandled upgrade never leaks a connection.
 	#onUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -452,14 +452,14 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Close the underlying server, resolving once it stops accepting
-	// connections. A keep-alive client leaves its socket IDLE after a
+	// connections. A keep-alive client leaves its socket idle after a
 	// response, which would hang a plain `close()` — so idle sockets are
 	// always dropped (an in-flight request is untouched); when `force` is set
 	// (the drain deadline fired with work still in flight, or `destroy`)
 	// every open socket is destroyed so the callback fires promptly.
 	//
 	// A protocol-upgraded socket needs the extra loop: node detaches it from
-	// the connection set BOTH `closeIdleConnections()` and
+	// the connection set both `closeIdleConnections()` and
 	// `closeAllConnections()` walk, so neither reaches it while
 	// `server.close()` still waits on it. Without destroying the tracked set
 	// here, a force close hangs exactly as hard as a graceful one.
@@ -481,7 +481,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Arm a fresh drain wakeup when the server goes from settled to busy.
-	// Called BEFORE the new unit is counted, so a zero here means nothing was
+	// Called before the new unit is counted, so a zero here means nothing was
 	// in flight yet. The invariant this pair holds — `#wakeup` is un-aborted
 	// whenever `#inflight` is positive — is what lets `#drainPending` park on
 	// it without racing a wakeup that already fired.
@@ -489,8 +489,8 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#inflight === 0) this.#wakeup = createAbort()
 	}
 
-	// Fire the current drain wakeup once the LAST unit of drainable work has
-	// left. Called AFTER that unit is uncounted — event-driven, never a
+	// Fire the current drain wakeup once the last unit of drainable work has
+	// left. Called after that unit is uncounted — event-driven, never a
 	// busy-loop.
 	#settle(): void {
 		if (this.#inflight === 0) this.#wakeup.abort()
@@ -510,7 +510,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Track one claimed upgraded socket for the duration of its life. The
-	// claiming handler still OWNS the socket — this only watches it, so the
+	// claiming handler still owns the socket — this only watches it, so the
 	// stop path can drain it like a request and cut it if the deadline wins.
 	// An already-dead socket never enters (nothing would ever untrack it).
 	#trackSocket(socket: Duplex): void {

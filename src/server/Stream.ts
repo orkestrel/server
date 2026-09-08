@@ -9,7 +9,7 @@ import { SSE_HEADERS } from './constants.js'
  * @remarks
  * Builds the `Response` at construction from
  * {@link import('./constants.js').SSE_HEADERS} with any `options.headers`
- * merged OVER them, at `options.status` (default `200`). A caller repeating one
+ * merged over them, at `options.status` (default `200`). A caller repeating one
  * of those keys therefore replaces the seam's value, in any casing. The
  * instance owns the stream's
  * controller, its text encoder, the closed flag, and the parked producer's
@@ -21,7 +21,7 @@ import { SSE_HEADERS } from './constants.js'
  * receiving `false` awaits `drain()`; that promise resolves on the next
  * consumer pull restoring capacity, or on stream closure. `comment` writes a
  * `: text` keep-alive line a conforming SSE parser ignores; `end` closes the
- * stream. Every method is a SAFE NO-OP once `closed` (ended by `end()`, or
+ * stream. Every method is a safe no-op once `closed` (ended by `end()`, or
  * the consumer cancelled the stream), so a late write never throws.
  *
  * The readiness signal reflects only the process-local `ReadableStream`
@@ -119,7 +119,7 @@ export class Stream implements StreamInterface {
 		this.#settle()
 	}
 
-	// The CONSUMER cancelled the stream: the handle is closed from the far end,
+	// The consumer cancelled the stream: the handle is closed from the far end,
 	// so a parked producer settles rather than waiting for a pull that cannot come.
 	#cancel(): void {
 		this.#closed = true

@@ -1,13 +1,13 @@
 // A handler signals a client-facing fault by throwing an `HTTPError` carrying
 // the HTTP `status` to send; the server's error boundary turns it into a
-// response of that status. Any OTHER throw is a programmer/runtime error → a
+// response of that status. Any other throw is a programmer/runtime error → a
 // 500 (its message hidden unless `expose`). The machine-readable field here is
 // the numeric `status` (plus an optional `context` bag) — `MultipartError` is
-// NOT declared here: it belongs to `@orkestrel/middleware` with its owner
+// not declared here: it belongs to `@orkestrel/middleware` with its owner
 // (`createMultipart`).
 //
 // Dual-package hazard: `instanceof HTTPError` fails when the thrown value was
-// constructed by a DIFFERENT copy of this package (version skew, a linked
+// constructed by a different copy of this package (version skew, a linked
 // workspace) — the two copies' `HTTPError` constructors are distinct objects
 // even though they are structurally identical. `isHTTPError` therefore tries
 // `instanceof` first (the common, cheap case) and falls back to a total
@@ -18,7 +18,7 @@
 // the boundary that trusts it.
 //
 // `ServerError` is the other half of the vocabulary: it reports a call the
-// CALLER programmed wrong, so it keys on a `ServerErrorCode` rather than a
+// caller programmed wrong, so it keys on a `ServerErrorCode` rather than a
 // `status`, and `isServerError` narrows it with a plain `instanceof`. A
 // `'STATUS'` lifecycle refusal is raised to the caller that invoked the
 // lifecycle method; a `'NEXT'` double-`next` refusal escapes its middleware
