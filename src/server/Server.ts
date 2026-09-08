@@ -211,8 +211,9 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#sockets.connections !== undefined) server.maxConnections = this.#sockets.connections
 		if (this.#sockets.headers !== undefined) server.maxHeadersCount = this.#sockets.headers
 		if (this.#sockets.requests !== undefined) server.maxRequestsPerSocket = this.#sockets.requests
-		// Bound to THIS run's server instance, discarded with it on stop/restart —
-		// no manual removal needed (the same per-run lifecycle as the handler above).
+		// Bound to this run's server instance, discarded with it on stop/restart —
+		// no manual removal needed (the same per-run lifecycle as the request
+		// handler `createHTTPServer` takes).
 		server.on('upgrade', (request, socket, head) => this.#onUpgrade(request, socket, head))
 		this.#http = server
 		return this.#listen(server, signal)
@@ -223,10 +224,10 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#status = 'stopping'
 		this.#emitter.emit('stop')
 		const server = this.#http
-		// A pure signal — NOT the drain deadline's parent (a parent abort would
+		// A pure signal — not the drain deadline's parent (a parent abort would
 		// clear the Timeout so it never fires). The drain deadline is an
-		// independent clock; the wake-park below resolves on the last finish OR
-		// the deadline, event-driven, never a busy-loop.
+		// independent clock; the wake-park inside `#drainPending` resolves on the
+		// last finish or the deadline, event-driven, never a busy-loop.
 		this.#abort.abort()
 		const deadline: TimeoutInterface = createTimeout({ ms: this.#drain })
 		deadline.start()
@@ -280,8 +281,8 @@ export class Server<TState> implements ServerInterface<TState> {
 			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
 			return
 		}
-		// Hoisted above the inner try (not block-scoped inside it) so the catch
-		// below can attach real request context to the `error` emit / `report`
+		// Hoisted out of the inner try (not block-scoped inside it) so that try's
+		// catch can attach real request context to the `error` emit / `report`
 		// sink — and so `response` can be emitted with the same facts on either
 		// the success or the error path.
 		const method = raw.method

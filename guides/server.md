@@ -66,7 +66,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 
 ### Constants
 
-A `Shape` cell holds an interface's data members as bare names in braces, `?` marking an optional member and `plus` introducing its call-signature members, and a type alias's own type literal with a union's arms escaped as `\|`. A `Shape` cell holds the constant's declared type.
+A `Shape` cell holds the constant's declared type.
 
 | API                          | Kind  | Shape                              | Summary                                                                                                                                                                                                                            |
 | ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -154,7 +154,7 @@ A `Shape` cell holds an interface's data members as bare names in braces, `?` ma
 | `CookieOptions`           | interface | `{ path?, domain?, maxAge?, httpOnly?, secure?, sameSite? }`                                                           | Represents the `Set-Cookie` attributes for `serializeCookie` (and any signed-cookie transport built over it).                                                                                                |
 | `AcceptEntry`             | interface | `{ value, q }`                                                                                                         | Represents one parsed entry of a weighted `Accept` / `Accept-Encoding` / `Accept-Language` header — a value and its quality weight, the element type `parseAcceptHeader` returns (sorted by `q` descending). |
 | `MediaMatch`              | interface | `{ q, rank }`                                                                                                          | Rates one candidate media type against a parsed `Accept` header — the quality and specificity `matchMediaType` reports for the best matching `AcceptEntry`.                                                  |
-| `Encoding`                | type      | `'gzip' \| 'deflate' \| 'identity'`                                                                                    | Represents a content-coding the substrate compresses / decompresses with. The listed codings are the `Content-Encoding` and `Accept-Encoding` token vocabulary the substrate understands.                    |
+| `Encoding`                | type      | `'gzip' \| 'deflate' \| 'identity'`                                                                                    | Represents a content-coding the substrate compresses or decompresses with. Its members are the `Content-Encoding` and `Accept-Encoding` token vocabulary the substrate understands.                          |
 | `FormatHandlerMap`        | type      | `Readonly<Record<string, (request: Request, context: MiddlewareContext<TState>) => Response \| Promise<Response>>>`    | Represents a map of media type → handler for `NegotiatorInterface.format` — the content-negotiation dispatch table.                                                                                          |
 | `NegotiatorInterface`     | interface | `{} plus negotiate, encoding, language, format`                                                                        | Represents content negotiation over the weighted `Accept` family — a reusable, cross-middleware machine (not itself a middleware).                                                                           |
 | `SSEMessage`              | interface | `{ data, event?, id?, retry? }`                                                                                        | Represents one Server-Sent Event to serialize to the wire.                                                                                                                                                   |
@@ -296,14 +296,14 @@ These invariants hold across `src/server` ↔ `server.md`.
    cut, so lower `drain` for a faster shutdown.
 6. **The built-in boundary is lifecycle machinery, not policy — one seam
    that spans setup and dispatch.** The `Server` wraps the whole per-request
-   lifecycle in nested phases of the same boundary. The innermost phase
-   covers only `buildRequest`: a malformed request (for example, an unparsable `Host`)
-   answers a plain `400`, with no `error` emit, no `report` call, and no
-   `response` emit, since nothing downstream ever ran and no parsed `Request`
-   exists yet to derive its facts from. The outer phase covers everything
-   after —
-   a throwing `this.#state(connection)` through the middleware/dispatcher
-   run — where a thrown `HTTPError` renders as its own status + message; any
+   lifecycle in an inner phase and an outer phase of the same boundary. The
+   inner phase covers only `buildRequest`: a malformed request (for example,
+   an unparsable `Host`) answers a plain `400`, with no `error` emit, no
+   `report` call, and no `response` emit, because nothing downstream ever ran
+   and no parsed `Request` exists yet to derive its facts from. The outer
+   phase covers everything after — a throwing `this.#state(connection)`
+   through the middleware/dispatcher run — where a thrown `HTTPError` renders
+   as its own status + message; any
    other throw renders `500` with its message hidden unless `expose` is set,
    `report` is invoked with the caught error plus the originating request's
    `{ method, url }` (its own throw swallowed so reporting can never crash
@@ -424,6 +424,10 @@ These invariants hold across `src/server` ↔ `server.md`.
 
 ### Quickstart: dispatcher, middleware, lifecycle
 
+`createServer` takes a dispatcher and a per-request state factory, `use`
+mounts middleware around the dispatch, and `start`, `stop`, and `destroy`
+run the lifecycle.
+
 ```ts
 import type { MiddlewareHandler } from '@orkestrel/server'
 import { createServer } from '@orkestrel/server'
@@ -431,6 +435,7 @@ import { createDispatcher } from '@orkestrel/router'
 
 interface State {
 	readonly requestId: string
+	readonly ip: string | undefined
 }
 
 const dispatcher = createDispatcher<State>()
@@ -444,7 +449,7 @@ const logRequestId: MiddlewareHandler<State> = async (_request, context, next) =
 
 const server = createServer<State>({
 	dispatcher,
-	state: () => ({ requestId: crypto.randomUUID() }),
+	state: (connection) => ({ requestId: crypto.randomUUID(), ip: connection.ip }),
 })
 server.use(logRequestId)
 const port = await server.start()
@@ -505,6 +510,10 @@ const withUser: MiddlewareHandler<State> = async (_request, context, next) => ne
 ```
 
 ### SSE route
+
+A route returns the stream's `response` at once and pumps events into the
+handle afterwards; a `write` that reports `false` is backpressure `drain`
+waits out.
 
 ```ts
 import type { StreamInterface } from '@orkestrel/server'
@@ -588,6 +597,9 @@ const port = await server.start(controller.signal)
 
 ### Upgrade attach
 
+An upgrade handler returns `true` to claim the socket, which ends the
+fan-out and leaves the connection with that handler.
+
 ```ts
 import { createServer } from '@orkestrel/server'
 import { createDispatcher } from '@orkestrel/router'
@@ -602,6 +614,9 @@ server.upgrade((_request, socket, _head) => {
 ```
 
 ### Substrate direct use — tokens, cookies, negotiation
+
+Each substrate helper stands on its own, so a caller reaches negotiation,
+signed cookies, tokens, and capped decompression without a `Server`.
 
 ```ts
 import type { MiddlewareContext } from '@orkestrel/server'
@@ -627,7 +642,7 @@ await negotiator.format(new Request('http://x'), context, {
 
 const headers = new Headers()
 await writeSignedCookie(headers, 'session', 'user-1', 'secret')
-const value = await readSignedCookie(
+await readSignedCookie(
 	new Request('http://x', { headers: { cookie: 'session=abc' } }),
 	'session',
 	'secret',

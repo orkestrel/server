@@ -93,7 +93,7 @@ export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-
  *
  * @remarks
  * The text-shaped application types worth compressing (JSON / JavaScript /
- * XML / SVG / WASM / a few document formats) — NOT already-compressed
+ * XML / SVG / WASM / a few document formats) — never already-compressed
  * binaries (`image/png`, `image/jpeg`, `video/*`, `application/zip`, a font's
  * `woff2`), which gzip/deflate would only bloat. The declared `ReadonlySet`
  * withholds `add` / `delete` / `clear` from the shared default, so a consumer

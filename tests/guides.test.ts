@@ -1,6 +1,6 @@
 // The consumer-side guides-parity drop-in: runs `@orkestrel/guide`'s checks against
 // this repo's own `guides/README.md` manifest. The constants that follow are this
-// package's own, and are the only part a sibling package changes.
+// package's own, as is the executed section that closes the file.
 
 import { describe, expect, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
@@ -274,6 +274,8 @@ for (const entry of manifest) {
 // the published specifier does not resolve inside this workspace.
 
 describe('guide fences', () => {
+	const guideText = requireValue(files[GUIDE_SPEC], `Missing file: ${GUIDE_SPEC}`)
+
 	it('the substrate fence negotiates the media type, coding, and language its comments claim', () => {
 		const negotiator = createNegotiator()
 		expect(
@@ -315,12 +317,13 @@ describe('guide fences', () => {
 	it('the Quickstart fence reaches listening and then stopped', async () => {
 		interface State {
 			readonly requestId: string
+			readonly ip: string | undefined
 		}
 		const dispatcher = createDispatcher<State>()
 		dispatcher.add({ method: 'GET', path: '/health', handler: () => new Response('ok') })
 		const server = createServer<State>({
 			dispatcher,
-			state: () => ({ requestId: crypto.randomUUID() }),
+			state: (connection) => ({ requestId: crypto.randomUUID(), ip: connection.ip }),
 		})
 		server.use(async (_request, context, next) => {
 			const response = await next()
@@ -336,5 +339,29 @@ describe('guide fences', () => {
 		} finally {
 			await server.destroy()
 		}
+	})
+
+	it('carries the fence lines the transcriptions copy', () => {
+		// The presence guards beside the transcriptions: they prove the transcribed
+		// lines are still the documented ones, and nothing about behavior. Binding the
+		// construction line alone would leave a comment free to claim the opposite
+		// value and stay green, so every line carrying a claim is bound.
+		expect(guideText).toContain(
+			"negotiator.negotiate('text/html, application/json;q=0.9', ['application/json', 'text/html']) // 'text/html'",
+		)
+		expect(guideText).toContain(
+			"negotiator.encoding('gzip;q=1.0, deflate;q=0.8', ['gzip', 'deflate']) // 'gzip'",
+		)
+		expect(guideText).toContain(
+			"negotiator.language('en-US, en;q=0.8, fr;q=0.5', ['en', 'fr']) // 'en'",
+		)
+		expect(guideText).toContain(
+			"await verifyToken('bad.token', 'secret') // undefined — total, never throws",
+		)
+		expect(guideText).toContain(
+			"const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)",
+		)
+		expect(guideText).toContain('const port = await server.start()')
+		expect(guideText).toContain('await server.stop()')
 	})
 })

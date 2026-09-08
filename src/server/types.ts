@@ -127,10 +127,10 @@ export type TokenSecret = string | readonly string[]
  * Options for `signToken` — how a stateless, HMAC-signed token is minted.
  *
  * @param secret - The {@link TokenSecret} to sign with; `signToken` always
- *   uses the FIRST secret (a single string, or the current head of a
+ *   uses the first secret (a single string, or the current head of a
  *   rotation list). An empty rotation list is a misconfiguration and throws.
  * @param ttl - An optional lifetime in milliseconds. When set, the expiry
- *   timestamp is bound INTO the signed payload (HMAC-covered, tamper-proof);
+ *   timestamp is bound into the signed payload (HMAC-covered, tamper-proof);
  *   `verifyToken` rejects the token once that instant has passed. Omitted ⇒
  *   the token never expires.
  */
@@ -145,14 +145,14 @@ export interface TokenOptions {
  *
  * @param path - The `Path` directive; defaults to `'/'`.
  * @param domain - The `Domain` directive; omitted ⇒ a host-only cookie.
- * @param maxAge - The `Max-Age` directive in SECONDS (the wire unit, not a
+ * @param maxAge - The `Max-Age` directive in seconds (the wire unit, not a
  *   millisecond `ttl`); `0` expires the cookie immediately.
  * @param httpOnly - The `HttpOnly` directive; defaults to `true`.
  * @param secure - The `Secure` directive: `true` forces it, `false`
  *   suppresses it, and omitted/`undefined` (the default) derives it from the
  *   connection through {@link import('./helpers.js').resolveSecure} — `Secure` on
  *   a TLS connection, off over plaintext HTTP ({@link
- *   Connection.encrypted}). A `sameSite: 'None'` cookie is ALWAYS
+ *   Connection.encrypted}). A `sameSite: 'None'` cookie is always
  *   `Secure` regardless (the spec requires it).
  * @param sameSite - The `SameSite` directive; defaults to `'Lax'`.
  */
@@ -173,7 +173,7 @@ export interface CookieOptions {
  * @remarks
  * `value` is the lower-cased token (`text/html`, `gzip`, `en-us`, or a
  * wildcard). `q` is the quality weight in `[0, 1]` (the `;q=` parameter,
- * default `1` when absent); a `;q=0` entry explicitly REJECTS that token — a
+ * default `1` when absent); a `;q=0` entry explicitly rejects that token — a
  * parser keeps it (so a caller can honor the rejection) rather than
  * dropping it.
  */
@@ -199,15 +199,15 @@ export interface MediaMatch {
 }
 
 /**
- * Represents a content-coding the substrate compresses / decompresses with. The listed
- * codings are the `Content-Encoding` and `Accept-Encoding` token vocabulary the substrate
- * understands.
+ * Represents a content-coding the substrate compresses or decompresses with. Its
+ * members are the `Content-Encoding` and `Accept-Encoding` token vocabulary the
+ * substrate understands.
  *
  * @remarks
  * `gzip` / `deflate` map to `CompressionStream` / `DecompressionStream`
  * (web-standard, no external codec); `identity` is the no-op "uncompressed"
  * coding. Brotli (`br`) has no `CompressionStream` implementation yet, so it
- * is deliberately OMITTED here — Brotli parity is the middleware package's
+ * is deliberately omitted here — Brotli parity is the middleware package's
  * node-entry decision, not this core's. A constrained set of external-spec
  * literals, so it stays a union, not a behavioral toggle.
  */
@@ -220,7 +220,7 @@ export type Encoding = 'gzip' | 'deflate' | 'identity'
  * @typeParam TState - The consumer's opaque per-request state type
  *
  * @remarks
- * Each key is a media type the route can PRODUCE (`application/json`,
+ * Each key is a media type the route can produce (`application/json`,
  * `text/html`, …) and each value the responder that returns that
  * representation as a `Response`. `format` negotiates the client's preferred
  * key from the request `Accept` header and invokes the matching handler, or
@@ -318,9 +318,9 @@ export interface NegotiatorInterface {
  *
  * @remarks
  * - `data` — the event payload (required). Serialized as one or more `data:`
- *   lines: the value is split on `\n` into a `data:` line PER segment, so it
+ *   lines: the value is split on `\n` into a `data:` line per segment, so it
  *   round-trips through a consumer's multi-`data` concat.
- * - `event` — the optional event TYPE, emitted as an `event:` line; omitted
+ * - `event` — the optional event type, emitted as an `event:` line; omitted
  *   ⇒ the consumer's default (`message`).
  * - `id` — the optional last-event-id, emitted as an `id:` line.
  * - `retry` — the optional reconnection time in milliseconds, emitted as a
@@ -328,9 +328,9 @@ export interface NegotiatorInterface {
  */
 export interface SSEMessage {
 	readonly data: string
-	/** Requires a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires a single-line value — an embedded newline would corrupt the SSE wire format. */
 	readonly event?: string
-	/** Requires a SINGLE-LINE value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires a single-line value — an embedded newline would corrupt the SSE wire format. */
 	readonly id?: string
 	readonly retry?: number
 }
@@ -341,7 +341,7 @@ export interface SSEMessage {
  *
  * @param status - The HTTP status the streaming response is opened with;
  *   defaults to `200`.
- * @param headers - Extra response headers merged OVER the SSE headers the
+ * @param headers - Extra response headers merged over the SSE headers the
  *   seam always sets ({@link SSE_HEADERS}); a caller repeating one of those
  *   keys replaces the seam's value, in any casing.
  */
@@ -364,7 +364,7 @@ export interface StreamOptions {
  * queue still has capacity; a producer that receives `false` parks on
  * `drain()` before writing again. `comment` writes a `: text` keep-alive line
  * (ignored by a conforming SSE parser — no spurious event); `end` closes the
- * stream. Every method is a SAFE NO-OP once `closed` is `true`, so a late
+ * stream. Every method is a safe no-op once `closed` is `true`, so a late
  * `write` never throws.
  *
  * The readiness signal is deliberately local: it reflects the
@@ -373,7 +373,7 @@ export interface StreamOptions {
  * the process-local socket sink is backpressured, so a cooperative producer
  * can bound its contribution to transport buffering without polling. A caller
  * that ignores the boolean keeps the prior unconditional-enqueue behavior.
- * The stream's default strategy measures queued CHUNKS, not their byte length,
+ * The stream's default strategy measures queued chunks, not their byte length,
  * so a producer seeking a byte bound must also bound each individual message.
  * Return `response` before awaiting a `false` write: the consumer cannot pull
  * until it receives the response.
@@ -424,19 +424,19 @@ export interface StreamInterface {
  * Represents the parsed outcome of an HTTP `Range` request header.
  *
  * @remarks
- * A `Range: bytes=start-end` against a known resource `size` resolves to ONE
+ * A `Range: bytes=start-end` against a known resource `size` resolves to one
  * of two shapes, discriminated by `satisfiable` (the axis is whether the
  * requested span overlaps the resource):
  *
  * - **`satisfiable: true`** — a concrete, clamped byte window `[start, end]`
- *   (INCLUSIVE, the HTTP wire convention), normalized from the header's
+ *   (inclusive, the HTTP wire convention), normalized from the header's
  *   open / suffix / closed forms against `size`.
  * - **`satisfiable: false`** — the range lies wholly outside the resource.
  *
- * `parseRange` returns `undefined` for an ABSENT / unparseable / multi-range
+ * `parseRange` returns `undefined` for an absent / unparseable / multi-range
  * / non-`bytes` header — the "no range, serve the whole resource" case — so
  * the three outcomes (full / partial / unsatisfiable) are distinguished
- * without a separate flag. It is TOTAL — a hostile header never throws.
+ * without a separate flag. It is total — a hostile header never throws.
  */
 export type RangeSpec =
 	| { readonly satisfiable: true; readonly start: number; readonly end: number }
@@ -449,14 +449,14 @@ export type RangeSpec =
  * @param limit - The maximum request body size in bytes; a larger body
  *   throws a {@link import('./errors.js').ContentTooLargeError} (413).
  *   Defaults to {@link DEFAULT_BODY_LIMIT}.
- * @param decompression - The maximum DECOMPRESSED body size in bytes (the
+ * @param decompression - The maximum decompressed body size in bytes (the
  *   zip-bomb cap) for a `Content-Encoding: gzip` / `deflate` request body. A
- *   highly-compressible payload small ON THE WIRE (under `limit`) can inflate
+ *   highly-compressible payload small on the wire (under `limit`) can inflate
  *   enormously, so a byte-counting `TransformStream` aborts the pipe the
  *   instant decompressed output would exceed this. Defaults to {@link
  *   import('./constants.js').DEFAULT_DECOMPRESSED_LIMIT} (16 MiB) —
- *   INDEPENDENT of `limit`, not aligned with it; a non-positive value means
- *   UNCAPPED decompressed output — use only when `limit` already bounds the
+ *   independent of `limit`, not aligned with it; a non-positive value means
+ *   uncapped decompressed output — use only when `limit` already bounds the
  *   compressed input.
  */
 export interface BodyOptions {
@@ -558,16 +558,16 @@ export interface ResponseRecord {
  *   failure.
  * - `stop` — `stop()` began (status moved to `'stopping'`). An upgrade
  *   handler that owns a long-lived socket closes it from here, so the drain
- *   below settles instead of running out the deadline.
+ *   settles instead of running out the deadline.
  * - `drain` — the graceful drain settled (deadline hit or all finished);
- *   carries the still-pending request count AND the still-attached upgraded
+ *   carries the still-pending request count and the still-attached upgraded
  *   socket count. Both `0` is a clean drain; either non-zero means the close
- *   that follows was FORCED and cut that work.
+ *   that follows was forced and cut that work.
  * - `response` — fired after the response has been sent, for every request
  *   that reaches the middleware pipeline (the success path and the
  *   outer-boundary error path); carries the method, parsed pathname, final
  *   status, and elapsed time in milliseconds. A request rejected at the
- *   `buildRequest` INNER boundary (a plain `400`, for example a malformed
+ *   `buildRequest` inner boundary (a plain `400`, for example a malformed
  *   `Host` header) emits no `response` — no parsed `Request` exists yet to derive
  *   its facts from.
  */
@@ -587,14 +587,14 @@ export type ServerEventMap = {
  *
  * @remarks
  * Fan-out semantics: handlers run in registration
- * order, the FIRST to return `true` CLAIMS (owns) the socket and stops the
- * fan-out; a handler that THROWS is treated as declined (the throw surfaces
- * on the `error` event) and the fan-out continues; if NONE claim it, the
+ * order, the first to return `true` claims (owns) the socket and stops the
+ * fan-out; a handler that throws is treated as declined (the throw surfaces
+ * on the `error` event) and the fan-out continues; if none claim it, the
  * socket is destroyed so an unhandled upgrade never leaks a dangling
  * connection. `request` / `socket` / `head` are node's own raw values, handed
  * over verbatim — no assertion at this boundary.
  *
- * A CLAIMED socket is TRACKED until it closes. The handler still owns it —
+ * A claimed socket is tracked until it closes. The handler still owns it —
  * the server only watches — but `stop()` now drains that socket like an
  * in-flight request and destroys it if the `drain` deadline expires first.
  * Node detaches an upgraded socket from its own connection set, so neither
@@ -607,7 +607,7 @@ export type ServerEventMap = {
  * @param request - The raw `node:http` upgrade request
  * @param socket - The raw, now-detached `Duplex` connection
  * @param head - The first packet of the upgraded stream, if any
- * @returns True if the handler CLAIMS the socket (this handler now owns
+ * @returns True if the handler claims the socket (this handler now owns
  *   it); false otherwise, declining so a later handler can try
  */
 export type UpgradeHandler = (request: IncomingMessage, socket: Duplex, head: Buffer) => boolean
@@ -714,7 +714,7 @@ export interface ServerOptions<TState> {
  * @remarks
  * `use` adds middleware and `upgrade` registers a protocol-upgrade claimant,
  * both configurable before or after `start()`. `start(signal?)` binds the
- * configured `host`/`port` (an omitted/`0` port ⇒ an EPHEMERAL port, resolved
+ * configured `host`/`port` (an omitted/`0` port ⇒ an ephemeral port, resolved
  * from the bound address), exposes that {@link AddressInfo} through `address`,
  * observes caller cancellation plus `timeouts.start` while binding, and resolves
  * the actually-bound port. A cancelled or expired bind closes its partial server

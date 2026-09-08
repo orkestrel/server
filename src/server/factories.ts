@@ -15,18 +15,10 @@ import { Stream } from './Stream.js'
  *
  * @returns A {@link NegotiatorInterface}
  *
- * @example Substrate direct use — tokens, cookies, negotiation
+ * @example
  * ```ts
- * import type { MiddlewareContext } from '@orkestrel/server'
- * import {
- * 	createNegotiator,
- * 	decodeTokenPayload,
- * 	decompressRequestBody,
- * 	readSignedCookie,
- * 	signToken,
- * 	verifyToken,
- * 	writeSignedCookie,
- * } from '@orkestrel/server'
+ * import type { MiddlewareContext } from '@src/server'
+ * import { createNegotiator } from '@src/server'
  *
  * declare const context: MiddlewareContext<Record<string, never>>
  *
@@ -37,26 +29,6 @@ import { Stream } from './Stream.js'
  * await negotiator.format(new Request('http://x'), context, {
  * 	'application/json': (_request, _context) => Response.json({ ok: true }),
  * })
- *
- * const headers = new Headers()
- * await writeSignedCookie(headers, 'session', 'user-1', 'secret')
- * const value = await readSignedCookie(
- * 	new Request('http://x', { headers: { cookie: 'session=abc' } }),
- * 	'session',
- * 	'secret',
- * )
- * await verifyToken('bad.token', 'secret') // undefined — total, never throws
- *
- * const token = await signToken('client', { secret: 'shh' })
- * decodeTokenPayload(token.split('.')[0]) // 'client' — the shared decode step verifyToken applies after a signature match
- *
- * const gzipped = new Uint8Array(
- * 	await new Response(
- * 		new Blob(['hi']).stream().pipeThrough(new CompressionStream('gzip')),
- * 	).arrayBuffer(),
- * )
- * const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)
- * new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb defense
  * ```
  */
 export function createNegotiator(): NegotiatorInterface {
@@ -71,20 +43,34 @@ export function createNegotiator(): NegotiatorInterface {
  * @param options - {@link ServerOptions}
  * @returns A {@link ServerInterface}, not yet started
  *
- * @example
+ * @example Quickstart: dispatcher, middleware, lifecycle
  * ```ts
- * import { createServer } from '@src/server'
+ * import type { MiddlewareHandler } from '@orkestrel/server'
+ * import { createServer } from '@orkestrel/server'
  * import { createDispatcher } from '@orkestrel/router'
  *
- * const dispatcher = createDispatcher<{ readonly ip?: string }>()
+ * interface State {
+ * 	readonly requestId: string
+ * 	readonly ip: string | undefined
+ * }
+ *
+ * const dispatcher = createDispatcher<State>()
  * dispatcher.add({ method: 'GET', path: '/health', handler: () => new Response('ok') })
  *
- * const server = createServer({
+ * const logRequestId: MiddlewareHandler<State> = async (_request, context, next) => {
+ * 	const response = await next()
+ * 	response.headers.set('X-Request-ID', context.state.requestId)
+ * 	return response
+ * }
+ *
+ * const server = createServer<State>({
  * 	dispatcher,
- * 	state: (connection) => ({ ip: connection.ip }),
+ * 	state: (connection) => ({ requestId: crypto.randomUUID(), ip: connection.ip }),
  * })
+ * server.use(logRequestId)
  * const port = await server.start()
  * await server.stop()
+ * await server.destroy()
  * ```
  */
 export function createServer<TState>(options: ServerOptions<TState>): ServerInterface<TState> {

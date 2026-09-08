@@ -178,7 +178,7 @@ export interface HeldUpgradeInterface {
 }
 
 /**
- * Completes a real protocol upgrade and KEEPS the socket open — the long-lived
+ * Completes a real protocol upgrade and keeps the socket open — the long-lived
  * connection a WebSocket peer holds, for the tests that ask what `stop()` does
  * while one is attached.
  *
@@ -229,7 +229,7 @@ export async function holdUpgrade(port: number, path = '/'): Promise<HeldUpgrade
  * Drives a raw `node:http` protocol-upgrade request against a running server —
  * the real-socket probe the server face's upgrade-seam tests use (no
  * mocks). Resolves after the outcome is known: a `101` upgrade response means a
- * registered handler CLAIMED the socket, and an ordinary HTTP response or a
+ * registered handler claimed the socket, and an ordinary HTTP response or a
  * connection error from a destroyed socket means none did.
  *
  * @param base - The server's base URL (`http://127.0.0.1:PORT`)
