@@ -14,7 +14,16 @@ import type {
 import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
-import { isRecord, isString, parseJSON } from '@orkestrel/contract'
+import {
+	isError,
+	isFiniteNumber,
+	isInstance,
+	isInteger,
+	isNumber,
+	isRecord,
+	isString,
+	parseJSON,
+} from '@orkestrel/contract'
 import {
 	COMPRESSIBLE_TYPES,
 	DEFAULT_BODY_LIMIT,
@@ -509,9 +518,8 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
  * Decodes the payload with `@orkestrel/codec`'s `decodeBase64URL` (total — a
  * non-canonical base64url segment answers `undefined` rather than throwing),
  * reads it as UTF-8 JSON, narrows it to a record with a string `value` without
- * `as`, and rejects an expired `exp`. Total — any
- * decode/shape/expiry failure yields `undefined`; only `JSON.parse` still
- * throws, and its `catch` answers `undefined` too.
+ * `as`, and rejects an expired `exp`. Total — any decode/shape/expiry failure
+ * yields `undefined`, including invalid JSON (`parseJSON` answers `undefined`).
  *
  * @param encoded - The base64url-encoded payload segment (before the last `.`)
  * @returns The embedded value when the payload is well-shaped + unexpired, else `undefined`
@@ -519,16 +527,12 @@ export async function verifyToken(token: string, secret: TokenSecret): Promise<s
 export function decodeTokenPayload(encoded: string): string | undefined {
 	const bytes = decodeBase64URL(encoded)
 	if (bytes === undefined) return undefined
-	try {
-		const payload: unknown = JSON.parse(new TextDecoder().decode(bytes))
-		if (!isRecord(payload)) return undefined
-		if (typeof payload.value !== 'string') return undefined
-		if (payload.exp !== undefined && typeof payload.exp !== 'number') return undefined
-		if (payload.exp !== undefined && Date.now() >= payload.exp) return undefined
-		return payload.value
-	} catch {
-		return undefined
-	}
+	const payload = parseJSON(new TextDecoder().decode(bytes))
+	if (!isRecord(payload)) return undefined
+	if (!isString(payload.value)) return undefined
+	if (payload.exp !== undefined && !isNumber(payload.exp)) return undefined
+	if (payload.exp !== undefined && Date.now() >= payload.exp) return undefined
+	return payload.value
 }
 
 /**
@@ -550,7 +554,7 @@ export function decodeTokenPayload(encoded: string): string | undefined {
  * ```
  */
 export function normalizeSecret(secret: TokenSecret): readonly string[] {
-	const list = typeof secret === 'string' ? [secret] : [...secret]
+	const list = isString(secret) ? [secret] : [...secret]
 	return list.filter((entry) => entry.trim().length > 0)
 }
 
@@ -594,7 +598,7 @@ export function parseAcceptHeader(header: string): readonly AcceptEntry[] {
 			const match = /;\s*q=(-?[0-9.]+)/i.exec(trimmed.slice(semicolon))
 			if (match !== null) {
 				const parsed = Number(match[1])
-				if (Number.isFinite(parsed)) q = Math.min(1, Math.max(0, parsed))
+				if (isFiniteNumber(parsed)) q = Math.min(1, Math.max(0, parsed))
 			}
 		}
 		entries.push({ value, q })
@@ -945,17 +949,17 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	const endText = spec.slice(dash + 1).trim()
 	if (startText === '') {
 		const suffix = Number(endText)
-		if (endText === '' || !Number.isInteger(suffix) || suffix <= 0) return undefined
+		if (endText === '' || !isInteger(suffix) || suffix <= 0) return undefined
 		if (size === 0) return { satisfiable: false }
 		const start = Math.max(0, size - suffix)
 		return { satisfiable: true, start, end: size - 1 }
 	}
 	const start = Number(startText)
-	if (!Number.isInteger(start) || start < 0) return undefined
+	if (!isInteger(start) || start < 0) return undefined
 	if (start >= size) return { satisfiable: false }
 	if (endText === '') return { satisfiable: true, start, end: size - 1 }
 	const end = Number(endText)
-	if (!Number.isInteger(end) || end < start) return undefined
+	if (!isInteger(end) || end < start) return undefined
 	return { satisfiable: true, start, end: Math.min(end, size - 1) }
 }
 
@@ -1382,7 +1386,7 @@ export async function decompressRequestBody(
 			size += value.byteLength
 		}
 	} catch (error) {
-		if (error instanceof ContentTooLargeError) throw error
+		if (isInstance(error, ContentTooLargeError)) throw error
 		throw new HTTPError(400, 'malformed compressed request body')
 	}
 	const merged = new Uint8Array(size)
@@ -1525,8 +1529,7 @@ export async function discoverPort(preferred?: number): Promise<number> {
 	try {
 		return await probePort(preferred)
 	} catch (error) {
-		if (error instanceof Error && 'code' in error && error.code === 'EADDRINUSE')
-			return probePort(0)
+		if (isError(error) && 'code' in error && error.code === 'EADDRINUSE') return probePort(0)
 		throw error
 	}
 }

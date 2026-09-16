@@ -27,7 +27,7 @@
 // carries no cross-copy brand.
 
 import type { ServerErrorCode } from './types.js'
-import { isNumber, isString } from '@orkestrel/contract'
+import { isInstance, isNumber, isObject, isString } from '@orkestrel/contract'
 import { HTTP_ERROR_BRAND } from './constants.js'
 
 /**
@@ -130,8 +130,8 @@ export class ContentTooLargeError extends HTTPError {
  * ```
  */
 export function isHTTPError(value: unknown): value is HTTPError {
-	if (value instanceof HTTPError) return true
-	if (typeof value !== 'object' || value === null) return false
+	if (isInstance(value, HTTPError)) return true
+	if (!isObject(value)) return false
 	if (!(HTTP_ERROR_BRAND in value) || value[HTTP_ERROR_BRAND] !== true) return false
 	if (!('status' in value) || !('message' in value)) return false
 	return isNumber(value.status) && isString(value.message)
@@ -202,5 +202,5 @@ export class ServerError extends Error {
  * ```
  */
 export function isServerError(value: unknown): value is ServerError {
-	return value instanceof ServerError
+	return isInstance(value, ServerError)
 }

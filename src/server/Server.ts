@@ -22,7 +22,7 @@ import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
+import { isError, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
 import { compose, readBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
@@ -351,7 +351,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	// any other throw renders `500` with its message hidden unless `expose`.
 	#boundary(error: unknown): Response {
 		if (isHTTPError(error)) return new Response(error.message, { status: error.status })
-		const message = this.#expose && error instanceof Error ? error.message : 'Internal Server Error'
+		const message = this.#expose && isError(error) ? error.message : 'Internal Server Error'
 		return new Response(message, { status: 500 })
 	}
 
