@@ -6,6 +6,7 @@ import type { ConnectionStateFunction, ServerInterface, ServerOptions } from '@s
 import { once } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
+import { finished as streamFinished } from 'node:stream/promises'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, createStream, HTTPError, isServerError } from '@src/server'
@@ -621,14 +622,14 @@ describe('Server — graceful drain', () => {
 	})
 })
 
-describe('Server — stop ends the connections no request holds', () => {
+describe('Server — a clean stop ends the connections no request reached', () => {
 	it('closes a connection that never sent a request, well inside the drain deadline', async () => {
 		const server = track(
 			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 10_000 }),
 		)
 		const port = await server.start()
 		// What a client leaves behind after it aborts a fetch: a connection that sends nothing.
-		// node counts it as neither idle nor active, so only an explicit close ends it.
+		// Node does not count it as idle, so `closeIdleConnections()` leaves it open.
 		const silent = net.createConnection({ port, host: '127.0.0.1' })
 		try {
 			await once(silent, 'connect')
@@ -663,17 +664,26 @@ describe('Server — stop ends the connections no request holds', () => {
 				return new Response('done')
 			},
 		})
+		const order: string[] = []
 		const drained = createRecorder<readonly [number, number]>()
 		const server = track(
 			createServer({
 				dispatcher,
 				state: () => undefined,
 				drain: 10_000,
-				on: { drain: drained.handler },
+				on: {
+					drain: drained.handler,
+					response: () => {
+						order.push('response')
+					},
+				},
 			}),
 		)
 		const port = await server.start()
 		const silent = net.createConnection({ port, host: '127.0.0.1' })
+		silent.once('close', () => {
+			order.push('silent')
+		})
 		try {
 			await once(silent, 'connect')
 			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
@@ -686,6 +696,7 @@ describe('Server — stop ends the connections no request holds', () => {
 			await waitForSocketClose(silent, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(order).toEqual(['response', 'silent'])
 			// The drain settled with nothing pending, so the close that followed cut no request.
 			expect(drained.calls).toEqual([[0, 0]])
 		} finally {
@@ -693,9 +704,11 @@ describe('Server — stop ends the connections no request holds', () => {
 		}
 	})
 
-	it('serves a request a kept-alive connection sends during the drain, then closes that idle connection', async () => {
+	it('counts a request a kept-alive connection sends during the drain, then closes that idle connection', async () => {
 		const arrived = Promise.withResolvers<void>()
 		const release = Promise.withResolvers<void>()
+		const late = Promise.withResolvers<void>()
+		const lateRelease = Promise.withResolvers<void>()
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
 		dispatcher.add({
@@ -710,7 +723,11 @@ describe('Server — stop ends the connections no request holds', () => {
 		dispatcher.add({
 			method: 'GET',
 			path: '/signal',
-			handler: (request) => new Response(`aborted=${String(request.signal.aborted)}`),
+			handler: async (request) => {
+				late.resolve()
+				await lateRelease.promise
+				return new Response(`aborted=${String(request.signal.aborted)}`)
+			},
 		})
 		const drained = createRecorder<readonly [number, number]>()
 		const server = track(
@@ -737,18 +754,111 @@ describe('Server — stop ends the connections no request holds', () => {
 			const started = performance.now()
 			const stopping = server.stop()
 			kept.write('GET /signal HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+			await late.promise
+			release.resolve()
+			expect(await (await inflight).text()).toBe('done')
+			// `/slow` has finished and the late request is still parked, so only its count holds the
+			// drain open: an uncounted request would have let the drain settle before this reply arrived.
+			expect(drained.count).toBe(0)
+			expect(server.status).toBe('stopping')
+			lateRelease.resolve()
 			// The stopping state serves it as in-flight work whose stop signal has already fired.
 			await waitForCondition('the kept-alive reply during the drain', () =>
 				received.includes('aborted=true'),
 			)
-			release.resolve()
-			expect(await (await inflight).text()).toBe('done')
 			await waitForSocketClose(kept, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
 			expect(drained.calls).toEqual([[0, 0]])
 		} finally {
 			kept.destroy()
+		}
+	})
+
+	it('destroys a connection whose header block has not fully arrived, because no request reached the server', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const partial = net.createConnection({ port, host: '127.0.0.1' })
+		try {
+			await once(partial, 'connect')
+			partial.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n')
+			// A later connection's round trip spans several event-loop turns, so the server has read
+			// the partial header block it was sent first before `stop()` runs.
+			const reply = await rawRequest(
+				port,
+				'GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n',
+			)
+			expect(reply).toContain('pong')
+			const started = performance.now()
+			const stopping = server.stop()
+			await waitForSocketClose(partial, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			// A request whose headers never completed is not counted work, so the drain saw none.
+			expect(drained.calls).toEqual([[0, 0]])
+		} finally {
+			partial.destroy()
+		}
+	})
+
+	it('keeps a connection whose handler answered 413 while its body still uploads', async () => {
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'POST',
+			path: '/upload',
+			handler: () => new Response('too large', { status: 413 }),
+		})
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher,
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		// The rest of the body outsizes the client's socket send buffer, so writing it completes only
+		// while the server keeps reading the connection; a destroyed peer resets it instead.
+		const first = 64 * 1024
+		const total = 64 * 1024 * 1024
+		const request = `POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		const failures = createRecorder<readonly [unknown]>()
+		upload.on('error', failures.handler)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write(request)
+			upload.write(Buffer.alloc(first))
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			expect(received).toMatch(/^HTTP\/1\.1 413 /)
+			const stopping = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			expect(drained.calls).toEqual([[0, 0]])
+			// The connection the 413 answered stays open, so it holds `stop()` until it closes.
+			expect(server.status).toBe('stopping')
+			upload.end(Buffer.alloc(total - first))
+			await streamFinished(upload, { readable: false })
+			// Every body byte left the client, which a reset or an early close from the server prevents.
+			expect(upload.bytesWritten).toBe(Buffer.byteLength(request) + total)
+			await waitForSocketClose(upload, { budget: 1_000 })
+			await stopping
+			expect(failures.count).toBe(0)
+			expect(server.status).toBe('stopped')
+		} finally {
+			upload.destroy()
 		}
 	})
 })

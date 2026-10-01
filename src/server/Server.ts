@@ -1,5 +1,5 @@
 import type { IncomingMessage, Server as NodeHTTPServer, ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { AbortInterface } from '@orkestrel/abort'
 import type { TimeoutInterface } from '@orkestrel/timeout'
@@ -48,9 +48,11 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   observe cancellation (a request that arrives during the drain is served
  *   with that signal already aborted), drains in-flight requests and
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
- *   busy-loop), then closes → `stopped`, destroying every socket still open:
- *   after a clean drain none carries a request, and after an expired one the
- *   deadline cuts what remains. `destroy()` is the idempotent final teardown.
+ *   busy-loop), then closes → `stopped`. After a clean drain the close ends
+ *   the idle keep-alive connections and destroys every connection Node has
+ *   read no request from; a connection whose request reached the server stays
+ *   open until it closes. After an expired drain the close destroys every
+ *   socket. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
  *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
@@ -89,6 +91,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #middleware: Array<MiddlewareHandler<TState>>
 	readonly #upgradeHandlers: UpgradeHandler[] = []
 	readonly #upgraded = new Set<Duplex>()
+	readonly #unused = new Set<Socket>()
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
 	readonly #configuredPort: number | undefined
@@ -217,6 +220,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		// no manual removal needed (the same per-run lifecycle as the request
 		// handler `createHTTPServer` takes).
 		server.on('upgrade', (request, socket, head) => this.#onUpgrade(request, socket, head))
+		server.on('connection', (socket) => this.#trackConnection(socket))
 		this.#http = server
 		return this.#listen(server, signal)
 	}
@@ -238,7 +242,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		const pending = this.#pending
 		const upgraded = this.#upgraded.size
 		this.#emitter.emit('drain', pending, upgraded)
-		if (server !== undefined) await this.#close(server)
+		if (server !== undefined) await this.#close(server, pending + upgraded > 0)
 		this.#http = undefined
 		this.#port = undefined
 		this.#status = 'stopped'
@@ -251,7 +255,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 		if (!this.#abort.aborted) this.#abort.abort()
 		const server = this.#http
-		if (server !== undefined) await this.#close(server)
+		if (server !== undefined) await this.#close(server, true)
 		this.#http = undefined
 		this.#port = undefined
 		this.#status = 'stopped'
@@ -266,6 +270,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		const finish = this.#trackStart()
 		response.once('finish', finish)
 		response.once('close', finish)
+		this.#unused.delete(message.socket)
 		void this.#accept(message, response)
 	}
 
@@ -423,7 +428,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			server.on('error', () => undefined)
 			binding.abort(error)
 			if (listening !== undefined) await listening.catch(() => undefined)
-			await this.#close(server)
+			await this.#close(server, true)
 			this.#http = undefined
 			this.#port = undefined
 			this.#status = 'idle'
@@ -453,25 +458,41 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 	}
 
-	// Close the underlying server and destroy every socket it still holds,
-	// resolving once the listener is closed. Every caller has already let its
-	// work finish or given up on it: `stop()` arrives here after the drain,
-	// with no I/O turn in between, so after a clean drain no socket carries a
-	// request, and `destroy` and a failed bind keep nothing. Destroying all of
-	// them, not only the idle ones, is what ends a connection that never sent
-	// a request: node counts it as neither idle nor active, so
-	// `closeIdleConnections()` leaves it holding `close()` open until the peer
-	// drops it.
+	// Close the underlying server, resolving after the listener closes, which
+	// Node does only after every connection has closed. A clean close (the
+	// drain settled) ends the idle keep-alive connections and destroys every
+	// connection Node has read no request from: Node does not count a
+	// never-used connection as idle, so `closeIdleConnections()` alone leaves
+	// it holding `close()` open until the peer drops it. A connection whose
+	// request reached the server stays open, because destroying one whose body
+	// still uploads after its response can reset the connection and lose that
+	// response. No I/O callback runs between the drain's settle and this call,
+	// so every request Node read before it was counted. A forced close (the
+	// drain deadline expired, `destroy`, or a failed bind) destroys every
+	// socket.
 	//
-	// A protocol-upgraded socket needs the extra loop: node detaches it from
+	// A protocol-upgraded socket needs the extra loop: Node detaches it from
 	// the connection set `closeAllConnections()` walks, so that call never
-	// reaches it while `server.close()` still waits on it.
-	#close(server: NodeHTTPServer): Promise<void> {
+	// reaches it while `server.close()` still waits on it. A clean drain leaves
+	// no claimed socket open.
+	#close(server: NodeHTTPServer, force: boolean): Promise<void> {
 		return new Promise<void>((resolve) => {
 			server.close(() => resolve())
-			server.closeAllConnections()
-			for (const socket of this.#upgraded) socket.destroy()
+			if (force) {
+				server.closeAllConnections()
+				for (const socket of this.#upgraded) socket.destroy()
+			} else {
+				server.closeIdleConnections()
+				for (const socket of this.#unused) socket.destroy()
+			}
 		})
+	}
+
+	// Watch a connection until Node reads its first request from it or it
+	// closes, so a clean close can find the connections no request reached.
+	#trackConnection(socket: Socket): void {
+		this.#unused.add(socket)
+		socket.once('close', () => this.#unused.delete(socket))
 	}
 
 	// Everything `stop()` has to drain: in-flight requests plus the upgraded
