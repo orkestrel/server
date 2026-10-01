@@ -51,12 +51,14 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
  *   busy-loop), then closes → `stopped`. After a clean drain the close
  *   destroys every connection that carries no open request exchange, and a
- *   connection that still carries one ends when its last exchange completes.
+ *   connection that still carries one ends when its last exchange completes
+ *   or the same `drain` deadline expires, whichever comes first.
  *   A request or an upgrade that such a connection sends after the listener
  *   closes is refused: its connection is destroyed before the request is
  *   counted or a handler sees it, so the `stop()` call waits only on work
  *   counted before the close. After an expired drain the close destroys every
- *   socket. `destroy()` is the idempotent final teardown.
+ *   socket. A `stop()` call made while a stop runs returns that stop's
+ *   promise. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
  *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
@@ -120,6 +122,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	#status: ServerStatus = 'idle'
 	#port: number | undefined
 	#pending = 0
+	#stopping: Promise<void> | undefined
 
 	constructor(options: ServerOptions<TState>) {
 		if (!isFunction(options.state)) throw new TypeError('ServerOptions.state must be a function')
@@ -229,27 +232,15 @@ export class Server<TState> implements ServerInterface<TState> {
 		return this.#listen(server, signal)
 	}
 
-	async stop(): Promise<void> {
-		if (this.#status !== 'listening') return
-		this.#status = 'stopping'
-		this.#emitter.emit('stop')
-		const server = this.#http
-		// A pure signal — not the drain deadline's parent (a parent abort would
-		// clear the Timeout so it never fires). The drain deadline is an
-		// independent clock; the wake-park inside `#drainPending` resolves on the
-		// last finish or the deadline, event-driven, never a busy-loop.
-		this.#abort.abort()
-		const deadline: TimeoutInterface = createTimeout({ ms: this.#drain })
-		deadline.start()
-		await this.#drainPending(deadline.signal)
-		deadline.clear()
-		const pending = this.#pending
-		const upgraded = this.#upgraded.size
-		this.#emitter.emit('drain', pending, upgraded)
-		if (server !== undefined) await this.#close(server, pending + upgraded > 0)
-		this.#http = undefined
-		this.#port = undefined
-		this.#status = 'stopped'
+	// A call during a stop returns the stop in flight, so every caller resolves
+	// after the same close; the field is released only by the stop that set it.
+	stop(): Promise<void> {
+		if (this.#status !== 'listening') return this.#stopping ?? Promise.resolve()
+		const stopping = this.#stopGracefully().finally(() => {
+			if (this.#stopping === stopping) this.#stopping = undefined
+		})
+		this.#stopping = stopping
+		return stopping
 	}
 
 	async destroy(): Promise<void> {
@@ -264,6 +255,39 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#port = undefined
 		this.#status = 'stopped'
 		this.#emitter.destroy()
+	}
+
+	// One `drain` deadline bounds the whole stop: it bounds the drain, then
+	// stays armed through the clean close's wait on open exchanges, and its
+	// expiry cuts what is still held as an expired drain does. It is a pure
+	// clock rather than the stop signal's child, because a parent abort clears
+	// a `Timeout` instead of expiring it.
+	async #stopGracefully(): Promise<void> {
+		this.#status = 'stopping'
+		this.#emitter.emit('stop')
+		const server = this.#http
+		this.#abort.abort()
+		const deadline: TimeoutInterface = createTimeout({ ms: this.#drain })
+		deadline.start()
+		try {
+			await this.#drainPending(deadline.signal)
+			const pending = this.#pending
+			const upgraded = this.#upgraded.size
+			this.#emitter.emit('drain', pending, upgraded)
+			if (server !== undefined) {
+				const relay = addAbortListener(deadline.signal, () => this.#cut(server))
+				try {
+					await this.#close(server, pending + upgraded > 0)
+				} finally {
+					relay[Symbol.dispose]()
+				}
+			}
+		} finally {
+			deadline.clear()
+		}
+		this.#http = undefined
+		this.#port = undefined
+		this.#status = 'stopped'
 	}
 
 	// Track the request for draining first — before anything that can throw —
@@ -377,8 +401,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	// throwing handler is treated as declined — surfaced on `error` — and the
 	// fan-out continues so a later handler can still claim. Unclaimed ⇒ the
 	// socket is destroyed so an unhandled upgrade never leaks a connection.
-	// An upgrade parsed after the close is refused the way `#handle` refuses a
-	// request: its socket is destroyed before any handler sees it.
+	// An upgrade parsed after the close is refused the way the `#handle` method
+	// refuses a request: its socket is destroyed before any handler sees it.
 	#onUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
 		if (this.#closed) {
 			socket.destroy()
@@ -482,24 +506,23 @@ export class Server<TState> implements ServerInterface<TState> {
 	// ends, which `server.close()` also calls itself. A connection with an open
 	// exchange, such as one whose body still uploads after its response, stays
 	// open, because destroying it can reset the connection and lose that
-	// response; `#trackExchange` ends it when its count returns to zero. A
-	// forced close (the drain deadline expired, `destroy`, or a failed bind)
-	// destroys every socket.
-	//
-	// A protocol-upgraded socket needs the extra loop: Node detaches it from
-	// the connection set `closeAllConnections()` walks, so that call never
-	// reaches it while `server.close()` still waits on it. A clean drain leaves
-	// no claimed socket open.
+	// response; the `#trackExchange` method ends it when its count returns to
+	// zero, and the stop's deadline cuts it if that comes first. A forced close
+	// (the drain deadline expired, `destroy`, or a failed bind) cuts at once.
 	#close(server: NodeHTTPServer, force: boolean): Promise<void> {
 		return new Promise<void>((resolve) => {
 			server.close(() => resolve())
-			if (force) {
-				server.closeAllConnections()
-				for (const socket of this.#upgraded) socket.destroy()
-			} else {
-				for (const [socket, open] of this.#exchanges) if (open === 0) socket.destroy()
-			}
+			if (force) this.#cut(server)
+			else for (const [socket, open] of this.#exchanges) if (open === 0) socket.destroy()
 		})
+	}
+
+	// Destroy every socket. A protocol-upgraded socket needs the extra loop:
+	// Node detaches it from the connection set `closeAllConnections()` walks,
+	// so that call never reaches it while `server.close()` still waits on it.
+	#cut(server: NodeHTTPServer): void {
+		server.closeAllConnections()
+		for (const socket of this.#upgraded) socket.destroy()
 	}
 
 	// Count a connection's open exchanges from its accept to its close, so a
@@ -512,12 +535,12 @@ export class Server<TState> implements ServerInterface<TState> {
 	// Count one exchange open on its connection until both its request message
 	// has ended or closed and its response has finished or closed; a count, not
 	// a flag, because a pipelining client holds several at once. While a clean
-	// close waits, the connection ends as its count returns to zero. An upload
-	// whose response already finished holds `stop()` until its body ends or
-	// Node's keep-alive socket timeout fires, and with `timeouts.keepalive: 0`
-	// a stalled upload holds it with no bound. The `error` listeners `finished`
-	// attaches stay after it settles, so a later `error` on the message or the
-	// response raises no uncaught exception.
+	// close waits, the connection ends as its count returns to zero. Each body
+	// byte restarts Node's keep-alive socket timer, so no Node timeout bounds an
+	// upload that keeps sending after its response; the stop's deadline does.
+	// The `error` listeners that the `finished` helper attaches stay after it
+	// settles, so a later `error` event on the message or the response raises
+	// no uncaught exception.
 	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)

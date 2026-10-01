@@ -643,9 +643,10 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   `EADDRINUSE` — no silent ephemeral fallback (use `discoverPort` to pick a
  *   guaranteed-free port up front).
  * @param drain - The graceful-stop deadline in milliseconds: on `stop()` the
- *   server stops accepting new connections and gives in-flight requests and
- *   claimed upgraded sockets this long to finish before forcing every
- *   remaining socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be a
+ *   server stops accepting new connections and gives in-flight requests,
+ *   claimed upgraded sockets, and connections that still carry an open
+ *   request exchange this long to finish before forcing every remaining
+ *   socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be a
  *   non-negative finite number. A long-lived upgraded socket that nothing
  *   closes therefore costs `stop()` this whole budget, so a WebSocket
  *   handler closes its sockets on the `stop` event to settle sooner.
@@ -721,8 +722,8 @@ export interface ServerOptions<TState> {
  * and resets to `idle`. `stop()` fires the stop signal so in-flight handlers
  * can observe it, drains in-flight requests and claimed upgraded sockets up to
  * the configured deadline, then closes the listener and ends each connection
- * when no request exchange is open on it; after an expired drain it destroys
- * every socket. `destroy()` is the final idempotent teardown. Per request: a `Request` is
+ * when no request exchange is open on it; when that same deadline expires it
+ * destroys every socket still open. `destroy()` is the final idempotent teardown. Per request: a `Request` is
  * built through the router's `buildRequest` (its signal linked to the server's
  * stop signal), the composed middleware onion runs terminating in
  * `dispatcher.handle`, and the result is written back through
@@ -784,10 +785,10 @@ export interface ServerInterface<TState> {
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**
-	 * Stops gracefully: fires the stop signal, drains in-flight requests and claimed upgraded
-	 * sockets up to the `drain` deadline, then closes the listener; after a clean drain it ends
-	 * each connection when no request exchange is open on it, and after an expired drain it
-	 * destroys every socket.
+	 * Stops gracefully within the `drain` deadline: fires the stop signal, drains in-flight
+	 * requests and claimed upgraded sockets, then closes the listener; after a clean drain it
+	 * ends each connection when no request exchange is open on it, and when the deadline
+	 * expires it destroys every socket still open.
 	 *
 	 * @remarks
 	 * Drainable work is every in-flight request plus every upgraded socket a
@@ -808,17 +809,25 @@ export interface ServerInterface<TState> {
 	 * counted work. A connection that still carries an open exchange, including
 	 * one whose handler answered while its body still uploads, ends when its
 	 * last exchange completes, and the `stop()` call resolves after that
-	 * connection closes. Such an upload holds the `stop()` call until its body
-	 * ends or Node's keep-alive socket timeout fires; with the
-	 * `timeouts.keepalive` option set to 0, a stalled upload holds it with no
-	 * bound. A request Node answers itself, such as the `417` response to an
-	 * unknown `Expect` value, never reaches the handler and opens no exchange.
-	 * When either count is still non-zero, the close destroys every socket,
-	 * including the claimed upgraded ones Node's own force-close cannot reach,
-	 * so the `stop()` call always resolves after an expired drain. The `drain`
-	 * counts say whether anything was cut.
+	 * connection closes. Each body byte restarts Node's keep-alive socket
+	 * timer, so no Node timeout bounds an upload that keeps sending. The
+	 * deadline that bounds the drain therefore stays armed through this wait:
+	 * when it expires before the listener closes, the server destroys every
+	 * socket still open, as an expired drain does, so no connection holds the
+	 * `stop()` call past the `drain` deadline. A request Node
+	 * answers itself, such as the `417` response to an unknown `Expect` value,
+	 * never reaches the handler and opens no exchange. When either count is
+	 * still non-zero, the close destroys every socket at once, including the
+	 * claimed upgraded ones Node's own force-close cannot reach. The `drain`
+	 * counts say whether a request or a claimed socket was cut. A cut during
+	 * the clean close's wait emits no event: every response had finished at
+	 * the clean drain, so that cut ends only the unread part of an upload the
+	 * handler had already answered. A `stop()` call made while a stop runs
+	 * returns that stop's promise.
 	 *
-	 * @returns Resolves after the listener is closed and the status is `'stopped'`
+	 * @returns Resolves after the listener is closed and the status is
+	 *   `'stopped'`; a call from `'idle'`, `'starting'`, or `'stopped'` while
+	 *   no stop runs resolves at once and changes nothing
 	 */
 	stop(): Promise<void>
 	/**

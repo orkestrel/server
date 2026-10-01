@@ -351,11 +351,28 @@ describe('Server — restart + idempotent lifecycle', () => {
 		expect(await response.text()).toBe('ok')
 	})
 
-	it('stop() before start() is a safe no-op', async () => {
+	it('stop() before start() is a safe no-op that resolves at once', async () => {
 		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
 		expect(server.status).toBe('idle')
-		await expect(server.stop()).resolves.toBeUndefined()
+		let settled = false
+		const stopping = server.stop().then(() => {
+			settled = true
+		})
+		// One host timer runs no I/O for an idle server, so only an already-settled stop finishes here.
+		await waitForDelay(0)
+		expect(settled).toBe(true)
+		await stopping
 		expect(server.status).toBe('idle')
+	})
+
+	it('stop() while start() binds resolves at once and leaves the bind to finish', async () => {
+		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const starting = server.start()
+		expect(server.status).toBe('starting')
+		await expect(server.stop()).resolves.toBeUndefined()
+		const port = await starting
+		expect(server.status).toBe('listening')
+		expect(await (await fetch(`http://127.0.0.1:${port}/ping`)).text()).toBe('pong')
 	})
 
 	it('double stop() is a no-op', async () => {
@@ -995,7 +1012,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		}
 	})
 
-	it('keeps a connection whose POST body ended before its response open until that response finishes', async () => {
+	it('drains a request whose POST body ended before its response, then ends its connection after that response', async () => {
 		const arrived = Promise.withResolvers<string>()
 		const release = Promise.withResolvers<void>()
 		const dispatcher = createDispatcher<undefined>()
@@ -1030,7 +1047,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		try {
 			await once(posting, 'connect')
 			posting.write('POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello')
-			// The handler read the whole body, so only the response still holds the exchange open.
+			// The handler read the whole body, so only its pending response holds the drain open.
 			expect(await arrived.promise).toBe('hello')
 			const started = performance.now()
 			const stopping = server.stop()
@@ -1112,14 +1129,13 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		}
 	})
 
-	it('ends a stalled 413 upload after the clean close when the keep-alive timeout fires', async () => {
+	it('cuts a 413 upload that sends one more byte and stalls when the drain deadline expires', async () => {
 		const drained = createRecorder<readonly [number, number]>()
 		const server = track(
 			createServer({
 				dispatcher: uploadDispatcher(),
 				state: () => undefined,
-				drain: 10_000,
-				timeouts: { keepalive: 300 },
+				drain: 300,
 				on: { drain: drained.handler },
 			}),
 		)
@@ -1134,18 +1150,106 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
-			upload.write(Buffer.alloc(total / 2))
 			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
-			// Node arms the keep-alive timeout as the 413 finishes, before the client reads it.
-			const answered = performance.now()
+			// Each body byte the server reads restarts Node's keep-alive idle timer, which then runs its
+			// 5 s default plus Node's 1 s buffer, past this test's budget.
+			upload.write(Buffer.alloc(1))
+			const started = performance.now()
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
-			// The upload stalls, so the open exchange holds the close until the 300 ms keep-alive timeout
-			// fires, inside a budget that Node's 5 s default would overrun.
 			await waitForSocketClose(upload, { budget: 2_000 })
 			await stopping
-			expect(performance.now() - answered).toBeGreaterThanOrEqual(200)
+			// The clean close held the open exchange until the 300 ms deadline rather than cutting it.
+			expect(performance.now() - started).toBeGreaterThanOrEqual(250)
+			expect(server.status).toBe('stopped')
+		} finally {
+			upload.destroy()
+		}
+	})
+
+	it('cuts a 413 upload that keeps sending one byte at a time when the drain deadline expires', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher: uploadDispatcher(),
+				state: () => undefined,
+				drain: 300,
+				timeouts: { keepalive: 100 },
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const total = 128 * 1024
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		let drip: ReturnType<typeof setInterval> | undefined
+		try {
+			await once(upload, 'connect')
+			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			// Every byte restarts Node's keep-alive idle timer before it fires, so no Node timeout ends
+			// this upload while it keeps sending.
+			drip = setInterval(() => {
+				if (upload.writable) upload.write(Buffer.alloc(1))
+			}, 25)
+			const started = performance.now()
+			const stopping = server.stop()
+			await waitForSocketClose(upload, { budget: 2_000 })
+			await stopping
+			expect(performance.now() - started).toBeGreaterThanOrEqual(250)
+			expect(drained.calls).toEqual([[0, 0]])
+			expect(server.status).toBe('stopped')
+		} finally {
+			clearInterval(drip)
+			upload.destroy()
+		}
+	})
+
+	it('returns the stop in flight to a concurrent stop() call, so both resolve after the close', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher: uploadDispatcher(),
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const total = 128 * 1024
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			const settled: string[] = []
+			const first = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			// The 413 exchange still holds the close, so the second call lands while the first waits.
+			const second = server.stop()
+			const both = Promise.all([
+				first.then(() => settled.push('first')),
+				second.then(() => settled.push('second')),
+			])
+			await waitForDelay(20)
+			expect(settled).toEqual([])
+			expect(server.status).toBe('stopping')
+			upload.write(Buffer.alloc(total))
+			await waitForSocketClose(upload, { budget: 1_000 })
+			await both
+			expect(settled).toEqual(['first', 'second'])
+			expect(second).toBe(first)
+			expect(drained.count).toBe(1)
 			expect(server.status).toBe('stopped')
 		} finally {
 			upload.destroy()
