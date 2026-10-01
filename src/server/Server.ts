@@ -52,8 +52,11 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   busy-loop), then closes → `stopped`. After a clean drain the close
  *   destroys every connection that carries no open request exchange, and a
  *   connection that still carries one ends when its last exchange completes.
- *   After an expired drain the close destroys every socket. `destroy()` is
- *   the idempotent final teardown.
+ *   A request or an upgrade that such a connection sends after the listener
+ *   closes is refused: its connection is destroyed before the request is
+ *   counted or a handler sees it, so the `stop()` call waits only on work
+ *   counted before the close. After an expired drain the close destroys every
+ *   socket. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
  *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
@@ -266,8 +269,14 @@ export class Server<TState> implements ServerInterface<TState> {
 	// Track the request for draining first — before anything that can throw —
 	// so the sync listener itself never throws; the rest of setup (which can
 	// throw on a malformed request) is deferred into the async `#accept`
-	// entry, kept behind the built-in boundary.
+	// entry, kept behind the built-in boundary. A request parsed after the
+	// close on a connection an open exchange still holds is not counted work,
+	// so its connection is destroyed before the request counts or runs.
 	#handle(message: IncomingMessage, response: ServerResponse): void {
+		if (this.#closed) {
+			message.socket.destroy()
+			return
+		}
 		const finish = this.#trackStart()
 		response.once('finish', finish)
 		response.once('close', finish)
@@ -368,7 +377,13 @@ export class Server<TState> implements ServerInterface<TState> {
 	// throwing handler is treated as declined — surfaced on `error` — and the
 	// fan-out continues so a later handler can still claim. Unclaimed ⇒ the
 	// socket is destroyed so an unhandled upgrade never leaks a connection.
+	// An upgrade parsed after the close is refused the way `#handle` refuses a
+	// request: its socket is destroyed before any handler sees it.
 	#onUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
+		if (this.#closed) {
+			socket.destroy()
+			return
+		}
 		let handled = false
 		for (const handler of this.#upgradeHandlers) {
 			try {
@@ -497,9 +512,12 @@ export class Server<TState> implements ServerInterface<TState> {
 	// Count one exchange open on its connection until both its request message
 	// has ended or closed and its response has finished or closed; a count, not
 	// a flag, because a pipelining client holds several at once. While a clean
-	// close waits, the connection ends as its count returns to zero, so an idle
-	// or trickling peer cannot hold `stop()`. A listener that is no longer
-	// listening while the status is `stopping` marks that close.
+	// close waits, the connection ends as its count returns to zero. An upload
+	// whose response already finished holds `stop()` until its body ends or
+	// Node's keep-alive socket timeout fires, and with `timeouts.keepalive: 0`
+	// a stalled upload holds it with no bound. The `error` listeners `finished`
+	// attaches stay after it settles, so a later `error` on the message or the
+	// response raises no uncaught exception.
 	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)
@@ -509,9 +527,14 @@ export class Server<TState> implements ServerInterface<TState> {
 		const left = this.#exchanges.get(socket)
 		if (left === undefined) return
 		this.#exchanges.set(socket, left - 1)
-		if (left === 1 && this.#status === 'stopping' && this.#http?.listening === false) {
-			socket.destroy()
-		}
+		if (left === 1 && this.#closed) socket.destroy()
+	}
+
+	// The listener has closed while the server stops, so the drain has settled
+	// and no further request or upgrade is counted work. Derived, so it cannot
+	// drift from the status and the listener it reads.
+	get #closed(): boolean {
+		return this.#status === 'stopping' && this.#http?.listening === false
 	}
 
 	// Everything `stop()` has to drain: in-flight requests plus the upgraded

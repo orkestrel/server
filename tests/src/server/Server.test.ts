@@ -52,6 +52,18 @@ function pingDispatcher(): DispatcherInterface<undefined> {
 	return dispatcher
 }
 
+// `/upload` answers 413 without reading its body, so the body keeps uploading after the answer and
+// its exchange stays open on the connection; `/ping` is the request a client pipelines behind it.
+function uploadDispatcher(): DispatcherInterface<undefined> {
+	const dispatcher = pingDispatcher()
+	dispatcher.add({
+		method: 'POST',
+		path: '/upload',
+		handler: () => new Response('too large', { status: 413 }),
+	})
+	return dispatcher
+}
+
 // Claim every upgrade and HOLD the socket, which is what a real WebSocket
 // handler does after its handshake — the tests that end the socket inline
 // (the fan-out suite below) never reach the stop path this exercises. The
@@ -814,16 +826,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	})
 
 	it('keeps a connection whose handler answered 413 while its body still uploads', async () => {
-		const dispatcher = createDispatcher<undefined>()
-		dispatcher.add({
-			method: 'POST',
-			path: '/upload',
-			handler: () => new Response('too large', { status: 413 }),
-		})
 		const drained = createRecorder<readonly [number, number]>()
 		const server = track(
 			createServer({
-				dispatcher,
+				dispatcher: uploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -867,17 +873,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	})
 
 	it('ends a 413 connection when its upload ends, while the client still holds the socket open', async () => {
-		const dispatcher = createDispatcher<undefined>()
-		dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
-		dispatcher.add({
-			method: 'POST',
-			path: '/upload',
-			handler: () => new Response('too large', { status: 413 }),
-		})
 		const drained = createRecorder<readonly [number, number]>()
 		const server = track(
 			createServer({
-				dispatcher,
+				dispatcher: uploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -911,8 +910,6 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			await waitForSocketClose(upload, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - ended).toBeLessThan(1_000)
-			// The server ended the connection, so a further request on it is never served.
-			expect(received.match(/HTTP\/1\.1 /g)).toEqual(['HTTP/1.1 '])
 			expect(failures.count).toBe(0)
 			expect(server.status).toBe('stopped')
 		} finally {
@@ -961,12 +958,13 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('answers an unknown Expect value with 417 and ends that connection on the clean close', async () => {
 		const drained = createRecorder<readonly [number, number]>()
+		const requests = createRecorder<readonly [string, string]>()
 		const server = track(
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: uploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
-				on: { drain: drained.handler },
+				on: { drain: drained.handler, request: requests.handler },
 			}),
 		)
 		const port = await server.start()
@@ -977,7 +975,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		})
 		try {
 			await once(expecting, 'connect')
-			expecting.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: unknown-value\r\n\r\n')
+			// The body is withheld, so Node counts the connection as busy and its own idle close skips it.
+			expecting.write(
+				'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1024\r\nExpect: unknown-value\r\n\r\n',
+			)
 			// Node answers the expectation itself, so the handler never sees this request.
 			await waitForCondition('the 417 answer', () => received.includes('\r\n\r\n'))
 			expect(received).toMatch(/^HTTP\/1\.1 417 /)
@@ -986,10 +987,266 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			await waitForSocketClose(expecting, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
-			expect(received).not.toContain('pong')
+			expect(received).not.toContain('too large')
+			expect(requests.count).toBe(0)
 			expect(drained.calls).toEqual([[0, 0]])
 		} finally {
 			expecting.destroy()
+		}
+	})
+
+	it('keeps a connection whose POST body ended before its response open until that response finishes', async () => {
+		const arrived = Promise.withResolvers<string>()
+		const release = Promise.withResolvers<void>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'POST',
+			path: '/echo',
+			handler: async (request) => {
+				arrived.resolve(await request.text())
+				await release.promise
+				return new Response('echoed')
+			},
+		})
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher,
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const posting = net.createConnection({ port, host: '127.0.0.1' })
+		let received = ''
+		posting.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		let closed = false
+		posting.once('close', () => {
+			closed = true
+		})
+		try {
+			await once(posting, 'connect')
+			posting.write('POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello')
+			// The handler read the whole body, so only the response still holds the exchange open.
+			expect(await arrived.promise).toBe('hello')
+			const started = performance.now()
+			const stopping = server.stop()
+			await waitForDelay(20)
+			expect(closed).toBe(false)
+			expect(drained.count).toBe(0)
+			release.resolve()
+			await waitForSocketClose(posting, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			// The whole response reached the client before the connection ended.
+			expect(received).toMatch(/^HTTP\/1\.1 200 /)
+			expect(received).toContain('echoed')
+			expect(drained.calls).toEqual([[0, 0]])
+		} finally {
+			posting.destroy()
+		}
+	})
+
+	it('serves a kept-alive request sent during the drain and keeps its connection open until the drain settles', async () => {
+		const arrived = Promise.withResolvers<void>()
+		const release = Promise.withResolvers<void>()
+		const dispatcher = pingDispatcher()
+		dispatcher.add({
+			method: 'GET',
+			path: '/slow',
+			handler: async () => {
+				arrived.resolve()
+				await release.promise
+				return new Response('done')
+			},
+		})
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher,
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const kept = net.createConnection({ port, host: '127.0.0.1' })
+		let received = ''
+		kept.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		let closed = false
+		kept.once('close', () => {
+			closed = true
+		})
+		const pongs = (): number => received.match(/pong/g)?.length ?? 0
+		const ping = 'GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'
+		try {
+			await once(kept, 'connect')
+			kept.write(ping)
+			await waitForCondition('the first kept-alive reply', () => pongs() === 1)
+			// `/slow` holds the drain open while the kept-alive connection sends.
+			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
+			await arrived.promise
+			const stopping = server.stop()
+			kept.write(ping)
+			await waitForCondition('the second reply, sent during the drain', () => pongs() === 2)
+			// A third request on the same connection is served only if the second left it open.
+			kept.write(ping)
+			await waitForCondition('the third reply or the close', () => pongs() === 3 || closed)
+			expect(pongs()).toBe(3)
+			expect(closed).toBe(false)
+			expect(drained.count).toBe(0)
+			const started = performance.now()
+			release.resolve()
+			expect(await (await inflight).text()).toBe('done')
+			await waitForSocketClose(kept, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(drained.calls).toEqual([[0, 0]])
+		} finally {
+			kept.destroy()
+		}
+	})
+
+	it('ends a stalled 413 upload after the clean close when the keep-alive timeout fires', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher: uploadDispatcher(),
+				state: () => undefined,
+				drain: 10_000,
+				timeouts: { keepalive: 300 },
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const total = 128 * 1024
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
+			upload.write(Buffer.alloc(total / 2))
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			// Node arms the keep-alive timeout as the 413 finishes, before the client reads it.
+			const answered = performance.now()
+			const stopping = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			expect(drained.calls).toEqual([[0, 0]])
+			// The upload stalls, so the open exchange holds the close until the 300 ms keep-alive timeout
+			// fires, inside a budget that Node's 5 s default would overrun.
+			await waitForSocketClose(upload, { budget: 2_000 })
+			await stopping
+			expect(performance.now() - answered).toBeGreaterThanOrEqual(200)
+			expect(server.status).toBe('stopped')
+		} finally {
+			upload.destroy()
+		}
+	})
+
+	it('refuses a request pipelined behind a 413 body that ends after the clean close', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const requests = createRecorder<readonly [string, string]>()
+		const server = track(
+			createServer({
+				dispatcher: uploadDispatcher(),
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler, request: requests.handler },
+			}),
+		)
+		const port = await server.start()
+		const first = 64 * 1024
+		const total = 128 * 1024
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
+			upload.write(Buffer.alloc(first))
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			const stopping = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			expect(drained.calls).toEqual([[0, 0]])
+			const started = performance.now()
+			// The body's tail and the next request share one segment, so the parser reaches the request
+			// while the 413 exchange is still open on the connection.
+			upload.write(
+				Buffer.concat([
+					Buffer.alloc(total - first),
+					Buffer.from('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'),
+				]),
+			)
+			await waitForSocketClose(upload, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(received).not.toContain('pong')
+			expect(requests.calls).toEqual([['POST', '/upload']])
+			expect(server.status).toBe('stopped')
+		} finally {
+			upload.destroy()
+		}
+	})
+
+	it('refuses an upgrade pipelined behind a 413 body that ends after the clean close', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
+		const server = track(
+			createServer({
+				dispatcher: uploadDispatcher(),
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler, upgrade: upgrades.handler },
+			}),
+		)
+		const claimed = claimUpgrades(server)
+		const port = await server.start()
+		const first = 64 * 1024
+		const total = 128 * 1024
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
+			upload.write(Buffer.alloc(first))
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			const stopping = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			expect(drained.calls).toEqual([[0, 0]])
+			const started = performance.now()
+			upload.write(
+				Buffer.concat([
+					Buffer.alloc(total - first),
+					Buffer.from(
+						'GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+					),
+				]),
+			)
+			await waitForSocketClose(upload, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(claimed).toHaveLength(0)
+			expect(upgrades.count).toBe(0)
+			expect(received).not.toContain('101 Switching Protocols')
+			expect(server.status).toBe('stopped')
+		} finally {
+			upload.destroy()
 		}
 	})
 })

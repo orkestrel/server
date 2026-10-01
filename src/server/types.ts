@@ -785,29 +785,38 @@ export interface ServerInterface<TState> {
 	start(signal?: AbortSignal): Promise<number>
 	/**
 	 * Stops gracefully: fires the stop signal, drains in-flight requests and claimed upgraded
-	 * sockets up to the `drain` deadline, then closes the listener and ends each connection when
-	 * no request exchange is open on it.
+	 * sockets up to the `drain` deadline, then closes the listener; after a clean drain it ends
+	 * each connection when no request exchange is open on it, and after an expired drain it
+	 * destroys every socket.
 	 *
 	 * @remarks
 	 * Drainable work is every in-flight request plus every upgraded socket a
 	 * handler claimed. The drain parks on that work reaching zero or the
-	 * `drain` deadline expiring, emits `drain` with both remaining counts, and
-	 * then closes the listener. A request that arrives while the drain runs is
-	 * counted and served with its signal already aborted. An exchange opens
-	 * when a request reaches the handler and stays open until its request
-	 * message has ended or closed and its response has finished or closed.
-	 * After a clean drain the close destroys every connection with no open
-	 * exchange: an idle keep-alive one, one that never sent a request, and one
-	 * partway through any header block, because a request whose headers never
-	 * completed is not counted work. A connection that still carries an open
-	 * exchange, including one whose handler answered while its body still
-	 * uploads, ends when its last exchange completes, and `stop()` resolves
-	 * after that connection closes. A request Node answers itself, such as the
-	 * `417` for an unknown `Expect` value, never reaches the handler and opens
-	 * no exchange. When either count is still non-zero, the close destroys
-	 * every socket, including the claimed upgraded ones Node's own force-close
-	 * cannot reach; `stop()` therefore always resolves after an expired drain.
-	 * The `drain` counts say whether anything was cut.
+	 * `drain` deadline expiring, emits the `drain` event with both remaining
+	 * counts, and then closes the listener. A request that arrives while the
+	 * drain runs is counted and served with its signal already aborted. A
+	 * request or an upgrade that a connection sends after the listener closes
+	 * is refused: the server destroys that connection before the request is
+	 * counted or a handler sees it. An exchange opens when a request reaches
+	 * the handler and stays open until its request message has ended or closed
+	 * and its response has finished or closed. The `error` listeners that this
+	 * tracking attaches to the message and the response stay attached, so a
+	 * later error on either raises no uncaught exception. After a clean drain
+	 * the close destroys every connection with no open exchange: an idle
+	 * keep-alive one, one that never sent a request, and one partway through
+	 * any header block, because a request whose headers never completed is not
+	 * counted work. A connection that still carries an open exchange, including
+	 * one whose handler answered while its body still uploads, ends when its
+	 * last exchange completes, and the `stop()` call resolves after that
+	 * connection closes. Such an upload holds the `stop()` call until its body
+	 * ends or Node's keep-alive socket timeout fires; with the
+	 * `timeouts.keepalive` option set to 0, a stalled upload holds it with no
+	 * bound. A request Node answers itself, such as the `417` response to an
+	 * unknown `Expect` value, never reaches the handler and opens no exchange.
+	 * When either count is still non-zero, the close destroys every socket,
+	 * including the claimed upgraded ones Node's own force-close cannot reach,
+	 * so the `stop()` call always resolves after an expired drain. The `drain`
+	 * counts say whether anything was cut.
 	 *
 	 * @returns Resolves after the listener is closed and the status is `'stopped'`
 	 */
