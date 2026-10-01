@@ -263,18 +263,24 @@ These invariants hold across `src/server` ↔ `server.md`.
    after a successful start and `undefined` before start and after stop or
    destroy; `stop()`/`destroy()` are idempotent no-ops from a state with
    nothing to tear down, so a `stop()` call from `idle`, `starting`, or
-   `stopped` resolves at once; a `stop()` call made while a stop runs returns
-   that stop's promise and resolves with it after the close; `EADDRINUSE` rejects `start()` outright — no silent
-   ephemeral fallback (use `discoverPort` up front for a guaranteed-free
-   port).
+   `stopped` while no stop runs resolves at once; a `stop()` call made while
+   a stop runs returns that stop's promise and resolves with it after the
+   close, including a call made from a `stop` event listener or from a
+   listener on the stop signal; `EADDRINUSE` rejects `start()` outright — no
+   silent ephemeral fallback (use `discoverPort` up front for a
+   guaranteed-free port). A `start()` call made after `destroy()` while an
+   earlier `stop()` call has not yet resolved can be reset to `stopped` when
+   that stop finishes.
 4. **Startup is bounded and caller-cancellable.** `start(signal?)` observes
    caller cancellation only while binding; `timeouts.start` independently
-   bounds the bind (`0` permits no startup window). Cancellation or deadline
-   expiry closes the partial listener, clears the startup deadline, resets
-   the entity to `idle`, and rejects; expiry rejects with a `DOMException`
-   named `TimeoutError`, while caller cancellation rejects with that signal's
-   `reason`. A later `start()` is therefore permitted. Aborting the caller
-   signal after a successful start does not stop a live server.
+   bounds the bind (`0` permits no startup window) and is an integer from 0
+   through 2_147_483_647, or construction throws a `TypeError`. Cancellation
+   or deadline expiry closes the partial listener, clears the startup
+   deadline, resets the entity to `idle`, and rejects; expiry rejects with a
+   `DOMException` named `TimeoutError`, while caller cancellation rejects
+   with that signal's `reason`. A later `start()` is therefore permitted.
+   Aborting the caller signal after a successful start does not stop a live
+   server.
 5. **Graceful drain is event-driven, never a busy-loop.** `stop()` fires the
    stop signal, arms a `@orkestrel/timeout` deadline, and parks on the
    drainable count reaching zero or the deadline firing (a wake-park, not
@@ -301,39 +307,43 @@ These invariants hold across `src/server` ↔ `server.md`.
    closes. Each body byte restarts Node's keep-alive socket timer, so no Node
    timeout bounds an upload that keeps sending. The deadline that bounds the
    drain therefore stays armed through the clean close's wait: when it
-   expires before the listener closes, the server destroys every socket still
-   open, as an expired drain does, so no connection holds the `stop()` call
-   past the `drain` deadline. That cut emits no event, because every
-   response had finished at the clean drain and the cut ends only the unread
-   part of an upload its handler had already answered; the `drain` counts
-   keep reporting the request and claimed-socket work at the drain's settle.
-   An upload ends before the deadline only because the `buildRequest`
-   function of `@orkestrel/router` reads a request body eagerly, whether or
-   not the handler reads it. A request or an
-   upgrade that a connection sends after the listener closes, such as one
-   pipelined behind the end of that upload, is refused: the server destroys
-   that connection before the request is counted or a handler sees it, so
-   the `stop()` call waits only on work counted before the close. That
-   refusal, and the clean close's destroy of a connection with no open
-   exchange, can reset the connection when the kernel still holds bytes the
-   server never read, as it does for a peer that pipelines a request behind a
-   POST request (RFC 9112 §9.3.2). After an
-   expired drain the close destroys every socket and cuts the work still
-   pending. No I/O callback runs between the drain's settle and the close, so
-   a request that reached the handler by the close did so before the drain
-   settled and was counted. A request Node answers itself never reaches the
-   handler and is not counted: Node answers an unknown `Expect` value with a
-   `417` response, so that connection carries no open exchange and the clean
-   close destroys it. A request that reaches the server after the `stop()`
-   call begins and before the listener closes, on a kept-alive connection or
-   on a connection the listener accepts, is in-flight work: the drain waits
-   for it, and its `request.signal` property is already aborted.
+   expires before the server's `close` event, the server destroys every
+   socket still open, as an expired drain does, so no connection holds the
+   `stop()` call past the `drain` deadline. The `drain` event has already
+   reported `[0, 0]` for that stop, because every response had finished at
+   the clean drain. The cut ends the unread part of an upload its handler had
+   already answered, and destroying that socket can also reset the
+   connection and lose the answered response the peer has not yet read. No
+   event reports that cut or that loss. An upload ends before the deadline
+   only because the `buildRequest` function of the `@orkestrel/router`
+   package reads a request body eagerly, whether or not the handler reads
+   it. A request or an upgrade that a connection sends after the listener
+   closes, such as one pipelined behind the end of that upload, is refused:
+   the server destroys that connection before the request is counted or a
+   handler sees it, so the `stop()` call waits only on work counted before
+   the close. That refusal, and the clean close's destroy of a connection
+   with no open exchange, can reset the connection when the kernel still
+   holds bytes the server never read, as it does for a peer that pipelines a
+   request behind a POST request; see
+   [the pipelining section of RFC 9112](https://www.rfc-editor.org/rfc/rfc9112#section-9.3.2).
+   After an expired drain the close destroys every socket and cuts the work
+   still pending. No I/O callback runs between the drain's settle and the
+   close, so a request that reached the handler by the close did so before
+   the drain settled and was counted. A request Node answers itself never
+   reaches the handler and is not counted: Node answers an unknown `Expect`
+   value with a `417` response, so that connection carries no open exchange
+   and the clean close destroys it. A request that reaches the server after
+   the `stop()` call begins and before the listener closes, on a kept-alive
+   connection or on a connection the listener accepts, is in-flight work:
+   the drain waits for it, and its `request.signal` property is already
+   aborted.
    Drainable work is every in-flight request plus every upgraded socket a
    handler claimed, because a long-lived upgraded connection is work a
    graceful stop lets finish rather than cuts mid-frame. `drain` carries
-   both counts, so a caller can tell a clean stop from a forced one. A
-   claimed socket never holds `stop()` or `destroy()` open forever: Node
-   detaches an upgraded socket from its own connection set, so neither
+   both counts, which say whether a request or a claimed socket was cut; a
+   cut during the clean close's wait reports `[0, 0]`. A claimed socket
+   never holds `stop()` or `destroy()` open forever: Node detaches an
+   upgraded socket from its own connection set, so neither
    `closeIdleConnections()` nor `closeAllConnections()` reaches it while
    `server.close()` still waits on it, and the server therefore tracks each
    claimed socket until it closes and destroys the survivors itself when the
@@ -593,7 +603,9 @@ such as an upload still sending its body after the response, keeps the
 `stop()` call waiting until that exchange completes or the same `drain`
 deadline expires and cuts it. A request that such a connection sends after
 the listener closes is refused, and its connection is destroyed. A second
-`stop()` call made during the stop returns the first call's promise.
+`stop()` call made during the stop returns the first call's promise. The
+`drain` option is an integer from 0 through 2_147_483_647 milliseconds, and
+construction throws a `TypeError` for any other value.
 
 ```ts
 import { createServer } from '@orkestrel/server'

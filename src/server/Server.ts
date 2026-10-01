@@ -20,7 +20,7 @@ import { addAbortListener, once } from 'node:events'
 import { createServer as createHTTPServer } from 'node:http'
 import { finished } from 'node:stream/promises'
 import { createAbort, linkSignal } from '@orkestrel/abort'
-import { createTimeout } from '@orkestrel/timeout'
+import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
 import { isError, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
@@ -129,12 +129,17 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (options.report !== undefined && !isFunction(options.report))
 			throw new TypeError('ServerOptions.report must be a function')
 		const drain = options.drain ?? DEFAULT_DRAIN_MS
-		if (!isFiniteNumber(drain) || drain < 0)
-			throw new TypeError('ServerOptions.drain must be a non-negative finite number')
+		if (!isTimeoutDuration(drain))
+			throw new TypeError('ServerOptions.drain must be an integer from 0 through 2_147_483_647')
 		const limit = options.limit ?? DEFAULT_BODY_LIMIT
 		if (!isFiniteNumber(limit) || limit < 0)
 			throw new TypeError('ServerOptions.limit must be a non-negative finite number')
 		const timeouts = options.timeouts ?? {}
+		if (timeouts.start !== undefined && !isTimeoutDuration(timeouts.start)) {
+			throw new TypeError(
+				'ServerOptions.timeouts.start must be an integer from 0 through 2_147_483_647',
+			)
+		}
 		for (const [name, value] of Object.entries(timeouts)) {
 			if (value !== undefined && (!isFiniteNumber(value) || value < 0))
 				throw new TypeError(`ServerOptions.timeouts.${name} must be a non-negative finite number`)
@@ -234,13 +239,19 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	// A call during a stop returns the stop in flight, so every caller resolves
 	// after the same close; the field is released only by the stop that set it.
+	// The promise is published before the stop's synchronous prologue, because
+	// that prologue emits `stop` and aborts the stop signal, and a listener on
+	// either can call this method.
 	stop(): Promise<void> {
 		if (this.#status !== 'listening') return this.#stopping ?? Promise.resolve()
-		const stopping = this.#stopGracefully().finally(() => {
-			if (this.#stopping === stopping) this.#stopping = undefined
-		})
-		this.#stopping = stopping
-		return stopping
+		const { promise, resolve, reject } = Promise.withResolvers<void>()
+		this.#stopping = promise
+		void this.#stopGracefully()
+			.finally(() => {
+				if (this.#stopping === promise) this.#stopping = undefined
+			})
+			.then(resolve, reject)
+		return promise
 	}
 
 	async destroy(): Promise<void> {

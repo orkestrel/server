@@ -646,10 +646,11 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   server stops accepting new connections and gives in-flight requests,
  *   claimed upgraded sockets, and connections that still carry an open
  *   request exchange this long to finish before forcing every remaining
- *   socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be a
- *   non-negative finite number. A long-lived upgraded socket that nothing
- *   closes therefore costs `stop()` this whole budget, so a WebSocket
- *   handler closes its sockets on the `stop` event to settle sooner.
+ *   socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be an integer from
+ *   0 through 2_147_483_647; construction throws a `TypeError` otherwise.
+ *   A long-lived upgraded socket that nothing closes therefore costs
+ *   `stop()` this whole budget, so a WebSocket handler closes its sockets
+ *   on the `stop` event to settle sooner.
  * @param limit - The default request-body byte cap the context's `body()`
  *   reads through. Defaults to `DEFAULT_BODY_LIMIT`. Must be a non-negative
  *   finite number.
@@ -667,8 +668,10 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   to receive the request headers, `headersTimeout`), and `keepalive` (idle
  *   keep-alive socket timeout, `keepAliveTimeout`). `headers` must not exceed
  *   `keepalive` (the Slowloris footgun) — construction throws a `TypeError`
- *   otherwise. Every present value must be a non-negative finite number. A
- *   startup expiry rejects with a `DOMException` named `TimeoutError`; caller
+ *   otherwise. A present `start` must be an integer from 0 through
+ *   2_147_483_647, and every other present value a non-negative finite
+ *   number; construction throws a `TypeError` otherwise. A startup expiry
+ *   rejects with a `DOMException` named `TimeoutError`; caller
  *   cancellation rejects with the caller signal's `reason`.
  * @param sockets - `node:http` socket caps: `connections` maps to
  *   `maxConnections` (`0` rejects every incoming connection), `headers` maps
@@ -812,18 +815,21 @@ export interface ServerInterface<TState> {
 	 * connection closes. Each body byte restarts Node's keep-alive socket
 	 * timer, so no Node timeout bounds an upload that keeps sending. The
 	 * deadline that bounds the drain therefore stays armed through this wait:
-	 * when it expires before the listener closes, the server destroys every
-	 * socket still open, as an expired drain does, so no connection holds the
-	 * `stop()` call past the `drain` deadline. A request Node
+	 * when it expires before the server's `close` event, the server destroys
+	 * every socket still open, as an expired drain does, so no connection
+	 * holds the `stop()` call past the `drain` deadline. A request Node
 	 * answers itself, such as the `417` response to an unknown `Expect` value,
 	 * never reaches the handler and opens no exchange. When either count is
 	 * still non-zero, the close destroys every socket at once, including the
 	 * claimed upgraded ones Node's own force-close cannot reach. The `drain`
-	 * counts say whether a request or a claimed socket was cut. A cut during
-	 * the clean close's wait emits no event: every response had finished at
-	 * the clean drain, so that cut ends only the unread part of an upload the
-	 * handler had already answered. A `stop()` call made while a stop runs
-	 * returns that stop's promise.
+	 * counts say whether a request or a claimed socket was cut, and a cut
+	 * during the clean close's wait reports `[0, 0]`, because every response
+	 * had finished at the clean drain. That cut ends the unread part of an
+	 * upload the handler had already answered, and destroying its socket can
+	 * also reset the connection and lose the answered response the peer has
+	 * not yet read. No event reports that cut or that loss. A `stop()` call
+	 * made while a stop runs returns that stop's promise, including a call
+	 * made from a `stop` event listener or from a listener on the stop signal.
 	 *
 	 * @returns Resolves after the listener is closed and the status is
 	 *   `'stopped'`; a call from `'idle'`, `'starting'`, or `'stopped'` while

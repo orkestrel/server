@@ -2,7 +2,12 @@ import type { IncomingMessage } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { DispatcherInterface } from '@orkestrel/router'
-import type { ConnectionStateFunction, ServerInterface, ServerOptions } from '@src/server'
+import type {
+	ConnectionStateFunction,
+	ServerInterface,
+	ServerOptions,
+	ServerStatus,
+} from '@src/server'
 import { once } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
@@ -176,6 +181,49 @@ describe('Server — construction guards', () => {
 		expect(() =>
 			createServer({ dispatcher: pingDispatcher(), state: () => undefined, limit: -1 }),
 		).toThrow(TypeError)
+	})
+
+	it('refuses a drain that is not an integer from 0 through 2_147_483_647', () => {
+		const refusal = new TypeError(
+			'ServerOptions.drain must be an integer from 0 through 2_147_483_647',
+		)
+		expect(() =>
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 1.5 }),
+		).toThrow(refusal)
+		expect(() =>
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 3e9 }),
+		).toThrow(refusal)
+		expect(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 2_147_483_647 })
+				.status,
+		).toBe('idle')
+	})
+
+	it('refuses a timeouts.start that is not an integer from 0 through 2_147_483_647', () => {
+		const refusal = new TypeError(
+			'ServerOptions.timeouts.start must be an integer from 0 through 2_147_483_647',
+		)
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				timeouts: { start: 1.5 },
+			}),
+		).toThrow(refusal)
+		expect(() =>
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				timeouts: { start: 3e9 },
+			}),
+		).toThrow(refusal)
+		expect(
+			createServer({
+				dispatcher: pingDispatcher(),
+				state: () => undefined,
+				timeouts: { start: 2_147_483_647 },
+			}).status,
+		).toBe('idle')
 	})
 
 	it('throws when startup timeout or socket caps violate their numeric contracts', () => {
@@ -369,7 +417,13 @@ describe('Server — restart + idempotent lifecycle', () => {
 		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
 		const starting = server.start()
 		expect(server.status).toBe('starting')
-		await expect(server.stop()).resolves.toBeUndefined()
+		let seen: ServerStatus | undefined
+		const stopping = server.stop().then(() => {
+			seen = server.status
+		})
+		await expect(stopping).resolves.toBeUndefined()
+		// The bind's `listening` event waits for a later tick, so a stop settled at once sees `starting`.
+		expect(seen).toBe('starting')
 		const port = await starting
 		expect(server.status).toBe('listening')
 		expect(await (await fetch(`http://127.0.0.1:${port}/ping`)).text()).toBe('pong')
@@ -1253,6 +1307,129 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			expect(server.status).toBe('stopped')
 		} finally {
 			upload.destroy()
+		}
+	})
+
+	it('returns the stop in flight to a stop() call made from a stop listener', async () => {
+		const gate = Promise.withResolvers<void>()
+		const entered = Promise.withResolvers<void>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/hold',
+			handler: async () => {
+				entered.resolve()
+				await gate.promise
+				return new Response('held')
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined, drain: 10_000 }))
+		let inner: Promise<void> | undefined
+		server.emitter.on('stop', () => {
+			inner = server.stop()
+		})
+		const port = await server.start()
+		try {
+			const inflight = fetch(`http://127.0.0.1:${port}/hold`)
+			await entered.promise
+			let settled = false
+			const outer = server.stop()
+			void outer.then(() => {
+				settled = true
+			})
+			expect(inner).toBe(outer)
+			await waitForDelay(20)
+			expect(settled).toBe(false)
+			expect(server.status).toBe('stopping')
+			gate.resolve()
+			expect(await (await inflight).text()).toBe('held')
+			await outer
+			expect(settled).toBe(true)
+			expect(server.status).toBe('stopped')
+		} finally {
+			gate.resolve()
+		}
+	})
+
+	it('returns the stop in flight to a stop() call made from a stop-signal abort listener', async () => {
+		const gate = Promise.withResolvers<void>()
+		const entered = Promise.withResolvers<void>()
+		let inner: Promise<void> | undefined
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/hold',
+			handler: async (request) => {
+				request.signal.addEventListener('abort', () => {
+					inner = server.stop()
+				})
+				entered.resolve()
+				await gate.promise
+				return new Response('held')
+			},
+		})
+		const server = track(createServer({ dispatcher, state: () => undefined, drain: 10_000 }))
+		const port = await server.start()
+		try {
+			const inflight = fetch(`http://127.0.0.1:${port}/hold`)
+			await entered.promise
+			let settled = false
+			const outer = server.stop()
+			void outer.then(() => {
+				settled = true
+			})
+			expect(inner).toBe(outer)
+			await waitForDelay(20)
+			expect(settled).toBe(false)
+			expect(server.status).toBe('stopping')
+			gate.resolve()
+			expect(await (await inflight).text()).toBe('held')
+			await outer
+			expect(settled).toBe(true)
+			expect(server.status).toBe('stopped')
+		} finally {
+			gate.resolve()
+		}
+	})
+
+	it('settles a stop and a destroy() made during the clean close wait, and leaves no deadline timer armed', async () => {
+		const drained = createRecorder<readonly [number, number]>()
+		const server = createServer({
+			dispatcher: uploadDispatcher(),
+			state: () => undefined,
+			drain: 10_000,
+			on: { drain: drained.handler },
+		})
+		const port = await server.start()
+		const upload = net.createConnection({ port, host: '127.0.0.1' })
+		upload.on('error', () => undefined)
+		let received = ''
+		upload.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(upload, 'connect')
+			upload.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 131072\r\n\r\n')
+			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			const stopping = server.stop()
+			await waitForCondition('the clean drain', () => drained.count === 1)
+			expect(drained.calls).toEqual([[0, 0]])
+			// The 413 exchange holds the clean close, so the 10 s deadline is an armed ref'd timer here.
+			// A timer an earlier test left can expire meanwhile, so the proof compares against this count.
+			const armed = process
+				.getActiveResourcesInfo()
+				.filter((resource) => resource === 'Timeout').length
+			const started = performance.now()
+			await Promise.all([stopping, server.destroy()])
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(server.status).toBe('stopped')
+			expect(
+				process.getActiveResourcesInfo().filter((resource) => resource === 'Timeout').length,
+			).toBeLessThan(armed)
+			await waitForSocketClose(upload, { budget: 1_000 })
+		} finally {
+			upload.destroy()
+			await server.destroy()
 		}
 	})
 
