@@ -44,11 +44,13 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   bind is pending, and transitions `idle → starting → listening`. A
  *   cancelled or expired bind closes its partial server and resets to `idle` for
  *   another start. `stop()` transitions
- *   to `stopping`: refuses new connections, fires a fresh-per-run stop signal
- *   so in-flight handlers observe cancellation, drains in-flight requests and
+ *   to `stopping`: fires a fresh-per-run stop signal so in-flight handlers
+ *   observe cancellation (a request that arrives during the drain is served
+ *   with that signal already aborted), drains in-flight requests and
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
- *   busy-loop), then closes → `stopped`, forcing whatever the deadline caught
- *   still open. `destroy()` is the idempotent final teardown.
+ *   busy-loop), then closes → `stopped`, destroying every socket still open:
+ *   after a clean drain none carries a request, and after an expired one the
+ *   deadline cuts what remains. `destroy()` is the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
  *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
@@ -236,7 +238,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		const pending = this.#pending
 		const upgraded = this.#upgraded.size
 		this.#emitter.emit('drain', pending, upgraded)
-		if (server !== undefined) await this.#close(server, pending + upgraded > 0)
+		if (server !== undefined) await this.#close(server)
 		this.#http = undefined
 		this.#port = undefined
 		this.#status = 'stopped'
@@ -249,7 +251,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 		if (!this.#abort.aborted) this.#abort.abort()
 		const server = this.#http
-		if (server !== undefined) await this.#close(server, true)
+		if (server !== undefined) await this.#close(server)
 		this.#http = undefined
 		this.#port = undefined
 		this.#status = 'stopped'
@@ -421,7 +423,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			server.on('error', () => undefined)
 			binding.abort(error)
 			if (listening !== undefined) await listening.catch(() => undefined)
-			await this.#close(server, true)
+			await this.#close(server)
 			this.#http = undefined
 			this.#port = undefined
 			this.#status = 'idle'
@@ -451,25 +453,24 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 	}
 
-	// Close the underlying server, resolving once it stops accepting
-	// connections. A keep-alive client leaves its socket idle after a
-	// response, which would hang a plain `close()` — so idle sockets are
-	// always dropped (an in-flight request is untouched); when `force` is set
-	// (the drain deadline fired with work still in flight, or `destroy`)
-	// every open socket is destroyed so the callback fires promptly.
+	// Close the underlying server and destroy every socket it still holds,
+	// resolving once the listener is closed. Every caller has already let its
+	// work finish or given up on it: `stop()` arrives here after the drain,
+	// with no I/O turn in between, so after a clean drain no socket carries a
+	// request, and `destroy` and a failed bind keep nothing. Destroying all of
+	// them, not only the idle ones, is what ends a connection that never sent
+	// a request: node counts it as neither idle nor active, so
+	// `closeIdleConnections()` leaves it holding `close()` open until the peer
+	// drops it.
 	//
 	// A protocol-upgraded socket needs the extra loop: node detaches it from
-	// the connection set both `closeIdleConnections()` and
-	// `closeAllConnections()` walk, so neither reaches it while
-	// `server.close()` still waits on it. Without destroying the tracked set
-	// here, a force close hangs exactly as hard as a graceful one.
-	#close(server: NodeHTTPServer, force: boolean): Promise<void> {
+	// the connection set `closeAllConnections()` walks, so that call never
+	// reaches it while `server.close()` still waits on it.
+	#close(server: NodeHTTPServer): Promise<void> {
 		return new Promise<void>((resolve) => {
 			server.close(() => resolve())
-			if (force) {
-				server.closeAllConnections()
-				for (const socket of this.#upgraded) socket.destroy()
-			} else server.closeIdleConnections()
+			server.closeAllConnections()
+			for (const socket of this.#upgraded) socket.destroy()
 		})
 	}
 

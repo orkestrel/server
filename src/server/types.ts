@@ -783,17 +783,20 @@ export interface ServerInterface<TState> {
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**
-	 * Stops gracefully: refuses new connections, fires the stop signal, drains in-flight
-	 * requests and claimed upgraded sockets up to the `drain` deadline, then closes.
+	 * Stops gracefully: fires the stop signal, drains in-flight requests and claimed upgraded
+	 * sockets up to the `drain` deadline, then closes the listener and every connection left.
 	 *
 	 * @remarks
 	 * Drainable work is every in-flight request plus every upgraded socket a
 	 * handler claimed. The drain parks on that work reaching zero or the
 	 * `drain` deadline expiring, emits `drain` with both remaining counts, and
-	 * then closes — dropping idle keep-alive sockets on a clean drain, and
-	 * destroying every open socket (including the claimed upgraded ones node's
-	 * own force-close cannot reach) when either count is still non-zero. It
-	 * therefore always resolves; the `drain` counts say whether anything was cut.
+	 * then closes, destroying every socket still open (including the claimed
+	 * upgraded ones node's own force-close cannot reach). After a clean drain
+	 * no socket carries a request, so the close ends only idle keep-alive
+	 * connections and connections that never sent one; when either count is
+	 * still non-zero it cuts that work. A request that arrives while the drain
+	 * runs is counted and served with its signal already aborted. It therefore
+	 * always resolves; the `drain` counts say whether anything was cut.
 	 *
 	 * @returns Resolves once the listener is closed and the status is `'stopped'`
 	 */

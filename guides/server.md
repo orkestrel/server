@@ -234,13 +234,13 @@ terminal, idempotent teardown. `stop` and `destroy` always resolve: an upgraded 
 handler claimed is drained up to the `drain` deadline and then destroyed,
 never waited on forever.
 
-| Method    | Returns           | Summary                                                                                                                                                           |
-| --------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `use`     | `void`            | Appends one middleware, or an array of them in order, to the onion, outer-to-inner in call order.                                                                 |
-| `upgrade` | `void`            | Registers an `UpgradeHandler` claimant that runs in registration order; a claimed socket is tracked until it closes.                                              |
-| `start`   | `Promise<number>` | Binds the configured `host` and `port`, or an ephemeral port, under an optional caller `AbortSignal`, and resolves the actually-bound port.                       |
-| `stop`    | `Promise<void>`   | Stops gracefully: refuses new connections, fires the stop signal, drains in-flight requests and claimed upgraded sockets up to the `drain` deadline, then closes. |
-| `destroy` | `Promise<void>`   | Tears down for good: force-closes the listener and every socket, then the emitter — terminal and idempotent from any state.                                       |
+| Method    | Returns           | Summary                                                                                                                                                                         |
+| --------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `use`     | `void`            | Appends one middleware, or an array of them in order, to the onion, outer-to-inner in call order.                                                                               |
+| `upgrade` | `void`            | Registers an `UpgradeHandler` claimant that runs in registration order; a claimed socket is tracked until it closes.                                                            |
+| `start`   | `Promise<number>` | Binds the configured `host` and `port`, or an ephemeral port, under an optional caller `AbortSignal`, and resolves the actually-bound port.                                     |
+| `stop`    | `Promise<void>`   | Stops gracefully: fires the stop signal, drains in-flight requests and claimed upgraded sockets up to the `drain` deadline, then closes the listener and every connection left. |
+| `destroy` | `Promise<void>`   | Tears down for good: force-closes the listener and every socket, then the emitter — terminal and idempotent from any state.                                                     |
 
 ## Contract
 
@@ -276,9 +276,18 @@ These invariants hold across `src/server` ↔ `server.md`.
 5. **Graceful drain is event-driven, never a busy-loop.** `stop()` fires the
    stop signal, arms a `@orkestrel/timeout` deadline, and parks on the
    drainable count reaching zero or the deadline firing (a wake-park, not
-   polling); it then emits `drain` with the still-pending counts and closes —
-   dropping idle keep-alive sockets always, force-closing every open socket
-   only when the deadline fired with work still pending (or on `destroy()`).
+   polling); it then emits `drain` with the still-pending counts and closes,
+   destroying every socket still open. After a clean drain no socket carries
+   a request, so the close ends only idle keep-alive connections and
+   connections that never sent a request; node counts the latter as neither
+   idle nor active, and `closeIdleConnections()` alone would leave one holding
+   `stop()` open until the peer drops it. After an expired drain the same
+   close cuts the work still pending. No I/O turn separates the drain from
+   the close, so a request either reached the server before the drain settled
+   or meets a closed connection. A request that reaches the server after
+   `stop()` begins, on a kept-alive connection or on a connection the
+   listener accepts before it closes, is in-flight work: the drain waits for
+   it, and its `request.signal` is already aborted.
    Drainable work is every in-flight request plus every upgraded socket a
    handler claimed, because a long-lived upgraded connection is work a
    graceful stop lets finish rather than cuts mid-frame. `drain` carries
@@ -287,8 +296,8 @@ These invariants hold across `src/server` ↔ `server.md`.
    upgraded socket from its own connection set, so neither
    `closeIdleConnections()` nor `closeAllConnections()` reaches it while
    `server.close()` still waits on it, and the server therefore tracks each
-   claimed socket until it closes and destroys the survivors itself on a
-   forced close. The claimant still owns the socket; tracking only watches it.
+   claimed socket until it closes and destroys the survivors itself when it
+   closes. The claimant still owns the socket; tracking only watches it.
    A handler that wants a protocol-clean goodbye — a WebSocket close frame —
    sends it on the `stop` event, which fires before the drain begins, and the
    drain then settles on that close instead of running the deadline out. A
@@ -534,9 +543,11 @@ function streamHandler(): Response {
 
 ### Graceful shutdown
 
-`stop()` refuses new connections, gives in-flight work up to the `drain`
-deadline, then closes; `destroy()` is the final, idempotent teardown. In-flight
-work is requests and claimed upgraded sockets, so each call always returns.
+`stop()` gives in-flight work up to the `drain` deadline, then closes the
+listener and every connection it still holds; `destroy()` is the final,
+idempotent teardown. In-flight work is requests and claimed upgraded sockets,
+so each call always returns. An idle keep-alive connection or a connection
+that never sent a request costs `stop()` no wait.
 
 ```ts
 import { createServer } from '@orkestrel/server'
@@ -727,7 +738,10 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   the status matrix, restart-fresh-abort, caller-cancelled / timed-out / clean
   bounded startup, `EADDRINUSE` honesty, host/port binds, ephemeral default,
   connection / header / per-socket request caps, graceful-vs-forced drain,
-  the held-upgraded-socket stop (drained to the deadline then cut, settled
+  the stop that ends a connection which never sent a request inside the
+  deadline, finishes a request in flight beside it, serves a kept-alive
+  request sent during the drain with its signal aborted, and then closes that
+  idle connection, the held-upgraded-socket stop (drained to the deadline then cut, settled
   early when the claimant closes it, reported on `drain`, and force-closed by
   `destroy()`) against a no-socket control, 20-parallel-none-dropped,
   connection facts threaded into state,

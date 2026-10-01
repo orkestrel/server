@@ -5,10 +5,12 @@ import type { DispatcherInterface } from '@orkestrel/router'
 import type { ConnectionStateFunction, ServerInterface, ServerOptions } from '@src/server'
 import { once } from 'node:events'
 import http from 'node:http'
+import net from 'node:net'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, createStream, HTTPError, isServerError } from '@src/server'
-import { createRecorder, waitForDelay } from '@orkestrel/test'
+import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
+import { waitForSocketClose } from '@orkestrel/test/server'
 import {
 	holdUpgrade,
 	openPausedResponse,
@@ -616,6 +618,138 @@ describe('Server — graceful drain', () => {
 		await server.stop()
 		expect(server.status).toBe('stopped')
 		await inflight
+	})
+})
+
+describe('Server — stop ends the connections no request holds', () => {
+	it('closes a connection that never sent a request, well inside the drain deadline', async () => {
+		const server = track(
+			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 10_000 }),
+		)
+		const port = await server.start()
+		// What a client leaves behind after it aborts a fetch: a connection that sends nothing.
+		// node counts it as neither idle nor active, so only an explicit close ends it.
+		const silent = net.createConnection({ port, host: '127.0.0.1' })
+		try {
+			await once(silent, 'connect')
+			// The listener accepts connections in arrival order, so a later connection's round trip
+			// proves the server already holds the silent one before `stop()` runs.
+			const reply = await rawRequest(
+				port,
+				'GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n',
+			)
+			expect(reply).toContain('pong')
+			const started = performance.now()
+			const stopping = server.stop()
+			await waitForSocketClose(silent, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(server.status).toBe('stopped')
+		} finally {
+			silent.destroy()
+		}
+	})
+
+	it('finishes a request in flight across stop() before it ends the silent connection beside it', async () => {
+		const arrived = Promise.withResolvers<void>()
+		const release = Promise.withResolvers<void>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({
+			method: 'GET',
+			path: '/slow',
+			handler: async () => {
+				arrived.resolve()
+				await release.promise
+				return new Response('done')
+			},
+		})
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher,
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const silent = net.createConnection({ port, host: '127.0.0.1' })
+		try {
+			await once(silent, 'connect')
+			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
+			await arrived.promise
+			const started = performance.now()
+			const stopping = server.stop()
+			release.resolve()
+			const response = await inflight
+			expect(await response.text()).toBe('done')
+			await waitForSocketClose(silent, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			// The drain settled with nothing pending, so the close that followed cut no request.
+			expect(drained.calls).toEqual([[0, 0]])
+		} finally {
+			silent.destroy()
+		}
+	})
+
+	it('serves a request a kept-alive connection sends during the drain, then closes that idle connection', async () => {
+		const arrived = Promise.withResolvers<void>()
+		const release = Promise.withResolvers<void>()
+		const dispatcher = createDispatcher<undefined>()
+		dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
+		dispatcher.add({
+			method: 'GET',
+			path: '/slow',
+			handler: async () => {
+				arrived.resolve()
+				await release.promise
+				return new Response('done')
+			},
+		})
+		dispatcher.add({
+			method: 'GET',
+			path: '/signal',
+			handler: (request) => new Response(`aborted=${String(request.signal.aborted)}`),
+		})
+		const drained = createRecorder<readonly [number, number]>()
+		const server = track(
+			createServer({
+				dispatcher,
+				state: () => undefined,
+				drain: 10_000,
+				on: { drain: drained.handler },
+			}),
+		)
+		const port = await server.start()
+		const kept = net.createConnection({ port, host: '127.0.0.1' })
+		let received = ''
+		kept.on('data', (chunk: Buffer) => {
+			received += chunk.toString('utf8')
+		})
+		try {
+			await once(kept, 'connect')
+			kept.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+			await waitForCondition('the kept-alive reply before stop()', () => received.includes('pong'))
+			// A request held in flight keeps the drain parked while the kept-alive connection sends.
+			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
+			await arrived.promise
+			const started = performance.now()
+			const stopping = server.stop()
+			kept.write('GET /signal HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+			// The stopping state serves it as in-flight work whose stop signal has already fired.
+			await waitForCondition('the kept-alive reply during the drain', () =>
+				received.includes('aborted=true'),
+			)
+			release.resolve()
+			expect(await (await inflight).text()).toBe('done')
+			await waitForSocketClose(kept, { budget: 1_000 })
+			await stopping
+			expect(performance.now() - started).toBeLessThan(1_000)
+			expect(drained.calls).toEqual([[0, 0]])
+		} finally {
+			kept.destroy()
+		}
 	})
 })
 
