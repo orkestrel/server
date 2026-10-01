@@ -18,6 +18,7 @@ import type {
 } from './types.js'
 import { addAbortListener, once } from 'node:events'
 import { createServer as createHTTPServer } from 'node:http'
+import { finished } from 'node:stream/promises'
 import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
@@ -48,11 +49,11 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   observe cancellation (a request that arrives during the drain is served
  *   with that signal already aborted), drains in-flight requests and
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
- *   busy-loop), then closes → `stopped`. After a clean drain the close ends
- *   the idle keep-alive connections and destroys every connection Node has
- *   read no request from; a connection whose request reached the server stays
- *   open until it closes. After an expired drain the close destroys every
- *   socket. `destroy()` is the idempotent final teardown.
+ *   busy-loop), then closes → `stopped`. After a clean drain the close
+ *   destroys every connection that carries no open request exchange, and a
+ *   connection that still carries one ends when its last exchange completes.
+ *   After an expired drain the close destroys every socket. `destroy()` is
+ *   the idempotent final teardown.
  * - **Per request.** In-flight is tracked (finished on response `finish` or
  *   `close`); a `Request` is built through the router's `buildRequest`, its
  *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
@@ -78,7 +79,7 @@ import { HTTPError, isHTTPError, ServerError } from './errors.js'
  *   throwing handler is treated as declined and surfaced on `error`, an
  *   unclaimed upgrade destroys the socket), bound per-run to this instance.
  *   A claimed socket joins `#upgraded` until it closes: the claimant still
- *   owns it, and the tracking exists because node detaches an upgraded socket
+ *   owns it, and the tracking exists because Node detaches an upgraded socket
  *   from the set its own close calls walk, so nothing else can end it.
  * - **Observable.** Owns an {@link Emitter} over {@link ServerEventMap}
  *   exposed as `readonly emitter`; the emitter isolates a listener throw and
@@ -91,7 +92,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #middleware: Array<MiddlewareHandler<TState>>
 	readonly #upgradeHandlers: UpgradeHandler[] = []
 	readonly #upgraded = new Set<Duplex>()
-	readonly #unused = new Set<Socket>()
+	readonly #exchanges = new Map<Socket, number>()
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
 	readonly #configuredPort: number | undefined
@@ -270,7 +271,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		const finish = this.#trackStart()
 		response.once('finish', finish)
 		response.once('close', finish)
-		this.#unused.delete(message.socket)
+		void this.#trackExchange(message, response)
 		void this.#accept(message, response)
 	}
 
@@ -460,16 +461,15 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	// Close the underlying server, resolving after the listener closes, which
 	// Node does only after every connection has closed. A clean close (the
-	// drain settled) ends the idle keep-alive connections and destroys every
-	// connection Node has read no request from: Node does not count a
-	// never-used connection as idle, so `closeIdleConnections()` alone leaves
-	// it holding `close()` open until the peer drops it. A connection whose
-	// request reached the server stays open, because destroying one whose body
-	// still uploads after its response can reset the connection and lose that
-	// response. No I/O callback runs between the drain's settle and this call,
-	// so every request Node read before it was counted. A forced close (the
-	// drain deadline expired, `destroy`, or a failed bind) destroys every
-	// socket.
+	// drain settled) destroys every connection with no open exchange: one that
+	// never sent a request, one partway through a header block, and an idle
+	// keep-alive one. That covers every connection `closeIdleConnections()`
+	// ends, which `server.close()` also calls itself. A connection with an open
+	// exchange, such as one whose body still uploads after its response, stays
+	// open, because destroying it can reset the connection and lose that
+	// response; `#trackExchange` ends it when its count returns to zero. A
+	// forced close (the drain deadline expired, `destroy`, or a failed bind)
+	// destroys every socket.
 	//
 	// A protocol-upgraded socket needs the extra loop: Node detaches it from
 	// the connection set `closeAllConnections()` walks, so that call never
@@ -482,17 +482,36 @@ export class Server<TState> implements ServerInterface<TState> {
 				server.closeAllConnections()
 				for (const socket of this.#upgraded) socket.destroy()
 			} else {
-				server.closeIdleConnections()
-				for (const socket of this.#unused) socket.destroy()
+				for (const [socket, open] of this.#exchanges) if (open === 0) socket.destroy()
 			}
 		})
 	}
 
-	// Watch a connection until Node reads its first request from it or it
-	// closes, so a clean close can find the connections no request reached.
+	// Count a connection's open exchanges from its accept to its close, so a
+	// clean close can find the connections that carry none.
 	#trackConnection(socket: Socket): void {
-		this.#unused.add(socket)
-		socket.once('close', () => this.#unused.delete(socket))
+		this.#exchanges.set(socket, 0)
+		socket.once('close', () => this.#exchanges.delete(socket))
+	}
+
+	// Count one exchange open on its connection until both its request message
+	// has ended or closed and its response has finished or closed; a count, not
+	// a flag, because a pipelining client holds several at once. While a clean
+	// close waits, the connection ends as its count returns to zero, so an idle
+	// or trickling peer cannot hold `stop()`. A listener that is no longer
+	// listening while the status is `stopping` marks that close.
+	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
+		const socket = message.socket
+		const open = this.#exchanges.get(socket)
+		if (open === undefined) return
+		this.#exchanges.set(socket, open + 1)
+		await Promise.allSettled([finished(message), finished(response)])
+		const left = this.#exchanges.get(socket)
+		if (left === undefined) return
+		this.#exchanges.set(socket, left - 1)
+		if (left === 1 && this.#status === 'stopping' && this.#http?.listening === false) {
+			socket.destroy()
+		}
 	}
 
 	// Everything `stop()` has to drain: in-flight requests plus the upgraded
@@ -522,10 +541,10 @@ export class Server<TState> implements ServerInterface<TState> {
 	#trackStart(): () => void {
 		this.#enter()
 		this.#pending += 1
-		let finished = false
+		let done = false
 		return () => {
-			if (finished) return
-			finished = true
+			if (done) return
+			done = true
 			this.#pending -= 1
 			this.#settle()
 		}

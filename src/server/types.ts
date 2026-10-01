@@ -720,8 +720,9 @@ export interface ServerOptions<TState> {
  * the actually-bound port. A cancelled or expired bind closes its partial server
  * and resets to `idle`. `stop()` fires the stop signal so in-flight handlers
  * can observe it, drains in-flight requests and claimed upgraded sockets up to
- * the configured deadline, then closes the listener and every connection left.
- * `destroy()` is the final idempotent teardown. Per request: a `Request` is
+ * the configured deadline, then closes the listener and ends each connection
+ * when no request exchange is open on it; after an expired drain it destroys
+ * every socket. `destroy()` is the final idempotent teardown. Per request: a `Request` is
  * built through the router's `buildRequest` (its signal linked to the server's
  * stop signal), the composed middleware onion runs terminating in
  * `dispatcher.handle`, and the result is written back through
@@ -784,34 +785,38 @@ export interface ServerInterface<TState> {
 	start(signal?: AbortSignal): Promise<number>
 	/**
 	 * Stops gracefully: fires the stop signal, drains in-flight requests and claimed upgraded
-	 * sockets up to the `drain` deadline, then closes the listener and every connection left.
+	 * sockets up to the `drain` deadline, then closes the listener and ends each connection when
+	 * no request exchange is open on it.
 	 *
 	 * @remarks
 	 * Drainable work is every in-flight request plus every upgraded socket a
 	 * handler claimed. The drain parks on that work reaching zero or the
 	 * `drain` deadline expiring, emits `drain` with both remaining counts, and
 	 * then closes the listener. A request that arrives while the drain runs is
-	 * counted and served with its signal already aborted. After a clean drain
-	 * the close ends every idle keep-alive connection and destroys every
-	 * connection Node has read no request from: one that never sent a request,
-	 * which Node does not count as idle, and one whose header block has not
-	 * fully arrived, because a request whose headers never completed is not
-	 * counted work. A connection whose request reached the server stays open,
-	 * including one whose handler answered while its body still uploads, and
-	 * `stop()` resolves after that connection closes. When either count is
-	 * still non-zero, the close destroys every socket, including the claimed
-	 * upgraded ones Node's own force-close cannot reach; `stop()` therefore
-	 * always resolves after an expired drain. The `drain` counts say whether
-	 * anything was cut.
+	 * counted and served with its signal already aborted. An exchange opens
+	 * when a request reaches the handler and stays open until its request
+	 * message has ended or closed and its response has finished or closed.
+	 * After a clean drain the close destroys every connection with no open
+	 * exchange: an idle keep-alive one, one that never sent a request, and one
+	 * partway through any header block, because a request whose headers never
+	 * completed is not counted work. A connection that still carries an open
+	 * exchange, including one whose handler answered while its body still
+	 * uploads, ends when its last exchange completes, and `stop()` resolves
+	 * after that connection closes. A request Node answers itself, such as the
+	 * `417` for an unknown `Expect` value, never reaches the handler and opens
+	 * no exchange. When either count is still non-zero, the close destroys
+	 * every socket, including the claimed upgraded ones Node's own force-close
+	 * cannot reach; `stop()` therefore always resolves after an expired drain.
+	 * The `drain` counts say whether anything was cut.
 	 *
-	 * @returns Resolves once the listener is closed and the status is `'stopped'`
+	 * @returns Resolves after the listener is closed and the status is `'stopped'`
 	 */
 	stop(): Promise<void>
 	/**
 	 * Tears down for good: force-closes the listener and every socket, then the emitter —
 	 * terminal and idempotent from any state.
 	 *
-	 * @returns Resolves once nothing is left open; idempotent from any state
+	 * @returns Resolves after nothing is left open; idempotent from any state
 	 */
 	destroy(): Promise<void>
 }
