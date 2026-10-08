@@ -973,10 +973,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
 			expect(server.status).toBe('stopping')
-			// The rest of the body outsizes the write buffer, so `drain` fires after all of it has passed
-			// to the kernel; the client keeps its side of the socket open, as a keep-alive client does.
-			expect(upload.write(Buffer.alloc(total - first))).toBe(false)
-			await once(upload, 'drain')
+			// The clock starts once the rest of the body has passed to the kernel: at `drain` when the write
+			// buffered, or at once when the host's send buffer took it whole (Windows loopback does, read
+			// 2026-10-07). The client keeps its side of the socket open, as a keep-alive client does.
+			if (!upload.write(Buffer.alloc(total - first))) await once(upload, 'drain')
 			const ended = performance.now()
 			await waitForSocketClose(upload, { budget: 1_000 })
 			await stopping
