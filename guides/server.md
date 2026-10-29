@@ -64,6 +64,17 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 | `createServer`     | function | Creates a `ServerInterface` — the node face's HTTP server facade over a consumed `@orkestrel/router` dispatcher.                             |
 | `createStream`     | function | Creates a `StreamInterface` — a generic Server-Sent-Events stream whose `response` is a fetch-standard streaming `Response` a route returns. |
 
+### Startup ownership
+
+| API             | Kind  | Shape                     | Summary                                                                     |
+| --------------- | ----- | ------------------------- | --------------------------------------------------------------------------- |
+| `ServerBinding` | class | `new () => ServerBinding` | Owns one startup attempt's listening subscription and validated bound port. |
+
+`Server` creates a binding per startup attempt. It retains the listening promise through failure
+cleanup and records the native address before publishing the port. The error listener is installed
+before cancellation, pending-listener settlement precedes forced close, and signal and deadline
+cleanup finish before the start event is emitted.
+
 ### Constants
 
 A `Shape` cell holds the constant's declared type.
@@ -122,7 +133,7 @@ A `Shape` cell holds the constant's declared type.
 | `parseEncoding`          | function | Parses a raw `Content-Encoding` header value into a decompressible `Encoding` — the boundary `readBody` coerces through to decide whether a request body needs transparent decompression.                                                                                     |
 | `decompressRequestBody`  | function | Decompresses an already-collected, `gzip`/`deflate`-encoded byte sequence transparently through `DecompressionStream`, capping the decompressed output — the zip-bomb defense.                                                                                                |
 | `readBody`               | function | Collects and decodes a `Request` body — the shared body-collection pipeline surfaced to middleware and handlers as the middleware context's cached `body()`. An empty body and a malformed `application/json` body each decode to `undefined`.                                |
-| `isHTTPError`            | function | Narrows an unknown caught value to an `HTTPError`, including a subclass such as `ContentTooLargeError`, and recognizes an instance from another copy of this package through a structural brand fallback.                                                                     |
+| `isHTTPError`            | function | Narrows an unknown caught value to an `HTTPError`, including a subclass such as `ContentTooLargeError`, and recognizes an instance from another copy of this package through its own identity brand.                                                                          |
 | `isServerError`          | function | Narrows an unknown caught value to a `ServerError` — the code-bearing refusal of a call the caller programmed.                                                                                                                                                                |
 | `isAddressInfo`          | function | Checks whether a `node:net` `server.address()` return is the structured `AddressInfo` (carrying a numeric `port`) rather than a pipe `string` or `null` — the total, never-throwing narrow `discoverPort` and the `Server`'s own port resolution read the bound port through. |
 | `probePort`              | function | Binds and closes a throwaway TCP server to resolve one available port.                                                                                                                                                                                                        |
@@ -175,6 +186,18 @@ A `Shape` cell holds an interface's data members as bare names in braces, `?` ma
 Each interface's `readonly` data members stay Surface rows, and its call-signature
 members are documented under [Methods](#methods). `ServerInterface.address` is the
 bound node `AddressInfo` while the listener is active and `undefined` otherwise.
+
+### Error identity and body iteration
+
+The error guards and request readers expose these primitives.
+
+| API                             | Kind     | Summary                                                                               |
+| ------------------------------- | -------- | ------------------------------------------------------------------------------------- |
+| `SERVER_ERROR_BRAND`            | const    | Names the identity brand carried by lifecycle errors across package copies.           |
+| `CONTENT_TOO_LARGE_ERROR_BRAND` | const    | Names the identity brand carried by body-limit errors across package copies.          |
+| `isContentTooLargeError`        | function | Recognizes a branded body-limit error, including subclasses and other package copies. |
+| `iterateMediaMatches`           | function | Yields matching media ranges through the first exact rejection.                       |
+| `iterateRequestBody`            | function | Yields the same lazily collected request-body promise on every read.                  |
 
 ## Methods
 
@@ -455,18 +478,11 @@ These invariants hold across `src/server` ↔ `server.md`.
     `'Internal Server Error'` string unless `expose` is explicitly `true`; an
     `HTTPError`'s own `message` is always client-facing (it is the handler's
     deliberate signal), independent of `expose`.
-18. **`isHTTPError` recognizes an `HTTPError` across package copies, not only
-    `instanceof`.** A version-skewed or workspace-linked duplicate install of
-    this package produces a second, distinct `HTTPError` constructor —
-    `instanceof` fails across the copies even though the thrown value is
-    structurally identical, which would otherwise collapse a deliberate 4xx
-    into the built-in boundary's 500 fallback. `isHTTPError` tries
-    `instanceof` first, then falls back to a total structural check: the
-    value must carry a stable cross-copy brand (a `Symbol.for`-interned key,
-    so every copy resolves the same symbol) and expose a numeric `status` and
-    a string `message` — the exact fields the boundary reads off a
-    recognized error. The brand is an implementation detail of `HTTPError`'s
-    constructor, not a field a consumer sets by hand.
+18. **Error guards recognize independent package copies through an own identity brand.**
+    A recognized value is a global Error with a derived prototype. Its own brand holds the
+    value itself. The guard checks the declared status or code, message, and optional context.
+    Object and callable contexts are accepted. Subclass names are unrestricted. Transparent
+    proxies, unbranded look-alikes, and branded plain objects are rejected.
 19. **SSE producers can cooperate with real process-local transport
     backpressure.** `StreamInterface.write` returns `true` only while the
     underlying `ReadableStream` controller retains positive desired size after

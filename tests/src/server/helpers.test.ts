@@ -1,3 +1,4 @@
+import type { ServerAppState } from '../../setupServer.js'
 import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
@@ -46,50 +47,27 @@ import {
 	writeSignedCookie,
 } from '@src/server'
 import { buildContext } from '../../setup.js'
-
-async function gzip(text: string): Promise<Uint8Array<ArrayBuffer>> {
-	const source = new ReadableStream<Uint8Array<ArrayBuffer>>({
-		start(controller) {
-			controller.enqueue(new TextEncoder().encode(text))
-			controller.close()
-		},
-	})
-	const compressed = source.pipeThrough(new CompressionStream('gzip'))
-	const reader = compressed.getReader()
-	const chunks: Uint8Array[] = []
-	let size = 0
-	for (;;) {
-		const { done, value } = await reader.read()
-		if (done) break
-		chunks.push(value)
-		size += value.byteLength
-	}
-	const merged = new Uint8Array(size)
-	let offset = 0
-	for (const chunk of chunks) {
-		merged.set(chunk, offset)
-		offset += chunk.byteLength
-	}
-	return merged
-}
+import {
+	ServerObservation,
+	ServerUserState,
+	compressServerFixture,
+	createTraceLayer,
+	repeatServerNext,
+	raceServerNext,
+	refuseServerRequest,
+	createObservedRefusal,
+	substituteServerRequest,
+	createResponseHeader,
+	stashServerUser,
+} from '../../setupServer.js'
 
 // ── compose (the middleware onion) ───────────────────────────────────────────
 
 describe('compose', () => {
 	it('runs middleware outermost-first around the terminal', async () => {
 		const order: string[] = []
-		const first: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
-			order.push('first-before')
-			const response = await next()
-			order.push('first-after')
-			return response
-		}
-		const second: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
-			order.push('second-before')
-			const response = await next()
-			order.push('second-after')
-			return response
-		}
+		const first = createTraceLayer(order, 'first')
+		const second = createTraceLayer(order, 'second')
 		const handle = compose([first, second], async () => {
 			order.push('terminal')
 			return new Response('ok')
@@ -105,21 +83,12 @@ describe('compose', () => {
 	})
 
 	it('rejects a second call to the same next() with a ServerError of code NEXT', async () => {
-		const doubleNext: MiddlewareHandler<Record<string, never>> = async (
-			_request,
-			_context,
-			next,
-		) => {
-			await next()
-			return next()
-		}
+		const doubleNext = repeatServerNext
 		const handle = compose([doubleNext], async () => new Response('ok'))
-		let caught: unknown
-		try {
-			await handle(new Request('http://localhost/'), buildContext({}))
-		} catch (error) {
-			caught = error
-		}
+		const caught = await handle(new Request('http://localhost/'), buildContext({})).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
 		if (!isServerError(caught))
 			throw new Error(`expected a ServerError, received ${String(caught)}`)
 		expect(caught.code).toBe('NEXT')
@@ -127,105 +96,71 @@ describe('compose', () => {
 	})
 
 	it('rejects the second of two CONCURRENT next() calls from the same middleware', async () => {
-		const concurrentDoubleNext: MiddlewareHandler<Record<string, never>> = async (
-			_request,
-			_context,
-			next,
-		) => {
-			const results = await Promise.allSettled([next(), next()])
-			const rejected = results.find((result) => result.status === 'rejected')
-			if (rejected === undefined || rejected.status !== 'rejected') {
-				throw new Error('expected one of the concurrent next() calls to reject')
-			}
-			return new Response(rejected.reason instanceof Error ? rejected.reason.message : 'unknown')
-		}
+		const concurrentDoubleNext = raceServerNext
 		const handle = compose([concurrentDoubleNext], async () => new Response('ok'))
 		const response = await handle(new Request('http://localhost/'), buildContext({}))
 		await expect(response.text()).resolves.toBe('next() was already called by this middleware')
 	})
 
 	it('short-circuits when a middleware never calls next', async () => {
-		let terminalRan = false
-		const shortCircuit: MiddlewareHandler<Record<string, never>> = async () =>
-			new Response('blocked', { status: 403 })
+		const terminalRan = new ServerObservation(false)
+		const shortCircuit = refuseServerRequest
 		const handle = compose([shortCircuit], async () => {
-			terminalRan = true
+			terminalRan.value = true
 			return new Response('ok')
 		})
 		const response = await handle(new Request('http://localhost/'), buildContext({}))
 		expect(response.status).toBe(403)
-		expect(terminalRan).toBe(false)
+		expect(terminalRan.value).toBe(false)
 	})
 
 	it('substitutes the downstream request by using next(newRequest)', async () => {
-		let seenUrl = ''
-		const substitute: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) =>
-			next(new Request('http://localhost/substituted'))
+		const seenUrl = new ServerObservation('')
+		const substitute = substituteServerRequest
 		const handle = compose([substitute], async (request) => {
-			seenUrl = request.url
+			seenUrl.value = request.url
 			return new Response('ok')
 		})
 		await handle(new Request('http://localhost/original'), buildContext({}))
-		expect(seenUrl).toBe('http://localhost/substituted')
+		expect(seenUrl.value).toBe('http://localhost/substituted')
 	})
 
 	it('lets a middleware transform the response after next()', async () => {
-		const addHeader: MiddlewareHandler<Record<string, never>> = async (
-			_request,
-			_context,
-			next,
-		) => {
-			const response = await next()
-			response.headers.set('x-test', 'yes')
-			return response
-		}
+		const addHeader = createResponseHeader('x-test', 'yes')
 		const handle = compose([addHeader], async () => new Response('ok'))
 		const response = await handle(new Request('http://localhost/'), buildContext({}))
 		expect(response.headers.get('x-test')).toBe('yes')
 	})
 
 	it('a short-circuit skips downstream but an outer middleware still post-processes the response', async () => {
-		let terminalRan = false
-		let downstreamRan = false
-		const outer: MiddlewareHandler<Record<string, never>> = async (_request, _context, next) => {
-			const response = await next()
-			response.headers.set('x-outer', 'seen')
-			return response
-		}
-		const shortCircuit: MiddlewareHandler<Record<string, never>> = async () => {
-			downstreamRan = true
-			return new Response('blocked', { status: 403 })
-		}
+		const terminalRan = new ServerObservation(false)
+		const downstreamRan = new ServerObservation(false)
+		const outer = createResponseHeader('x-outer', 'seen')
+		const shortCircuit = createObservedRefusal(downstreamRan)
 		const handle = compose([outer, shortCircuit], async () => {
-			terminalRan = true
+			terminalRan.value = true
 			return new Response('ok')
 		})
 		const response = await handle(new Request('http://localhost/'), buildContext({}))
 		expect(response.status).toBe(403)
 		expect(response.headers.get('x-outer')).toBe('seen')
-		expect(terminalRan).toBe(false)
-		expect(downstreamRan).toBe(true)
+		expect(terminalRan.value).toBe(false)
+		expect(downstreamRan.value).toBe(true)
 	})
 
 	it('threads state written by middleware through to a route handler behind a real Dispatcher', async () => {
-		interface RequestState {
-			userId?: string
-		}
-		const dispatcher = createDispatcher<RequestState>()
+		const dispatcher = createDispatcher<ServerUserState>()
 		dispatcher.add({
 			method: 'GET',
 			path: '/whoami/:id',
 			handler: (_request, context) =>
 				Response.json({ params: context.params, userId: context.state.userId }),
 		})
-		const stashUser: MiddlewareHandler<RequestState> = async (request, context, next) => {
-			context.state.userId = 'user-42'
-			return next(request)
-		}
+		const stashUser = stashServerUser
 		const handle = compose([stashUser], (request, context) =>
 			dispatcher.handle(request, context.state),
 		)
-		const state: RequestState = {}
+		const state = new ServerUserState()
 		const request = new Request('http://localhost/whoami/7')
 		const response = await handle(request, {
 			url: new URL(request.url),
@@ -244,16 +179,8 @@ describe('compose', () => {
 
 describe('MiddlewareContext<TState> / NextFunction / MiddlewareHandler<TState> — type shape', () => {
 	it('types context.state and context.url/method/body from TState', () => {
-		interface AppState {
-			readonly userId: string
-		}
-		const context: MiddlewareContext<AppState> = {
-			url: new URL('http://localhost/'),
-			method: 'GET',
-			state: { userId: 'me' },
-			body: async () => undefined,
-		}
-		expectTypeOf(context.state).toEqualTypeOf<AppState>()
+		const context = buildContext<ServerAppState>({ userId: 'me' })
+		expectTypeOf(context.state).toEqualTypeOf<ServerAppState>()
 		expectTypeOf(context.url).toEqualTypeOf<URL>()
 		expectTypeOf(context.method).toEqualTypeOf<string>()
 		expectTypeOf(context.body).returns.toEqualTypeOf<Promise<unknown>>()
@@ -265,15 +192,12 @@ describe('MiddlewareContext<TState> / NextFunction / MiddlewareHandler<TState> �
 	})
 
 	it('types MiddlewareHandler<TState> as (request, context, next) => Response | Promise<Response>', () => {
-		interface AppState {
-			readonly userId: string
-		}
-		expectTypeOf<MiddlewareHandler<AppState>>().parameter(0).toEqualTypeOf<Request>()
-		expectTypeOf<MiddlewareHandler<AppState>>()
+		expectTypeOf<MiddlewareHandler<ServerAppState>>().parameter(0).toEqualTypeOf<Request>()
+		expectTypeOf<MiddlewareHandler<ServerAppState>>()
 			.parameter(1)
-			.toEqualTypeOf<MiddlewareContext<AppState>>()
-		expectTypeOf<MiddlewareHandler<AppState>>().parameter(2).toEqualTypeOf<NextFunction>()
-		expectTypeOf<MiddlewareHandler<AppState>>().returns.toEqualTypeOf<
+			.toEqualTypeOf<MiddlewareContext<ServerAppState>>()
+		expectTypeOf<MiddlewareHandler<ServerAppState>>().parameter(2).toEqualTypeOf<NextFunction>()
+		expectTypeOf<MiddlewareHandler<ServerAppState>>().returns.toEqualTypeOf<
 			Response | Promise<Response>
 		>()
 	})
@@ -937,7 +861,7 @@ describe('readBody', () => {
 	})
 
 	it('transparently decompresses a gzip body', async () => {
-		const compressed = await gzip('{"greeting":"hi"}')
+		const compressed = await compressServerFixture('{"greeting":"hi"}')
 		const request = new Request('http://localhost/', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
@@ -947,7 +871,7 @@ describe('readBody', () => {
 	})
 
 	it('zip-bomb: aborts before materializing when decompressed output exceeds the cap', async () => {
-		const compressed = await gzip('x'.repeat(1_000_000))
+		const compressed = await compressServerFixture('x'.repeat(1_000_000))
 		const request = new Request('http://localhost/', {
 			method: 'POST',
 			headers: { 'content-encoding': 'gzip' },
@@ -959,7 +883,7 @@ describe('readBody', () => {
 	})
 
 	it('isolation case: a payload under the wire limit but over the decompression cap is a 413, not a pass', async () => {
-		const compressed = await gzip('y'.repeat(500_000))
+		const compressed = await compressServerFixture('y'.repeat(500_000))
 		expect(compressed.byteLength).toBeLessThan(50_000)
 		const request = new Request('http://localhost/', {
 			method: 'POST',
@@ -977,12 +901,10 @@ describe('readBody', () => {
 			headers: { 'content-encoding': 'gzip' },
 			body: new Uint8Array([1, 2, 3, 4, 5]),
 		})
-		let caught: unknown
-		try {
-			await readBody(request, { limit: 1000, decompression: 1000 })
-		} catch (error) {
-			caught = error
-		}
+		const caught = await readBody(request, { limit: 1000, decompression: 1000 }).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
 		expect(caught).toBeInstanceOf(HTTPError)
 		expect(caught instanceof ContentTooLargeError).toBe(false)
 		const status = caught instanceof HTTPError ? caught.status : undefined
@@ -992,13 +914,13 @@ describe('readBody', () => {
 
 describe('decompressRequestBody', () => {
 	it('decompresses gzip bytes back to their original content', async () => {
-		const compressed = await gzip('hello world')
+		const compressed = await compressServerFixture('hello world')
 		const bytes = await decompressRequestBody(compressed, 'gzip', 1_000_000)
 		expect(new TextDecoder().decode(bytes)).toBe('hello world')
 	})
 
 	it('an uncapped (non-positive) cap allows a large decompressed output', async () => {
-		const compressed = await gzip('z'.repeat(200_000))
+		const compressed = await compressServerFixture('z'.repeat(200_000))
 		const bytes = await decompressRequestBody(compressed, 'gzip', 0)
 		expect(bytes.byteLength).toBe(200_000)
 	})

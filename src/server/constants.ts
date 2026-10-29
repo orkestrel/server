@@ -128,3 +128,9 @@ export const COMPRESSIBLE_TYPES: ReadonlySet<string> = Object.freeze(
  * shared default.
  */
 export const DEFAULT_ENCODINGS: readonly Encoding[] = Object.freeze(['gzip', 'deflate'])
+
+/** Names the identity brand carried by lifecycle errors across package copies. */
+export const SERVER_ERROR_BRAND = Symbol.for('@orkestrel/server.ServerError')
+
+/** Names the identity brand carried by body-limit errors across package copies. */
+export const CONTENT_TOO_LARGE_ERROR_BRAND = Symbol.for('@orkestrel/server.ContentTooLargeError')

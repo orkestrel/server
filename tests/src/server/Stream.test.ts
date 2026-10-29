@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { StreamInterface } from '@src/server'
 import { Stream } from '@src/server'
+import { ServerObservation } from '../../setupServer.js'
 
 // Mirror of `src/server/Stream.ts` — the SSE handle over a real
 // `ReadableStream` (no mocks): the response it opens, the wire it writes, the
@@ -65,19 +66,19 @@ describe('Stream', () => {
 	it('parks at the stream high-water mark and wakes on the next consumer pull', async () => {
 		const stream = new Stream()
 		expect(stream.write({ data: 'queued' })).toBe(false)
-		let drained = false
+		const drained = new ServerObservation(false)
 		const draining = stream.drain().then(() => {
-			drained = true
+			drained.value = true
 		})
 		await Promise.resolve()
-		expect(drained).toBe(false)
+		expect(drained.value).toBe(false)
 		const body = stream.response.body
 		expect(body).not.toBeNull()
 		if (body === null) return
 		const reader = body.getReader()
 		const first = await reader.read()
 		await draining
-		expect(drained).toBe(true)
+		expect(drained.value).toBe(true)
 		expect(new TextDecoder().decode(first.value)).toBe('data: queued\n\n')
 		stream.end()
 		await expect(reader.read()).resolves.toEqual({ done: true, value: undefined })

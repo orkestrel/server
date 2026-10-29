@@ -1,34 +1,14 @@
-// A handler signals a client-facing fault by throwing an `HTTPError` carrying
-// the HTTP `status` to send; the server's error boundary turns it into a
-// response of that status. Any other throw is a programmer/runtime error → a
-// 500 (its message hidden unless `expose`). The machine-readable field here is
-// the numeric `status` (plus an optional `context` bag) — `MultipartError` is
-// not declared here: it belongs to `@orkestrel/middleware` with its owner
-// (`createMultipart`).
-//
-// Dual-package hazard: `instanceof HTTPError` fails when the thrown value was
-// constructed by a different copy of this package (version skew, a linked
-// workspace) — the two copies' `HTTPError` constructors are distinct objects
-// even though they are structurally identical. `isHTTPError` therefore tries
-// `instanceof` first (the common, cheap case) and falls back to a total
-// structural check keyed by a `Symbol.for`-interned brand (`HTTP_ERROR_BRAND`,
-// shared across every copy through the global symbol registry) plus the exact
-// fields the server's boundary reads off a recognized error (`status`,
-// `message`) — so a foreign-copy instance the guard accepts can never crash
-// the boundary that trusts it.
-//
-// `ServerError` is the other half of the vocabulary: it reports a call the
-// caller programmed wrong, so it keys on a `ServerErrorCode` rather than a
-// `status`, and `isServerError` narrows it with a plain `instanceof`. A
-// `'STATUS'` lifecycle refusal is raised to the caller that invoked the
-// lifecycle method; a `'NEXT'` double-`next` refusal escapes its middleware
-// into the request boundary, which finds no `status` on it and renders a
-// generic 500. No error boundary consumes it across package copies, so it
-// carries no cross-copy brand.
-
 import type { ServerErrorCode } from './types.js'
-import { isInstance, isNumber, isObject, isString } from '@orkestrel/contract'
-import { HTTP_ERROR_BRAND } from './constants.js'
+import {
+	holds,
+	INTRINSICS,
+	isFunction,
+	isInstance,
+	isNumber,
+	isObject,
+	isString,
+} from '@orkestrel/contract'
+import { CONTENT_TOO_LARGE_ERROR_BRAND, HTTP_ERROR_BRAND, SERVER_ERROR_BRAND } from './constants.js'
 
 /**
  * Represents an error a handler (or middleware) throws to produce an HTTP response of a
@@ -59,13 +39,11 @@ import { HTTP_ERROR_BRAND } from './constants.js'
 export class HTTPError extends Error {
 	readonly status: number
 	readonly context?: Readonly<Record<string, unknown>>
-	// The cross-copy brand (the dual-package hazard) — `isHTTPError`
-	// reads it structurally when `instanceof` fails across package copies.
-	// Not a public field to set by hand: the constructor is the only writer.
-	readonly [HTTP_ERROR_BRAND] = true
+	declare readonly [HTTP_ERROR_BRAND]: this
 
 	constructor(status: number, message: string, context?: Readonly<Record<string, unknown>>) {
 		super(message)
+		Object.defineProperty(this, HTTP_ERROR_BRAND, { value: this })
 		this.name = 'HTTPError'
 		this.status = status
 		if (context !== undefined) this.context = context
@@ -96,6 +74,7 @@ export class HTTPError extends Error {
 export class ContentTooLargeError extends HTTPError {
 	constructor(limit: number) {
 		super(413, `request body exceeds the ${limit}-byte limit`, { limit })
+		Object.defineProperty(this, CONTENT_TOO_LARGE_ERROR_BRAND, { value: this })
 		this.name = 'ContentTooLargeError'
 	}
 }
@@ -103,20 +82,16 @@ export class ContentTooLargeError extends HTTPError {
 /**
  * Narrows an unknown caught value to an {@link HTTPError}, including a subclass such
  * as {@link ContentTooLargeError}, and recognizes an instance from another copy of
- * this package through a structural brand fallback.
+ * this package through its own identity brand.
  *
  * @param value - The value to test (typically a `catch` binding)
  * @returns True if `value` is an {@link HTTPError}; false otherwise
  *
  * @remarks
- * Tries `instanceof` first, then falls back to a total structural check for
- * an instance built by a different copy of this package (the dual-package
- * hazard — version skew, a linked workspace duplicate) whose `HTTPError`
- * constructor is a distinct object from this copy's: the value must carry
- * the cross-copy brand (interned by using `Symbol.for`, so every copy resolves the
- * same key) and expose the exact fields the server's error boundary reads off
- * a recognized `HTTPError` — a numeric `status` and a string `message`. A
- * plain object that merely carries a `status` without the brand is rejected.
+ * Requires a global Error instance with a derived prototype, its own identity brand,
+ * a numeric status, a string message, and an absent or object-valued context.
+ * Callable contexts are accepted. Subclass names are unrestricted.
+ * Transparent proxies and branded plain objects are rejected.
  *
  * @example
  * ```ts
@@ -130,11 +105,34 @@ export class ContentTooLargeError extends HTTPError {
  * ```
  */
 export function isHTTPError(value: unknown): value is HTTPError {
-	if (isInstance(value, HTTPError)) return true
-	if (!isObject(value)) return false
-	if (!(HTTP_ERROR_BRAND in value) || value[HTTP_ERROR_BRAND] !== true) return false
-	if (!('status' in value) || !('message' in value)) return false
-	return isNumber(value.status) && isString(value.message)
+	return holds(() => {
+		if (!isInstance(value, Error) || INTRINSICS.prototype(value) === Error.prototype) return false
+		if (!INTRINSICS.own(value, HTTP_ERROR_BRAND)) return false
+		if (INTRINSICS.describe(value, HTTP_ERROR_BRAND)?.value !== value) return false
+		const context: unknown = INTRINSICS.reflect.read(value, 'context')
+		return (
+			isNumber(INTRINSICS.reflect.read(value, 'status')) &&
+			isString(INTRINSICS.reflect.read(value, 'message')) &&
+			(context === undefined || isObject(context) || isFunction(context))
+		)
+	})
+}
+
+/**
+ * Recognizes a branded body-limit error, including subclasses and other package copies.
+ *
+ * @example
+ * ```ts
+ * isContentTooLargeError(new ContentTooLargeError(1024)) // true
+ * ```
+ */
+export function isContentTooLargeError(value: unknown): value is ContentTooLargeError {
+	return holds(
+		() =>
+			isHTTPError(value) &&
+			INTRINSICS.own(value, CONTENT_TOO_LARGE_ERROR_BRAND) &&
+			INTRINSICS.describe(value, CONTENT_TOO_LARGE_ERROR_BRAND)?.value === value,
+	)
 }
 
 /**
@@ -167,6 +165,7 @@ export class ServerError extends Error {
 
 	constructor(code: ServerErrorCode, message: string, context?: Readonly<Record<string, unknown>>) {
 		super(message)
+		Object.defineProperty(this, SERVER_ERROR_BRAND, { value: this })
 		this.name = 'ServerError'
 		this.code = code
 		if (context !== undefined) this.context = context
@@ -181,10 +180,9 @@ export class ServerError extends Error {
  * @returns True if `value` is a {@link ServerError}; false otherwise
  *
  * @remarks
- * Recognizes an instance built by this copy of the package. A `ServerError`
- * is raised by a `Server` to the caller that invoked it directly, so both sides
- * hold the same copy and the cross-copy brand {@link isHTTPError} needs has no
- * consumer here.
+ * Requires the own identity brand, a declared code, a string message, and an absent
+ * or object-valued context on a global Error with a derived prototype.
+ * Callable contexts and subclasses are accepted; transparent proxies are rejected.
  *
  * @example
  * ```ts
@@ -202,5 +200,16 @@ export class ServerError extends Error {
  * ```
  */
 export function isServerError(value: unknown): value is ServerError {
-	return isInstance(value, ServerError)
+	return holds(() => {
+		if (!isInstance(value, Error) || INTRINSICS.prototype(value) === Error.prototype) return false
+		if (!INTRINSICS.own(value, SERVER_ERROR_BRAND)) return false
+		if (INTRINSICS.describe(value, SERVER_ERROR_BRAND)?.value !== value) return false
+		const code: unknown = INTRINSICS.reflect.read(value, 'code')
+		const context: unknown = INTRINSICS.reflect.read(value, 'context')
+		return (
+			(code === 'STATUS' || code === 'NEXT') &&
+			isString(INTRINSICS.reflect.read(value, 'message')) &&
+			(context === undefined || isObject(context) || isFunction(context))
+		)
+	})
 }

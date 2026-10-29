@@ -1,8 +1,40 @@
+import type * as ServerErrors from '../src/server/errors.js'
 import { once } from 'node:events'
+import { readFileSync } from 'node:fs'
+import { stripTypeScriptTypes } from 'node:module'
+import type { Duplex } from 'node:stream'
+import type { LoopbackInterface } from '@orkestrel/test/server'
+import type { RecorderInterface } from '@orkestrel/test'
+import type { DispatcherInterface } from '@orkestrel/router'
+import type {
+	MiddlewareContext,
+	MiddlewareHandler,
+	NextFunction,
+	ServerInterface,
+} from '@src/server'
+import type { IncomingMessage } from 'node:http'
+import { createDispatcher } from '@orkestrel/router'
 import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { resolveRoot } from '@orkestrel/test'
+
+/** Holds the mutable observation owned by one test invocation. */
+export class ServerObservation<T> {
+	#value: T
+
+	constructor(value: T) {
+		this.#value = value
+	}
+
+	get value(): T {
+		return this.#value
+	}
+
+	set value(value: T) {
+		this.#value = value
+	}
+}
 
 // ── Server-only setup ────────────────────────────────────────────────────────
 //
@@ -12,6 +44,234 @@ import { resolveRoot } from '@orkestrel/test'
 
 /** Holds the workspace root, anchored from this setup file's own location. */
 export const WORKSPACE_ROOT = fileURLToPath(resolveRoot(import.meta))
+
+export interface ServerUpgrade {
+	readonly request: IncomingMessage
+	readonly socket: Duplex
+	readonly head: Buffer
+}
+
+/** Loads the actual error implementation at an independent module identity before build. */
+export async function loadServerErrors(): Promise<typeof ServerErrors> {
+	const source = readFileSync(new URL('../src/server/errors.ts', import.meta.url), 'utf8')
+	const compiled = stripTypeScriptTypes(source)
+		.replace("'@orkestrel/contract'", JSON.stringify(import.meta.resolve('@orkestrel/contract')))
+		.replace(
+			"'./constants.js'",
+			JSON.stringify(new URL('../src/server/constants.ts', import.meta.url).href),
+		)
+	return import(`data:text/javascript,${encodeURIComponent(compiled)}`)
+}
+
+export function trackLoopback(
+	bound: LoopbackInterface[],
+	loopback: LoopbackInterface,
+): LoopbackInterface {
+	bound.push(loopback)
+	return loopback
+}
+
+export function createRawPeer(
+	opened: Array<{ destroy(): void }>,
+	requests: RecorderInterface<[string]>,
+	answer: string,
+): net.Server {
+	return net.createServer((socket) => {
+		opened.push(socket)
+		const chunks: string[] = []
+		socket.on('data', (chunk: Buffer) => {
+			chunks.push(chunk.toString('utf8'))
+			const text = chunks.join('')
+			if (!text.endsWith('\r\n\r\n')) return
+			requests.handler(text)
+			socket.write(answer)
+		})
+	})
+}
+
+export function createAnsweringPeer(paths: RecorderInterface<[string | undefined]>): http.Server {
+	return http.createServer((request, response) => {
+		paths.handler(request.url)
+		response.writeHead(200, { 'Content-Type': 'text/plain' })
+		response.end('parked')
+	})
+}
+
+export function createUpgradePeer(
+	opened: Array<{ destroy(): void }>,
+	handshakes: RecorderInterface<[string | undefined, unknown]>,
+	claimed: Duplex[],
+): http.Server {
+	const server = http.createServer((_request, response) => {
+		response.writeHead(426)
+		response.end()
+	})
+	server.on('upgrade', (request, socket) => {
+		claimed.push(socket)
+		opened.push(socket)
+		handshakes.handler(request.url, request.headers['sec-websocket-key'])
+		socket.write(
+			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+		)
+		// A real peer reads its side of the upgraded connection. A claimed socket that never reads
+		// stays paused, so the client's departure sits unread in the receive buffer and the peer
+		// reports nothing. An upgraded socket also keeps its writable side after the client leaves,
+		// so `end` is the peer's departure signal and `close` never arrives.
+		socket.on('error', () => undefined)
+		socket.resume()
+	})
+	return server
+}
+
+export async function compressServerFixture(text: string): Promise<Uint8Array<ArrayBuffer>> {
+	const source = new ReadableStream<Uint8Array<ArrayBuffer>>({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode(text))
+			controller.close()
+		},
+	})
+	return new Uint8Array(
+		await new Response(source.pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
+	)
+}
+
+export interface ServerAppState {
+	readonly userId: string
+}
+
+export class ServerUserState {
+	#userId: string | undefined
+
+	get userId(): string | undefined {
+		return this.#userId
+	}
+
+	set userId(value: string | undefined) {
+		this.#userId = value
+	}
+}
+
+export function createTraceLayer(
+	order: string[],
+	name: string,
+): MiddlewareHandler<Record<string, never>> {
+	return async (_request, _context, next) => {
+		order.push(`${name}-before`)
+		const response = await next()
+		order.push(`${name}-after`)
+		return response
+	}
+}
+
+export async function repeatServerNext(
+	_request: Request,
+	_context: MiddlewareContext<Record<string, never>>,
+	next: NextFunction,
+): Promise<Response> {
+	await next()
+	return next()
+}
+
+export async function raceServerNext(
+	_request: Request,
+	_context: MiddlewareContext<Record<string, never>>,
+	next: NextFunction,
+): Promise<Response> {
+	const results = await Promise.allSettled([next(), next()])
+	const rejected = results.find((result) => result.status === 'rejected')
+	if (rejected === undefined || rejected.status !== 'rejected') {
+		throw new Error('expected one of the concurrent next() calls to reject')
+	}
+	return new Response(rejected.reason instanceof Error ? rejected.reason.message : 'unknown')
+}
+
+export async function refuseServerRequest(): Promise<Response> {
+	return new Response('blocked', { status: 403 })
+}
+
+export function createObservedRefusal(
+	observation: ServerObservation<boolean>,
+): MiddlewareHandler<Record<string, never>> {
+	return async () => {
+		observation.value = true
+		return new Response('blocked', { status: 403 })
+	}
+}
+
+export async function substituteServerRequest(
+	_request: Request,
+	_context: MiddlewareContext<Record<string, never>>,
+	next: NextFunction,
+): Promise<Response> {
+	return next(new Request('http://localhost/substituted'))
+}
+
+export function createResponseHeader(
+	name: string,
+	value: string,
+): MiddlewareHandler<Record<string, never>> {
+	return async (_request, _context, next) => {
+		const response = await next()
+		response.headers.set(name, value)
+		return response
+	}
+}
+
+export async function stashServerUser(
+	request: Request,
+	context: MiddlewareContext<ServerUserState>,
+	next: NextFunction,
+): Promise<Response> {
+	context.state.userId = 'user-42'
+	return next(request)
+}
+
+export interface EchoState {
+	readonly ip: string | undefined
+	readonly encrypted: boolean
+}
+
+export function createEchoDispatcher(): DispatcherInterface<EchoState> {
+	const dispatcher = createDispatcher<EchoState>()
+	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
+	return dispatcher
+}
+
+export function createPingDispatcher(): DispatcherInterface<undefined> {
+	const dispatcher = createDispatcher<undefined>()
+	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
+	return dispatcher
+}
+
+export function createUploadDispatcher(): DispatcherInterface<undefined> {
+	const dispatcher = createPingDispatcher()
+	dispatcher.add({
+		method: 'POST',
+		path: '/upload',
+		handler: () => new Response('too large', { status: 413 }),
+	})
+	return dispatcher
+}
+
+export function claimUpgrades(server: ServerInterface<undefined>): Duplex[] {
+	const claimed: Duplex[] = []
+	server.upgrade((_request, socket) => {
+		claimed.push(socket)
+		socket.write(
+			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+		)
+		return true
+	})
+	return claimed
+}
+
+export function trackServer<T extends { stop(): Promise<void> }>(
+	running: Array<{ stop(): Promise<void> }>,
+	server: T,
+): T {
+	running.push(server)
+	return server
+}
 
 /** Reports the outcome of a raw `upgradeRequest` probe: whether a handler claimed the socket. */
 export interface UpgradeOutcomeInterface {
@@ -42,12 +302,12 @@ export function rawRequest(port: number, raw: string): Promise<string> {
 		const socket = net.createConnection({ port, host: '127.0.0.1' }, () => {
 			socket.write(raw)
 		})
-		let data = ''
+		const chunks: string[] = []
 		socket.on('data', (chunk: Buffer) => {
-			data += chunk.toString('utf8')
+			chunks.push(chunk.toString('utf8'))
 			socket.end()
 		})
-		socket.on('close', () => resolve(data))
+		socket.on('close', () => resolve(chunks.join('')))
 		socket.on('error', reject)
 	})
 }
@@ -84,9 +344,9 @@ export async function openPausedResponse(
 ): Promise<PausedResponseInterface> {
 	const socket = net.createConnection({ port, host: '127.0.0.1' })
 	const closed = Promise.withResolvers<void>()
-	let bytes = 0
+	const chunks: number[] = []
 	socket.on('data', (chunk: Buffer) => {
-		bytes += chunk.byteLength
+		chunks.push(chunk.byteLength)
 	})
 	socket.once('close', () => closed.resolve())
 	socket.once('error', (error) => closed.reject(error))
@@ -98,7 +358,7 @@ export async function openPausedResponse(
 	return {
 		closed: closed.promise,
 		get bytes(): number {
-			return bytes
+			return chunks.reduce((bytes, size) => bytes + size, 0)
 		},
 		resume(): void {
 			socket.resume()

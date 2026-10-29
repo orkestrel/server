@@ -31,20 +31,18 @@ export class Negotiator implements NegotiatorInterface {
 		if (available.length === 0) return undefined
 		const entries = parseAcceptHeader(header)
 		if (entries.length === 0) return available[0]
-		let best: string | undefined
-		let bestQuality = 0
-		let bestRank = Number.POSITIVE_INFINITY
-		for (const candidate of available) {
+		const best = Iterator.from(available).reduce<
+			{ readonly value: string; readonly q: number; readonly rank: number } | undefined
+		>((previous, candidate) => {
 			const match = matchMediaType(entries, candidate)
-			if (match === undefined) continue
+			if (match === undefined) return previous
 			const { q, rank } = match
-			if (q > bestQuality || (q === bestQuality && rank < bestRank)) {
-				best = candidate
-				bestQuality = q
-				bestRank = rank
-			}
-		}
-		return best
+			return q > (previous?.q ?? 0) ||
+				(q === (previous?.q ?? 0) && rank < (previous?.rank ?? Number.POSITIVE_INFINITY))
+				? { value: candidate, q, rank }
+				: previous
+		}, undefined)
+		return best?.value
 	}
 
 	encoding(header: string, available: readonly Encoding[]): Encoding | undefined {
@@ -56,16 +54,13 @@ export class Negotiator implements NegotiatorInterface {
 		if (available.length === 0) return undefined
 		const entries = parseAcceptHeader(header)
 		if (entries.length === 0) return available[0]
-		let best: string | undefined
-		let bestQuality = 0
-		for (const candidate of available) {
+		const best = Iterator.from(available).reduce<
+			{ readonly value: string; readonly quality: number } | undefined
+		>((previous, candidate) => {
 			const quality = computeLanguageQuality(entries, candidate)
-			if (quality > bestQuality) {
-				best = candidate
-				bestQuality = quality
-			}
-		}
-		return best
+			return quality > (previous?.quality ?? 0) ? { value: candidate, quality } : previous
+		}, undefined)
+		return best?.value
 	}
 
 	/**

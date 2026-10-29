@@ -1,6 +1,6 @@
+import type { EchoState, ServerUpgrade } from '../../setupServer.js'
 import type { IncomingMessage } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { Duplex } from 'node:stream'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
 	ConnectionStateFunction,
@@ -18,6 +18,12 @@ import { createServer, createStream, HTTPError, isServerError } from '@src/serve
 import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { waitForSocketClose } from '@orkestrel/test/server'
 import {
+	ServerObservation,
+	claimUpgrades,
+	createEchoDispatcher,
+	createPingDispatcher,
+	createUploadDispatcher,
+	trackServer,
 	holdUpgrade,
 	openPausedResponse,
 	probeConnectionDrop,
@@ -36,61 +42,20 @@ const BINDS_IPV6 = await probeLoopback('::1')
 // lifecycle, drain, upgrade fan-out, the built-in boundary, connection facts,
 // and observability.
 
-interface EchoState {
-	readonly ip: string | undefined
-	readonly encrypted: boolean
-}
-
-function echoDispatcher(): DispatcherInterface<EchoState> {
-	const dispatcher = createDispatcher<EchoState>()
-	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
-	return dispatcher
-}
-
 // A state-agnostic sibling of `echoDispatcher` for tests that exercise
 // lifecycle/bind/drain/error mechanics and never read `context.state` — kept
 // distinct so those sites' `state: () => undefined` stays honest instead of
 // mismatching `EchoState`.
-function pingDispatcher(): DispatcherInterface<undefined> {
-	const dispatcher = createDispatcher<undefined>()
-	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
-	return dispatcher
-}
 
 // `/upload` answers 413 without reading its body, so the body keeps uploading after the answer and
 // its exchange stays open on the connection; `/ping` is the request a client pipelines behind it.
-function uploadDispatcher(): DispatcherInterface<undefined> {
-	const dispatcher = pingDispatcher()
-	dispatcher.add({
-		method: 'POST',
-		path: '/upload',
-		handler: () => new Response('too large', { status: 413 }),
-	})
-	return dispatcher
-}
 
 // Claim every upgrade and HOLD the socket, which is what a real WebSocket
 // handler does after its handshake — the tests that end the socket inline
 // (the fan-out suite below) never reach the stop path this exercises. The
 // returned array is the live set of sockets the server handed over.
-function claimUpgrades(server: ServerInterface<undefined>): Duplex[] {
-	const claimed: Duplex[] = []
-	server.upgrade((_request, socket) => {
-		claimed.push(socket)
-		socket.write(
-			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
-		)
-		return true
-	})
-	return claimed
-}
 
 const running: Array<{ stop(): Promise<void> }> = []
-
-function track<T extends { stop(): Promise<void> }>(server: T): T {
-	running.push(server)
-	return server
-}
 
 afterEach(async () => {
 	await Promise.all(running.splice(0).map((server) => server.stop().catch(() => undefined)))
@@ -98,9 +63,10 @@ afterEach(async () => {
 
 describe('Server — lifecycle', () => {
 	it('starts on an ephemeral port, serves a route, and reports listening', async () => {
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: echoDispatcher(),
+				dispatcher: createEchoDispatcher(),
 				state: (c) => ({ ip: c.ip, encrypted: c.encrypted }),
 			}),
 		)
@@ -118,14 +84,20 @@ describe('Server — lifecycle', () => {
 	})
 
 	it('transitions idle → listening → stopped and refuses start while listening', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		await server.start()
 		await expect(server.start()).rejects.toThrow(/cannot start/)
 		expect(server.status).toBe('listening')
 	})
 
 	it('refuses a wrong-status start with a ServerError naming the status it refused from', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		await server.start()
 		const refusal: unknown = await server.start().catch((error: unknown) => error)
 		expect(isServerError(refusal)).toBe(true)
@@ -138,9 +110,10 @@ describe('Server — lifecycle', () => {
 
 	it('starts cleanly within its configured deadline and ignores caller abort after binding', async () => {
 		const controller = new AbortController()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { start: 500 },
 			}),
@@ -153,7 +126,7 @@ describe('Server — lifecycle', () => {
 	})
 
 	it('destroy is idempotent and leaves the server stopped', async () => {
-		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
+		const server = createServer({ dispatcher: createPingDispatcher(), state: () => undefined })
 		await server.start()
 		await server.destroy()
 		await server.destroy()
@@ -167,7 +140,7 @@ describe('Server — construction guards', () => {
 	it('throws when timeouts.headers exceeds timeouts.keepalive (the Slowloris guard)', () => {
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { headers: 5_000, keepalive: 1_000 },
 			}),
@@ -176,10 +149,14 @@ describe('Server — construction guards', () => {
 
 	it('throws when drain / limit are not non-negative finite numbers', () => {
 		expect(() =>
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: Number.NaN }),
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				drain: Number.NaN,
+			}),
 		).toThrow(TypeError)
 		expect(() =>
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, limit: -1 }),
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, limit: -1 }),
 		).toThrow(TypeError)
 	})
 
@@ -188,14 +165,17 @@ describe('Server — construction guards', () => {
 			'ServerOptions.drain must be an integer from 0 through 2_147_483_647',
 		)
 		expect(() =>
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 1.5 }),
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 1.5 }),
 		).toThrow(refusal)
 		expect(() =>
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 3e9 }),
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 3e9 }),
 		).toThrow(refusal)
 		expect(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 2_147_483_647 })
-				.status,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				drain: 2_147_483_647,
+			}).status,
 		).toBe('idle')
 	})
 
@@ -205,21 +185,21 @@ describe('Server — construction guards', () => {
 		)
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { start: 1.5 },
 			}),
 		).toThrow(refusal)
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { start: 3e9 },
 			}),
 		).toThrow(refusal)
 		expect(
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { start: 2_147_483_647 },
 			}).status,
@@ -229,28 +209,28 @@ describe('Server — construction guards', () => {
 	it('throws when startup timeout or socket caps violate their numeric contracts', () => {
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				timeouts: { start: -1 },
 			}),
 		).toThrow(TypeError)
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				sockets: { connections: 1.5 },
 			}),
 		).toThrow(TypeError)
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				sockets: { headers: Number.NaN },
 			}),
 		).toThrow(TypeError)
 		expect(() =>
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				sockets: { requests: -1 },
 			}),
@@ -262,7 +242,10 @@ describe('Server — bounded cancellable startup', () => {
 	it('cancels a pending bind from the caller signal and remains restartable', async () => {
 		const controller = new AbortController()
 		const reason = new Error('cancel startup')
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const starting = server.start(controller.signal)
 		controller.abort(reason)
 		await expect(starting).rejects.toBe(reason)
@@ -278,7 +261,7 @@ describe('Server — bounded cancellable startup', () => {
 
 	it('times out a zero-window bind and leaves the lifecycle able to start again', async () => {
 		const server = createServer({
-			dispatcher: pingDispatcher(),
+			dispatcher: createPingDispatcher(),
 			state: () => undefined,
 			timeouts: { start: 0 },
 		})
@@ -292,9 +275,10 @@ describe('Server — bounded cancellable startup', () => {
 
 describe('Server — socket caps', () => {
 	it('applies the connection cap before bind', async () => {
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				sockets: { connections: 0 },
 			}),
@@ -310,7 +294,8 @@ describe('Server — socket caps', () => {
 			path: '/headers',
 			handler: (request) => new Response(request.headers.get('x-extra') ?? 'missing'),
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({ dispatcher, state: () => undefined, sockets: { headers: 1 } }),
 		)
 		const port = await server.start()
@@ -325,9 +310,10 @@ describe('Server — socket caps', () => {
 	})
 
 	it('closes keep-alive after the configured requests-per-socket cap', async () => {
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				sockets: { requests: 1 },
 			}),
@@ -343,16 +329,28 @@ describe('Server — socket caps', () => {
 
 describe('Server — host/port bind', () => {
 	it('binds the exact configured port and rejects a duplicate EADDRINUSE bind', async () => {
-		const first = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const first = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const port = await first.start()
-		const second = createServer({ dispatcher: pingDispatcher(), state: () => undefined, port })
+		const second = createServer({
+			dispatcher: createPingDispatcher(),
+			state: () => undefined,
+			port,
+		})
 		await expect(second.start()).rejects.toThrow(/EADDRINUSE/)
 		expect(second.status).toBe('idle')
 	})
 
 	it('exposes an IPv4 literal host and its real ephemeral port', async () => {
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, host: '127.0.0.1' }),
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+			}),
 		)
 		const port = await server.start()
 		expect(server.address).toEqual({ address: '127.0.0.1', family: 'IPv4', port })
@@ -361,8 +359,9 @@ describe('Server — host/port bind', () => {
 	})
 
 	it.skipIf(!BINDS_IPV6)('exposes an IPv6 literal host and its real ephemeral port', async () => {
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, host: '::1' }),
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, host: '::1' }),
 		)
 		const port = await server.start()
 		expect(server.address).toEqual({ address: '::1', family: 'IPv6', port })
@@ -371,7 +370,10 @@ describe('Server — host/port bind', () => {
 	})
 
 	it('defaults to an ephemeral port when none is configured', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const port = await server.start()
 		expect(port).toBeGreaterThan(0)
 		expect(server.port).toBe(port)
@@ -386,7 +388,7 @@ describe('Server — restart + idempotent lifecycle', () => {
 			path: '/check',
 			handler: (request) => new Response(request.signal.aborted ? 'aborted' : 'ok'),
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const first = await server.start()
 		expect((await fetch(`http://127.0.0.1:${first}/check`)).status).toBe(200)
 		await server.stop()
@@ -400,37 +402,40 @@ describe('Server — restart + idempotent lifecycle', () => {
 	})
 
 	it('stop() before start() is a safe no-op that resolves at once', async () => {
-		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
+		const server = createServer({ dispatcher: createPingDispatcher(), state: () => undefined })
 		expect(server.status).toBe('idle')
-		let settled = false
+		const settled = new ServerObservation(false)
 		const stopping = server.stop().then(() => {
-			settled = true
+			settled.value = true
 		})
 		// One host timer runs no I/O for an idle server, so only an already-settled stop finishes here.
 		await waitForDelay(0)
-		expect(settled).toBe(true)
+		expect(settled.value).toBe(true)
 		await stopping
 		expect(server.status).toBe('idle')
 	})
 
 	it('stop() while start() binds resolves at once and leaves the bind to finish', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const starting = server.start()
 		expect(server.status).toBe('starting')
-		let seen: ServerStatus | undefined
+		const seen = new ServerObservation<ServerStatus | undefined>(undefined)
 		const stopping = server.stop().then(() => {
-			seen = server.status
+			seen.value = server.status
 		})
 		await expect(stopping).resolves.toBeUndefined()
 		// The bind's `listening` event waits for a later tick, so a stop settled at once sees `starting`.
-		expect(seen).toBe('starting')
+		expect(seen.value).toBe('starting')
 		const port = await starting
 		expect(server.status).toBe('listening')
 		expect(await (await fetch(`http://127.0.0.1:${port}/ping`)).text()).toBe('pong')
 	})
 
 	it('double stop() is a no-op', async () => {
-		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
+		const server = createServer({ dispatcher: createPingDispatcher(), state: () => undefined })
 		await server.start()
 		await server.stop()
 		expect(server.status).toBe('stopped')
@@ -441,7 +446,7 @@ describe('Server — restart + idempotent lifecycle', () => {
 	})
 
 	it('destroy() while listening tears down without a prior stop, and the socket refuses new connections', async () => {
-		const server = createServer({ dispatcher: pingDispatcher(), state: () => undefined })
+		const server = createServer({ dispatcher: createPingDispatcher(), state: () => undefined })
 		const port = await server.start()
 		await server.destroy()
 		expect(server.status).toBe('stopped')
@@ -454,30 +459,30 @@ describe('Server — restart + idempotent lifecycle', () => {
 describe('Server — the stop signal reaches handlers', () => {
 	it('a handler observing request.signal sees it fire on stop()', async () => {
 		const dispatcher = createDispatcher<undefined>()
-		let capturedSignal: AbortSignal | undefined
-		let resolveEntered: () => void = () => undefined
-		const entered = new Promise<void>((resolve) => {
-			resolveEntered = resolve
-		})
+		const capturedSignal = new ServerObservation<AbortSignal | undefined>(undefined)
+		const entered = Promise.withResolvers<void>()
 		dispatcher.add({
 			method: 'GET',
 			path: '/watch',
 			handler: async (request) => {
-				capturedSignal = request.signal
+				capturedSignal.value = request.signal
 				// Observable gate — stop() below is only called once the handler is
 				// provably in flight, instead of relying on a fixed-delay guess.
-				resolveEntered()
+				entered.resolve()
 				await waitForDelay(60)
 				return new Response(request.signal.aborted ? 'aborted' : 'ok')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined, drain: 500 }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher, state: () => undefined, drain: 500 }),
+		)
 		const port = await server.start()
 		const inflight = fetch(`http://127.0.0.1:${port}/watch`)
-		await entered
+		await entered.promise
 		const stopping = server.stop()
 		await waitForDelay(15)
-		expect(capturedSignal?.aborted).toBe(true)
+		expect(capturedSignal.value?.aborted).toBe(true)
 		await inflight
 		await stopping
 	})
@@ -498,7 +503,7 @@ describe('Server — the client disconnect signal reaches streaming handlers', (
 				return stream.response
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const connected = Promise.withResolvers<IncomingMessage>()
 		const client = http.get(`http://127.0.0.1:${port}/events`, (response) =>
@@ -528,7 +533,8 @@ describe('Server — setup-phase crash safety (built-in boundary encloses per-re
 	it('a throwing state function is caught by the boundary — 500, and the server still answers the next request', async () => {
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => {
@@ -545,7 +551,10 @@ describe('Server — setup-phase crash safety (built-in boundary encloses per-re
 	})
 
 	it('a malformed Host header never crashes the process — answered 400, and the server still answers the next request', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const port = await server.start()
 		const raw = await rawRequest(port, 'GET / HTTP/1.1\r\nHost: foo bar\r\n\r\n')
 		expect(raw).toMatch(/^HTTP\/1\.1 400/)
@@ -565,7 +574,7 @@ describe('Server — setup-phase crash safety (built-in boundary encloses per-re
 				throw new Error('original boom')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		server.emitter.on('error', errors.handler)
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/boom`)
@@ -585,7 +594,8 @@ describe('Server — connection facts', () => {
 			path: '/who',
 			handler: (_request, context) => Response.json(context.state),
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: (connection) => ({ ip: connection.ip, encrypted: connection.encrypted }),
@@ -607,21 +617,22 @@ describe('Server — context.body() caching', () => {
 		// `context` itself, so only middleware can read the body.
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({ method: 'POST', path: '/echo', handler: () => new Response('ok') })
-		let firstRead: unknown
-		let secondRead: unknown
-		const server = track(
+		const firstRead = new ServerObservation<unknown>(undefined)
+		const secondRead = new ServerObservation<unknown>(undefined)
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
 				middleware: [
 					async (request, context, next) => {
-						firstRead = await context.body()
+						firstRead.value = await context.body()
 						return next(request)
 					},
 					async (request, context, next) => {
 						// A second middleware reads it too — the same cached value, the
 						// underlying stream is never read twice.
-						secondRead = await context.body()
+						secondRead.value = await context.body()
 						return next(request)
 					},
 				],
@@ -634,9 +645,9 @@ describe('Server — context.body() caching', () => {
 			body: JSON.stringify({ n: 1 }),
 		})
 		expect(response.status).toBe(200)
-		expect(firstRead).toEqual({ n: 1 })
-		expect(secondRead).toEqual({ n: 1 })
-		expect(firstRead).toBe(secondRead)
+		expect(firstRead.value).toEqual({ n: 1 })
+		expect(secondRead.value).toEqual({ n: 1 })
+		expect(firstRead.value).toBe(secondRead.value)
 	})
 })
 
@@ -652,7 +663,7 @@ describe('Server — concurrency', () => {
 				return new Response(id)
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const ids = Array.from({ length: 20 }, (_value, index) => String(index))
 		const bodies = await Promise.all(
@@ -707,8 +718,9 @@ describe('Server — graceful drain', () => {
 
 describe('Server — a clean stop ends each connection when no request exchange is open on it', () => {
 	it('closes a connection that never sent a request, well inside the drain deadline', async () => {
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 10_000 }),
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 10_000 }),
 		)
 		const port = await server.start()
 		// What a client leaves behind after it aborts a fetch: a connection that sends nothing.
@@ -749,7 +761,8 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		})
 		const order: string[] = []
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -817,7 +830,8 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			},
 		})
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -827,14 +841,16 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		)
 		const port = await server.start()
 		const kept = net.createConnection({ port, host: '127.0.0.1' })
-		let received = ''
+		const received = new ServerObservation('')
 		kept.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(kept, 'connect')
 			kept.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
-			await waitForCondition('the kept-alive reply before stop()', () => received.includes('pong'))
+			await waitForCondition('the kept-alive reply before stop()', () =>
+				received.value.includes('pong'),
+			)
 			// A request held in flight keeps the drain parked while the kept-alive connection sends.
 			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
 			await arrived.promise
@@ -851,7 +867,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			lateRelease.resolve()
 			// The stopping state serves it as in-flight work whose stop signal has already fired.
 			await waitForCondition('the kept-alive reply during the drain', () =>
-				received.includes('aborted=true'),
+				received.value.includes('aborted=true'),
 			)
 			await waitForSocketClose(kept, { budget: 1_000 })
 			await stopping
@@ -864,9 +880,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('destroys a connection whose header block has not fully arrived, because no request reached the server', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -898,9 +915,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('keeps a connection whose handler answered 413 while its body still uploads', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -915,16 +933,16 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		const failures = createRecorder<readonly [unknown]>()
 		upload.on('error', failures.handler)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(request)
 			upload.write(Buffer.alloc(first))
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
-			expect(received).toMatch(/^HTTP\/1\.1 413 /)
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
+			expect(received.value).toMatch(/^HTTP\/1\.1 413 /)
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
@@ -945,9 +963,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('ends a 413 connection when its upload ends, while the client still holds the socket open', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -960,15 +979,15 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		const failures = createRecorder<readonly [unknown]>()
 		upload.on('error', failures.handler)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(request)
 			upload.write(Buffer.alloc(first))
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
@@ -990,9 +1009,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('destroys a kept-alive connection partway through its second header block', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -1000,14 +1020,14 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		)
 		const port = await server.start()
 		const kept = net.createConnection({ port, host: '127.0.0.1' })
-		let received = ''
+		const received = new ServerObservation('')
 		kept.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(kept, 'connect')
 			kept.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
-			await waitForCondition('the first kept-alive reply', () => received.includes('pong'))
+			await waitForCondition('the first kept-alive reply', () => received.value.includes('pong'))
 			kept.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n')
 			// A later connection's round trip spans several event-loop turns, so the server has read
 			// the partial header block before `stop()` runs.
@@ -1030,9 +1050,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('answers an unknown Expect value with 417 and ends that connection on the clean close', async () => {
 		const drained = createRecorder<readonly [number, number]>()
 		const requests = createRecorder<readonly [string, string]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler, request: requests.handler },
@@ -1040,9 +1061,9 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		)
 		const port = await server.start()
 		const expecting = net.createConnection({ port, host: '127.0.0.1' })
-		let received = ''
+		const received = new ServerObservation('')
 		expecting.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(expecting, 'connect')
@@ -1051,14 +1072,14 @@ describe('Server — a clean stop ends each connection when no request exchange 
 				'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1024\r\nExpect: unknown-value\r\n\r\n',
 			)
 			// Node answers the expectation itself, so the handler never sees this request.
-			await waitForCondition('the 417 answer', () => received.includes('\r\n\r\n'))
-			expect(received).toMatch(/^HTTP\/1\.1 417 /)
+			await waitForCondition('the 417 answer', () => received.value.includes('\r\n\r\n'))
+			expect(received.value).toMatch(/^HTTP\/1\.1 417 /)
 			const started = performance.now()
 			const stopping = server.stop()
 			await waitForSocketClose(expecting, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
-			expect(received).not.toContain('too large')
+			expect(received.value).not.toContain('too large')
 			expect(requests.count).toBe(0)
 			expect(drained.calls).toEqual([[0, 0]])
 		} finally {
@@ -1080,7 +1101,8 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			},
 		})
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -1090,13 +1112,13 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		)
 		const port = await server.start()
 		const posting = net.createConnection({ port, host: '127.0.0.1' })
-		let received = ''
+		const received = new ServerObservation('')
 		posting.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
-		let closed = false
+		const closed = new ServerObservation(false)
 		posting.once('close', () => {
-			closed = true
+			closed.value = true
 		})
 		try {
 			await once(posting, 'connect')
@@ -1106,15 +1128,15 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			const started = performance.now()
 			const stopping = server.stop()
 			await waitForDelay(20)
-			expect(closed).toBe(false)
+			expect(closed.value).toBe(false)
 			expect(drained.count).toBe(0)
 			release.resolve()
 			await waitForSocketClose(posting, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
 			// The whole response reached the client before the connection ended.
-			expect(received).toMatch(/^HTTP\/1\.1 200 /)
-			expect(received).toContain('echoed')
+			expect(received.value).toMatch(/^HTTP\/1\.1 200 /)
+			expect(received.value).toContain('echoed')
 			expect(drained.calls).toEqual([[0, 0]])
 		} finally {
 			posting.destroy()
@@ -1124,7 +1146,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('serves a kept-alive request sent during the drain and keeps its connection open until the drain settles', async () => {
 		const arrived = Promise.withResolvers<void>()
 		const release = Promise.withResolvers<void>()
-		const dispatcher = pingDispatcher()
+		const dispatcher = createPingDispatcher()
 		dispatcher.add({
 			method: 'GET',
 			path: '/slow',
@@ -1135,7 +1157,8 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			},
 		})
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -1145,31 +1168,39 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		)
 		const port = await server.start()
 		const kept = net.createConnection({ port, host: '127.0.0.1' })
-		let received = ''
+		const received = new ServerObservation('')
 		kept.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
-		let closed = false
+		const closed = new ServerObservation(false)
 		kept.once('close', () => {
-			closed = true
+			closed.value = true
 		})
-		const pongs = (): number => received.match(/pong/g)?.length ?? 0
 		const ping = 'GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'
 		try {
 			await once(kept, 'connect')
 			kept.write(ping)
-			await waitForCondition('the first kept-alive reply', () => pongs() === 1)
+			await waitForCondition(
+				'the first kept-alive reply',
+				() => (received.value.match(/pong/g)?.length ?? 0) === 1,
+			)
 			// `/slow` holds the drain open while the kept-alive connection sends.
 			const inflight = fetch(`http://127.0.0.1:${port}/slow`)
 			await arrived.promise
 			const stopping = server.stop()
 			kept.write(ping)
-			await waitForCondition('the second reply, sent during the drain', () => pongs() === 2)
+			await waitForCondition(
+				'the second reply, sent during the drain',
+				() => (received.value.match(/pong/g)?.length ?? 0) === 2,
+			)
 			// A third request on the same connection is served only if the second left it open.
 			kept.write(ping)
-			await waitForCondition('the third reply or the close', () => pongs() === 3 || closed)
-			expect(pongs()).toBe(3)
-			expect(closed).toBe(false)
+			await waitForCondition(
+				'the third reply or the close',
+				() => (received.value.match(/pong/g)?.length ?? 0) === 3 || closed.value,
+			)
+			expect(received.value.match(/pong/g)?.length ?? 0).toBe(3)
+			expect(closed.value).toBe(false)
 			expect(drained.count).toBe(0)
 			const started = performance.now()
 			release.resolve()
@@ -1185,9 +1216,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('cuts a 413 upload that sends one more byte and stalls when the drain deadline expires', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 300,
 				on: { drain: drained.handler },
@@ -1197,14 +1229,14 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const total = 128 * 1024
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			// Each body byte the server reads restarts Node's keep-alive idle timer, which then runs its
 			// 5 s default plus Node's 1 s buffer, past this test's budget.
 			upload.write(Buffer.alloc(1))
@@ -1224,9 +1256,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 
 	it('cuts a 413 upload that keeps sending one byte at a time when the drain deadline expires', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 300,
 				timeouts: { keepalive: 100 },
@@ -1237,18 +1270,18 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const total = 128 * 1024
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
-		let drip: ReturnType<typeof setInterval> | undefined
+		const drip = new ServerObservation<ReturnType<typeof setInterval> | undefined>(undefined)
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			// Every byte restarts Node's keep-alive idle timer before it fires, so no Node timeout ends
 			// this upload while it keeps sending.
-			drip = setInterval(() => {
+			drip.value = setInterval(() => {
 				if (upload.writable) upload.write(Buffer.alloc(1))
 			}, 25)
 			const started = performance.now()
@@ -1259,16 +1292,17 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			expect(drained.calls).toEqual([[0, 0]])
 			expect(server.status).toBe('stopped')
 		} finally {
-			clearInterval(drip)
+			clearInterval(drip.value)
 			upload.destroy()
 		}
 	})
 
 	it('returns the stop in flight to a concurrent stop() call, so both resolve after the close', async () => {
 		const drained = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler },
@@ -1278,14 +1312,14 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const total = 128 * 1024
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			const settled: string[] = []
 			const first = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
@@ -1323,28 +1357,31 @@ describe('Server — a clean stop ends each connection when no request exchange 
 				return new Response('held')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined, drain: 10_000 }))
-		let inner: Promise<void> | undefined
+		const server = trackServer(
+			running,
+			createServer({ dispatcher, state: () => undefined, drain: 10_000 }),
+		)
+		const inner = new ServerObservation<Promise<void> | undefined>(undefined)
 		server.emitter.on('stop', () => {
-			inner = server.stop()
+			inner.value = server.stop()
 		})
 		const port = await server.start()
 		try {
 			const inflight = fetch(`http://127.0.0.1:${port}/hold`)
 			await entered.promise
-			let settled = false
+			const settled = new ServerObservation(false)
 			const outer = server.stop()
 			void outer.then(() => {
-				settled = true
+				settled.value = true
 			})
-			expect(inner).toBe(outer)
+			expect(inner.value).toBe(outer)
 			await waitForDelay(20)
-			expect(settled).toBe(false)
+			expect(settled.value).toBe(false)
 			expect(server.status).toBe('stopping')
 			gate.resolve()
 			expect(await (await inflight).text()).toBe('held')
 			await outer
-			expect(settled).toBe(true)
+			expect(settled.value).toBe(true)
 			expect(server.status).toBe('stopped')
 		} finally {
 			gate.resolve()
@@ -1354,38 +1391,41 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('returns the stop in flight to a stop() call made from a stop-signal abort listener', async () => {
 		const gate = Promise.withResolvers<void>()
 		const entered = Promise.withResolvers<void>()
-		let inner: Promise<void> | undefined
+		const inner = new ServerObservation<Promise<void> | undefined>(undefined)
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({
 			method: 'GET',
 			path: '/hold',
 			handler: async (request) => {
 				request.signal.addEventListener('abort', () => {
-					inner = server.stop()
+					inner.value = server.stop()
 				})
 				entered.resolve()
 				await gate.promise
 				return new Response('held')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined, drain: 10_000 }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher, state: () => undefined, drain: 10_000 }),
+		)
 		const port = await server.start()
 		try {
 			const inflight = fetch(`http://127.0.0.1:${port}/hold`)
 			await entered.promise
-			let settled = false
+			const settled = new ServerObservation(false)
 			const outer = server.stop()
 			void outer.then(() => {
-				settled = true
+				settled.value = true
 			})
-			expect(inner).toBe(outer)
+			expect(inner.value).toBe(outer)
 			await waitForDelay(20)
-			expect(settled).toBe(false)
+			expect(settled.value).toBe(false)
 			expect(server.status).toBe('stopping')
 			gate.resolve()
 			expect(await (await inflight).text()).toBe('held')
 			await outer
-			expect(settled).toBe(true)
+			expect(settled.value).toBe(true)
 			expect(server.status).toBe('stopped')
 		} finally {
 			gate.resolve()
@@ -1395,7 +1435,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('settles a stop and a destroy() made during the clean close wait, and leaves no deadline timer armed', async () => {
 		const drained = createRecorder<readonly [number, number]>()
 		const server = createServer({
-			dispatcher: uploadDispatcher(),
+			dispatcher: createUploadDispatcher(),
 			state: () => undefined,
 			drain: 10_000,
 			on: { drain: drained.handler },
@@ -1403,14 +1443,14 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const port = await server.start()
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 131072\r\n\r\n')
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
@@ -1436,9 +1476,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('refuses a request pipelined behind a 413 body that ends after the clean close', async () => {
 		const drained = createRecorder<readonly [number, number]>()
 		const requests = createRecorder<readonly [string, string]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler, request: requests.handler },
@@ -1449,15 +1490,15 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const total = 128 * 1024
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
 			upload.write(Buffer.alloc(first))
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
@@ -1473,7 +1514,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			await waitForSocketClose(upload, { budget: 1_000 })
 			await stopping
 			expect(performance.now() - started).toBeLessThan(1_000)
-			expect(received).not.toContain('pong')
+			expect(received.value).not.toContain('pong')
 			expect(requests.calls).toEqual([['POST', '/upload']])
 			expect(server.status).toBe('stopped')
 		} finally {
@@ -1484,9 +1525,10 @@ describe('Server — a clean stop ends each connection when no request exchange 
 	it('refuses an upgrade pipelined behind a 413 body that ends after the clean close', async () => {
 		const drained = createRecorder<readonly [number, number]>()
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: uploadDispatcher(),
+				dispatcher: createUploadDispatcher(),
 				state: () => undefined,
 				drain: 10_000,
 				on: { drain: drained.handler, upgrade: upgrades.handler },
@@ -1498,15 +1540,15 @@ describe('Server — a clean stop ends each connection when no request exchange 
 		const total = 128 * 1024
 		const upload = net.createConnection({ port, host: '127.0.0.1' })
 		upload.on('error', () => undefined)
-		let received = ''
+		const received = new ServerObservation('')
 		upload.on('data', (chunk: Buffer) => {
-			received += chunk.toString('utf8')
+			received.value += chunk.toString('utf8')
 		})
 		try {
 			await once(upload, 'connect')
 			upload.write(`POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${total}\r\n\r\n`)
 			upload.write(Buffer.alloc(first))
-			await waitForCondition('the 413 before stop()', () => received.includes('too large'))
+			await waitForCondition('the 413 before stop()', () => received.value.includes('too large'))
 			const stopping = server.stop()
 			await waitForCondition('the clean drain', () => drained.count === 1)
 			expect(drained.calls).toEqual([[0, 0]])
@@ -1524,7 +1566,7 @@ describe('Server — a clean stop ends each connection when no request exchange 
 			expect(performance.now() - started).toBeLessThan(1_000)
 			expect(claimed).toHaveLength(0)
 			expect(upgrades.count).toBe(0)
-			expect(received).not.toContain('101 Switching Protocols')
+			expect(received.value).not.toContain('101 Switching Protocols')
 			expect(server.status).toBe('stopped')
 		} finally {
 			upload.destroy()
@@ -1537,8 +1579,9 @@ describe('Server — graceful drain with an upgraded socket', () => {
 		// CONTROL — identical configuration, nothing upgraded. Without it a
 		// passing subject proves only that stop() returns eventually, not that
 		// the held socket is what it waited on.
-		const control = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 300 }),
+		const control = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 300 }),
 		)
 		await control.start()
 		const idle = performance.now()
@@ -1547,8 +1590,9 @@ describe('Server — graceful drain with an upgraded socket', () => {
 		expect(control.status).toBe('stopped')
 
 		// SUBJECT — one claimed socket held open, the way a WebSocket peer holds it.
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 300 }),
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 300 }),
 		)
 		const claimed = claimUpgrades(server)
 		const port = await server.start()
@@ -1572,8 +1616,9 @@ describe('Server — graceful drain with an upgraded socket', () => {
 	})
 
 	it('settles the moment the claimant closes its socket, well inside the deadline', async () => {
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 10_000 }),
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 10_000 }),
 		)
 		const claimed = claimUpgrades(server)
 		// What the stop event is for: the claimant owns the protocol, so it
@@ -1597,9 +1642,10 @@ describe('Server — graceful drain with an upgraded socket', () => {
 
 	it('reports the cut on drain, and a clean drain as zero', async () => {
 		const cut = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				drain: 100,
 				on: { drain: cut.handler },
@@ -1615,9 +1661,10 @@ describe('Server — graceful drain with an upgraded socket', () => {
 		await held.closed
 
 		const clean = createRecorder<readonly [number, number]>()
-		const quiet = track(
+		const quiet = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				drain: 100,
 				on: { drain: clean.handler },
@@ -1631,8 +1678,9 @@ describe('Server — graceful drain with an upgraded socket', () => {
 	it('cuts a held socket immediately at the drain: 0 boundary', async () => {
 		// The guide's escape hatch for a caller who wants no window at all — a
 		// zero deadline must fire rather than park forever on a socket.
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, drain: 0 }),
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 0 }),
 		)
 		const claimed = claimUpgrades(server)
 		const port = await server.start()
@@ -1644,7 +1692,10 @@ describe('Server — graceful drain with an upgraded socket', () => {
 	})
 
 	it('destroy() cuts a held socket instead of waiting on it', async () => {
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		const claimed = claimUpgrades(server)
 		const port = await server.start()
 		const held = await holdUpgrade(port, '/ws')
@@ -1668,7 +1719,7 @@ describe('Server — boundary mapping', () => {
 				throw new HTTPError(404, 'not here')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/boom`)
 		expect(response.status).toBe(404)
@@ -1686,7 +1737,8 @@ describe('Server — boundary mapping', () => {
 				throw new HTTPError(404, 'not found')
 			},
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -1711,7 +1763,7 @@ describe('Server — boundary mapping', () => {
 				throw new Error('secret internals')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/boom`)
 		expect(response.status).toBe(500)
@@ -1727,7 +1779,10 @@ describe('Server — boundary mapping', () => {
 				throw new Error('visible internals')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined, expose: true }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher, state: () => undefined, expose: true }),
+		)
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/boom`)
 		expect(response.status).toBe(500)
@@ -1744,7 +1799,8 @@ describe('Server — boundary mapping', () => {
 				throw new Error('reported')
 			},
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher,
 				state: () => undefined,
@@ -1767,9 +1823,10 @@ describe('Server — lifecycle + emit safety', () => {
 		const requests = createRecorder<readonly [string, string]>()
 		const stops = createRecorder<readonly []>()
 		const drains = createRecorder<readonly [number, number]>()
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({
-				dispatcher: pingDispatcher(),
+				dispatcher: createPingDispatcher(),
 				state: () => undefined,
 				on: {
 					start: starts.handler,
@@ -1791,8 +1848,13 @@ describe('Server — lifecycle + emit safety', () => {
 
 	it('a throwing observer cannot crash the server and routes to the error option', async () => {
 		const errors = createRecorder<readonly [unknown, string]>()
-		const server = track(
-			createServer({ dispatcher: pingDispatcher(), state: () => undefined, error: errors.handler }),
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				error: errors.handler,
+			}),
 		)
 		server.emitter.on('request', () => {
 			throw new Error('bad observer')
@@ -1817,7 +1879,10 @@ describe('Server — response event', () => {
 				},
 			]
 		>()
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('response', responses.handler)
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/ping`)
@@ -1849,7 +1914,7 @@ describe('Server — response event', () => {
 				throw new Error('boundary boom')
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		server.emitter.on('response', responses.handler)
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/boom`)
@@ -1881,7 +1946,8 @@ describe('Server — error/report request context', () => {
 				throw new Error('context boom')
 			},
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer({ dispatcher, state: () => undefined, report: reports.handler }),
 		)
 		server.emitter.on('error', errors.handler)
@@ -1904,11 +1970,14 @@ describe('Server — error/report request context', () => {
 describe('Server — upgrade seam', () => {
 	it('fans a raw upgrade out to a handler that claims the socket', async () => {
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
-		let seen: { request: IncomingMessage; socket: Duplex; head: Buffer } | undefined
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const seen = new ServerObservation<ServerUpgrade | undefined>(undefined)
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('upgrade', upgrades.handler)
 		server.upgrade((request, socket, head) => {
-			seen = { request, socket, head }
+			seen.value = { request, socket, head }
 			socket.write(
 				'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
 			)
@@ -1921,15 +1990,18 @@ describe('Server — upgrade seam', () => {
 		})
 		expect(outcome.claimed).toBe(true)
 		expect(outcome.status).toBe(101)
-		expect(seen?.request.url).toBe('/ws')
-		expect(Buffer.isBuffer(seen?.head)).toBe(true)
+		expect(seen.value?.request.url).toBe('/ws')
+		expect(Buffer.isBuffer(seen.value?.head)).toBe(true)
 		expect(upgrades.count).toBe(1)
 		expect(upgrades.calls[0]?.[1]).toBe(true)
 	})
 
 	it('destroys the socket and fires upgrade(handled: false) with no handlers', async () => {
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('upgrade', upgrades.handler)
 		const port = await server.start()
 		const outcome = await upgradeRequest(`http://127.0.0.1:${port}`)
@@ -1940,7 +2012,10 @@ describe('Server — upgrade seam', () => {
 
 	it('a declining handler is skipped and a later handler claims', async () => {
 		const order: string[] = []
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.upgrade(() => {
 			order.push('decline')
 			return false
@@ -1961,7 +2036,10 @@ describe('Server — upgrade seam', () => {
 
 	it('first claimer wins — a later handler never runs', async () => {
 		const order: string[] = []
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.upgrade((_request, socket) => {
 			order.push('first')
 			socket.write(
@@ -1983,7 +2061,10 @@ describe('Server — upgrade seam', () => {
 	it('a throwing handler is treated as declined — the next one still claims and the server survives', async () => {
 		const order: string[] = []
 		const errors = createRecorder<readonly [unknown]>()
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('error', errors.handler)
 		server.upgrade(() => {
 			order.push('throw')
@@ -2009,7 +2090,10 @@ describe('Server — upgrade seam', () => {
 
 	it('a sole handler that declines cleanly (returns false, no throw) — the socket is destroyed', async () => {
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('upgrade', upgrades.handler)
 		server.upgrade(() => false)
 		const port = await server.start()
@@ -2022,7 +2106,10 @@ describe('Server — upgrade seam', () => {
 	it('a sole throwing handler declines — the socket is destroyed and upgrade fires handled: false', async () => {
 		const upgrades = createRecorder<readonly [IncomingMessage, boolean]>()
 		const errors = createRecorder<readonly [unknown]>()
-		const server = track(createServer({ dispatcher: pingDispatcher(), state: () => undefined }))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined }),
+		)
 		server.emitter.on('upgrade', upgrades.handler)
 		server.emitter.on('error', errors.handler)
 		server.upgrade(() => {
@@ -2044,8 +2131,8 @@ describe('Server — stream backpressure', () => {
 		const parked = Promise.withResolvers<{ readonly bytes: number; readonly writes: number }>()
 		const resumed = Promise.withResolvers<void>()
 		const finished = Promise.withResolvers<void>()
-		let active: Promise<void> | undefined
-		let sustained: Promise<void> | undefined
+		const active = new ServerObservation<Promise<void> | undefined>(undefined)
+		const sustained = new ServerObservation<Promise<void> | undefined>(undefined)
 		const dispatcher = createDispatcher<undefined>()
 		dispatcher.add({
 			method: 'GET',
@@ -2054,31 +2141,29 @@ describe('Server — stream backpressure', () => {
 				const stream = createStream()
 				void waitForDelay(10).then(async () => {
 					const payload = 'x'.repeat(65_536)
-					let bytes = 0
-					let flowing = false
-					let writes = 0
+					const flowing = new ServerObservation(false)
 					try {
-						for (let index = 0; index < 1_024; index += 1) {
+						for (const index of Array.from({ length: 1_024 }).keys()) {
 							const ready = stream.write({ data: payload })
-							writes += 1
-							bytes += payload.length + 8
+							const writes = index + 1
+							const bytes = writes * (payload.length + 8)
 							if (ready) {
-								flowing = true
+								flowing.value = true
 								continue
 							}
 							const draining = stream.drain()
-							active = draining
-							if (flowing) {
+							active.value = draining
+							if (flowing.value) {
 								void waitForDelay(50).then(() => {
-									if (active !== draining) return
-									sustained = draining
+									if (active.value !== draining) return
+									sustained.value = draining
 									parked.resolve({ bytes, writes })
 								})
 							}
 							await draining
-							flowing = true
-							if (active === draining) active = undefined
-							if (sustained === draining) {
+							flowing.value = true
+							if (active.value === draining) active.value = undefined
+							if (sustained.value === draining) {
 								resumed.resolve()
 								break
 							}
@@ -2091,7 +2176,7 @@ describe('Server — stream backpressure', () => {
 				return stream.response
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const client = await openPausedResponse(port, '/events')
 		try {
@@ -2127,16 +2212,15 @@ describe('Server — stream backpressure', () => {
 			handler: () => {
 				const stream = createStream()
 				const payload = 'y'.repeat(32_768)
-				let unavailable = 0
-				for (let index = 0; index < 32; index += 1) {
-					if (!stream.write({ data: payload })) unavailable += 1
-				}
+				const unavailable = Array.from({ length: 32 }, () =>
+					stream.write({ data: payload }),
+				).filter((ready) => !ready).length
 				stream.end()
 				produced.resolve({ bytes: 32 * (payload.length + 8), unavailable })
 				return stream.response
 			},
 		})
-		const server = track(createServer({ dispatcher, state: () => undefined }))
+		const server = trackServer(running, createServer({ dispatcher, state: () => undefined }))
 		const port = await server.start()
 		const client = await openPausedResponse(port, '/events')
 		try {
@@ -2213,7 +2297,8 @@ describe('Server — capstone', () => {
 			handler: (_request, context) =>
 				Response.json({ id: context.params.id, userId: context.state.userId }),
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer<AppState>({
 				dispatcher,
 				state: () => ({}),
@@ -2243,7 +2328,8 @@ describe('Server — capstone', () => {
 				throw new HTTPError(404, 'user not found')
 			},
 		})
-		const server = track(
+		const server = trackServer(
+			running,
 			createServer<AppState>({
 				dispatcher,
 				state: () => ({}),
@@ -2271,7 +2357,7 @@ describe('Server — capstone', () => {
 				return stream.response
 			},
 		})
-		const server = track(createServer<AppState>({ dispatcher, state: () => ({}) }))
+		const server = trackServer(running, createServer<AppState>({ dispatcher, state: () => ({}) }))
 		const port = await server.start()
 		const response = await fetch(`http://127.0.0.1:${port}/events`)
 		expect(response.headers.get('content-type')).toContain('text/event-stream')
@@ -2279,16 +2365,15 @@ describe('Server — capstone', () => {
 		expect(reader).toBeDefined()
 		const decoder = new TextDecoder()
 		const reads: string[] = []
-		let text = ''
 		if (reader !== undefined) {
 			for (;;) {
 				const { done, value } = await reader.read()
 				if (done) break
 				const chunk = decoder.decode(value)
 				reads.push(chunk)
-				text += chunk
 			}
 		}
+		const text = reads.join('')
 		expect(reads.length).toBeGreaterThan(1)
 		expect(text).toContain('event: greeting\ndata: hello\n\n')
 		expect(text).toContain('event: greeting\ndata: world\n\n')

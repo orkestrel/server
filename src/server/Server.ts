@@ -23,11 +23,12 @@ import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { isError, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
-import { compose, readBody } from './helpers.js'
+import { attempt, isError, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
+import { compose, iterateRequestBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
 import { HTTPError, isHTTPError, ServerError } from './errors.js'
+import { ServerBinding } from './ServerBinding.js'
 
 /**
  * Represents the HTTP server facade — an observable `node:http` lifecycle composing this
@@ -326,13 +327,12 @@ export class Server<TState> implements ServerInterface<TState> {
 	// (for example, a malformed `Host` header) maps to a silent `400`, never
 	// `error`.
 	async #accept(message: IncomingMessage, response: ServerResponse): Promise<void> {
-		let raw: Request
-		try {
-			raw = buildRequest(message, { response })
-		} catch {
+		const created = attempt(() => buildRequest(message, { response }))
+		if (!created.success) {
 			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
 			return
 		}
+		const raw = created.value
 		// Hoisted out of the inner try (not block-scoped inside it) so that try's
 		// catch can attach real request context to the `error` emit / `report`
 		// sink — and so `response` can be emitted with the same facts on either
@@ -419,17 +419,14 @@ export class Server<TState> implements ServerInterface<TState> {
 			socket.destroy()
 			return
 		}
-		let handled = false
-		for (const handler of this.#upgradeHandlers) {
+		const handled = Iterator.from(this.#upgradeHandlers).some((handler) => {
 			try {
-				if (handler(request, socket, head)) {
-					handled = true
-					break
-				}
+				return handler(request, socket, head)
 			} catch (error) {
 				this.#emitter.emit('error', error)
+				return false
 			}
-		}
+		})
 		if (handled) this.#trackSocket(socket)
 		else socket.destroy()
 		this.#emitter.emit('upgrade', request, handled)
@@ -444,17 +441,16 @@ export class Server<TState> implements ServerInterface<TState> {
 			startup === undefined
 				? undefined
 				: addAbortListener(startup, () => binding.abort(startup.reason))
-		let listening: Promise<unknown[]> | undefined
+		const operation = new ServerBinding()
 		// The bound port, read inside the `try` so an address carrying none takes
 		// the same cleanup path a failed bind takes. `0` is this package's request
 		// for an ephemeral port, so it can never stand in for an unknown one.
-		let port: number
 		try {
 			signal?.throwIfAborted()
 			deadline?.start()
 			if (deadline?.ms === 0 && startup !== undefined) await once(startup, 'abort')
 			startup?.throwIfAborted()
-			listening = once(server, 'listening', { signal: binding.signal })
+			const listening = operation.subscribe(server, binding.signal)
 			if (startup === undefined) server.listen(this.#configuredPort ?? 0, this.#host)
 			else {
 				server.listen({
@@ -464,12 +460,7 @@ export class Server<TState> implements ServerInterface<TState> {
 				})
 			}
 			await listening
-			const address = server.address()
-			// This branch is unreachable through `listen(port)` and exists for the other members of `address()`'s union.
-			if (!isAddressInfo(address)) {
-				throw new TypeError('server bound a listener with no resolvable AddressInfo')
-			}
-			port = address.port
+			operation.record(server.address())
 		} catch (error) {
 			const expired = deadline?.expired === true
 			const cancelled = startup?.aborted === true
@@ -478,6 +469,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			// settles so it cannot escape as an uncaught process error.
 			server.on('error', () => undefined)
 			binding.abort(error)
+			const listening = operation.pending
 			if (listening !== undefined) await listening.catch(() => undefined)
 			await this.#close(server, true)
 			this.#http = undefined
@@ -495,6 +487,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			relay?.[Symbol.dispose]()
 			deadline?.clear()
 		}
+		const port = operation.port
 		this.#port = port
 		this.#status = 'listening'
 		this.#emitter.emit('start', port)
@@ -502,11 +495,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	#createBody(request: Request): () => Promise<unknown> {
-		let cached: Promise<unknown> | undefined
-		return () => {
-			cached ??= readBody(request, { limit: this.#limit })
-			return cached
-		}
+		const bodies = iterateRequestBody(request, this.#limit)
+		return () => bodies.next().value
 	}
 
 	// Close the underlying server, resolving after the listener closes, which
@@ -598,10 +588,9 @@ export class Server<TState> implements ServerInterface<TState> {
 	#trackStart(): () => void {
 		this.#enter()
 		this.#pending += 1
-		let done = false
+		const completions = [undefined].values()
 		return () => {
-			if (done) return
-			done = true
+			if (completions.next().done) return
 			this.#pending -= 1
 			this.#settle()
 		}

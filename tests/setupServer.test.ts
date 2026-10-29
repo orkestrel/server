@@ -1,14 +1,17 @@
-import type { Duplex } from 'node:stream'
 import type { LoopbackInterface } from '@orkestrel/test/server'
-import type { RecorderInterface } from '@orkestrel/test'
-import { readFileSync } from 'node:fs'
+import type { Duplex } from 'node:stream'
 import http from 'node:http'
 import net from 'node:net'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createRecorder, readProperty, requireValue, waitForCondition } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
+	trackLoopback,
+	createRawPeer,
+	createAnsweringPeer,
+	createUpgradePeer,
 	holdUpgrade,
 	openPausedResponse,
 	probeConnectionDrop,
@@ -35,11 +38,6 @@ const UNBINDABLE_HOST = '192.0.2.1'
 const bound: LoopbackInterface[] = []
 const opened: Array<{ destroy(): void }> = []
 
-function track(loopback: LoopbackInterface): LoopbackInterface {
-	bound.push(loopback)
-	return loopback
-}
-
 /**
  * Build a raw TCP peer that records each complete request it reads and answers with one payload.
  *
@@ -47,18 +45,6 @@ function track(loopback: LoopbackInterface): LoopbackInterface {
  * @param answer - The bytes written back after a complete request arrives.
  * @returns The unbound server.
  */
-function createRawPeer(requests: RecorderInterface<[string]>, answer: string): net.Server {
-	return net.createServer((socket) => {
-		opened.push(socket)
-		let text = ''
-		socket.on('data', (chunk: Buffer) => {
-			text += chunk.toString('utf8')
-			if (!text.endsWith('\r\n\r\n')) return
-			requests.handler(text)
-			socket.write(answer)
-		})
-	})
-}
 
 /**
  * Build an HTTP peer that records the path of every request and answers it in full.
@@ -66,13 +52,6 @@ function createRawPeer(requests: RecorderInterface<[string]>, answer: string): n
  * @param paths - The recorder each request path is reported to.
  * @returns The unbound server.
  */
-function createAnsweringPeer(paths: RecorderInterface<[string | undefined]>): http.Server {
-	return http.createServer((request, response) => {
-		paths.handler(request.url)
-		response.writeHead(200, { 'Content-Type': 'text/plain' })
-		response.end('parked')
-	})
-}
 
 /**
  * Build an HTTP peer that claims every upgrade, records the handshake, and keeps the socket.
@@ -81,30 +60,6 @@ function createAnsweringPeer(paths: RecorderInterface<[string | undefined]>): ht
  * @param claimed - The live set of sockets the peer took over.
  * @returns The unbound server.
  */
-function createUpgradePeer(
-	handshakes: RecorderInterface<[string | undefined, unknown]>,
-	claimed: Duplex[],
-): http.Server {
-	const server = http.createServer((_request, response) => {
-		response.writeHead(426)
-		response.end()
-	})
-	server.on('upgrade', (request, socket) => {
-		claimed.push(socket)
-		opened.push(socket)
-		handshakes.handler(request.url, request.headers['sec-websocket-key'])
-		socket.write(
-			'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
-		)
-		// A real peer reads its side of the upgraded connection. A claimed socket that never reads
-		// stays paused, so the client's departure sits unread in the receive buffer and the peer
-		// reports nothing. An upgraded socket also keeps its writable side after the client leaves,
-		// so `end` is the peer's departure signal and `close` never arrives.
-		socket.on('error', () => undefined)
-		socket.resume()
-	})
-	return server
-}
 
 afterEach(async () => {
 	for (const socket of opened.splice(0)) socket.destroy()
@@ -121,7 +76,10 @@ describe('setupServer — workspace root', () => {
 describe('setupServer — raw requests', () => {
 	it('puts bytes fetch refuses on the wire and returns the peer answer', async () => {
 		const requests = createRecorder<[string]>()
-		const loopback = track(await createLoopback(createRawPeer(requests, RAW_ANSWER)))
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(createRawPeer(opened, requests, RAW_ANSWER)),
+		)
 		const answer = await rawRequest(loopback.port, MALFORMED_REQUEST)
 		expect(requests.calls).toEqual([[MALFORMED_REQUEST]])
 		expect(answer).toBe(RAW_ANSWER)
@@ -131,7 +89,7 @@ describe('setupServer — raw requests', () => {
 describe('setupServer — paused responses', () => {
 	it('parks the answer bytes until the reader resumes', async () => {
 		const paths = createRecorder<[string | undefined]>()
-		const loopback = track(await createLoopback(createAnsweringPeer(paths)))
+		const loopback = trackLoopback(bound, await createLoopback(createAnsweringPeer(paths)))
 		const paused = await openPausedResponse(loopback.port, '/events')
 		await waitForCondition('the peer answered the paused request', () => paths.count === 1)
 		expect(paths.calls).toEqual([['/events']])
@@ -143,7 +101,7 @@ describe('setupServer — paused responses', () => {
 
 	it('tears down a paused response that was never resumed', async () => {
 		const paths = createRecorder<[string | undefined]>()
-		const loopback = track(await createLoopback(createAnsweringPeer(paths)))
+		const loopback = trackLoopback(bound, await createLoopback(createAnsweringPeer(paths)))
 		const paused = await openPausedResponse(loopback.port)
 		await waitForCondition('the peer answered the paused request', () => paths.count === 1)
 		paused.destroy()
@@ -155,7 +113,7 @@ describe('setupServer — paused responses', () => {
 describe('setupServer — connection drops', () => {
 	it('reports a drop when the peer cuts the connection inside the window', async () => {
 		const peer = net.createServer((socket) => socket.destroy())
-		const loopback = track(await createLoopback(peer))
+		const loopback = trackLoopback(bound, await createLoopback(peer))
 		expect(await probeConnectionDrop(loopback.port, 500)).toBe(true)
 	})
 
@@ -163,14 +121,14 @@ describe('setupServer — connection drops', () => {
 		const peer = net.createServer((socket) => {
 			opened.push(socket)
 		})
-		const loopback = track(await createLoopback(peer))
+		const loopback = trackLoopback(bound, await createLoopback(peer))
 		expect(await probeConnectionDrop(loopback.port, 150)).toBe(false)
 	})
 })
 
 describe('setupServer — loopback families', () => {
 	it('agrees with a real bind on the family this host accepts', async () => {
-		const loopback = track(await createLoopback(net.createServer()))
+		const loopback = trackLoopback(bound, await createLoopback(net.createServer()))
 		expect(loopback.url).toBe(`http://127.0.0.1:${loopback.port}`)
 		expect(await probeLoopback('127.0.0.1')).toBe(true)
 	})
@@ -184,7 +142,10 @@ describe('setupServer — held upgrades', () => {
 	it('completes the handshake and holds the socket until the peer cuts it', async () => {
 		const handshakes = createRecorder<[string | undefined, unknown]>()
 		const claimed: Duplex[] = []
-		const loopback = track(await createLoopback(createUpgradePeer(handshakes, claimed)))
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(createUpgradePeer(opened, handshakes, claimed)),
+		)
 		const held = await holdUpgrade(loopback.port, '/ws')
 		expect(handshakes.calls).toEqual([['/ws', 'aGVsZA==']])
 		expect(held.done).toBe(false)
@@ -196,7 +157,10 @@ describe('setupServer — held upgrades', () => {
 	it('closes the client end on release, which the peer observes', async () => {
 		const handshakes = createRecorder<[string | undefined, unknown]>()
 		const claimed: Duplex[] = []
-		const loopback = track(await createLoopback(createUpgradePeer(handshakes, claimed)))
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(createUpgradePeer(opened, handshakes, claimed)),
+		)
 		const held = await holdUpgrade(loopback.port)
 		const departures = createRecorder<[]>()
 		requireValue(claimed.at(0), 'the peer claimed the upgrade').once('end', departures.handler)
@@ -212,7 +176,10 @@ describe('setupServer — held upgrades', () => {
 describe('setupServer — upgrade outcomes', () => {
 	it('reports a claim with the handshake status and merges the extra headers', async () => {
 		const handshakes = createRecorder<[string | undefined, unknown]>()
-		const loopback = track(await createLoopback(createUpgradePeer(handshakes, [])))
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(createUpgradePeer(opened, handshakes, [])),
+		)
 		const outcome = await upgradeRequest(loopback.url, '/ws', { 'Sec-WebSocket-Key': 'cHJvb2Y=' })
 		expect(outcome).toEqual({ claimed: true, status: 101 })
 		expect(handshakes.calls).toEqual([['/ws', 'cHJvb2Y=']])
@@ -224,14 +191,14 @@ describe('setupServer — upgrade outcomes', () => {
 			opened.push(socket)
 			socket.end('HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
 		})
-		const loopback = track(await createLoopback(server))
+		const loopback = trackLoopback(bound, await createLoopback(server))
 		expect(await upgradeRequest(loopback.url, '/ws')).toEqual({ claimed: false, status: 426 })
 	})
 
 	it('reports no claim without a status when the peer destroys the socket', async () => {
 		const server = http.createServer()
 		server.on('upgrade', (_request, socket) => socket.destroy())
-		const loopback = track(await createLoopback(server))
+		const loopback = trackLoopback(bound, await createLoopback(server))
 		expect(await upgradeRequest(loopback.url, '/ws')).toEqual({ claimed: false, status: 0 })
 	})
 })

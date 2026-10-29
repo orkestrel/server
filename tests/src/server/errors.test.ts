@@ -1,12 +1,39 @@
 import { describe, expect, it } from 'vitest'
 import {
 	ContentTooLargeError,
-	HTTP_ERROR_BRAND,
 	HTTPError,
+	isContentTooLargeError,
 	isHTTPError,
 	isServerError,
 	ServerError,
 } from '@src/server'
+import { loadServerErrors } from '../../setupServer.js'
+
+describe('declared error contexts', () => {
+	it('accepts a class-instance context for every declared error guard', () => {
+		const context = new URL('https://example.invalid/context')
+		const http = new HTTPError(400, 'context')
+		const server = new ServerError('STATUS', 'context')
+		const limit = new ContentTooLargeError(1)
+		for (const error of [http, server, limit])
+			Object.defineProperty(error, 'context', { value: context })
+		expect(isHTTPError(http)).toBe(true)
+		expect(isServerError(server)).toBe(true)
+		expect(isContentTooLargeError(limit)).toBe(true)
+	})
+
+	it('accepts a callable context for every declared error guard', () => {
+		const context = Object.assign(() => undefined, { field: 'callable' })
+		const http = new HTTPError(400, 'context')
+		const server = new ServerError('STATUS', 'context')
+		const limit = new ContentTooLargeError(1)
+		for (const error of [http, server, limit])
+			Object.defineProperty(error, 'context', { value: context })
+		expect(isHTTPError(http)).toBe(true)
+		expect(isServerError(server)).toBe(true)
+		expect(isContentTooLargeError(limit)).toBe(true)
+	})
+})
 
 describe('HTTPError', () => {
 	it('carries the status and message', () => {
@@ -69,22 +96,17 @@ describe('isHTTPError', () => {
 		expect(isHTTPError(lookAlike)).toBe(false)
 	})
 
-	it('narrows a structurally-complete instance from a foreign package copy', () => {
-		// Simulates the dual-package hazard: an object carrying the
-		// `Symbol.for`-interned brand but NOT constructed by THIS copy's
-		// `HTTPError` (so `instanceof` would fail across copies).
-		const foreign: unknown = Object.assign(
-			{},
-			{ [HTTP_ERROR_BRAND]: true, status: 401, message: 'unauthorized' },
-		)
+	it('narrows a structurally-complete instance from a foreign package copy', async () => {
+		const copy = await loadServerErrors()
+		expect(copy.HTTPError).not.toBe(HTTPError)
+		const foreign = new copy.HTTPError(401, 'unauthorized')
 		expect(isHTTPError(foreign)).toBe(true)
 	})
 
-	it('narrows a foreign-copy clone of an HTTPError subclass', () => {
-		const foreignSubclass: unknown = Object.assign(
-			{},
-			{ [HTTP_ERROR_BRAND]: true, status: 413, message: 'too large', name: 'ContentTooLargeError' },
-		)
+	it('narrows a foreign-copy clone of an HTTPError subclass', async () => {
+		const copy = await loadServerErrors()
+		expect(copy.ContentTooLargeError).not.toBe(ContentTooLargeError)
+		const foreignSubclass = new copy.ContentTooLargeError(1024)
 		expect(isHTTPError(foreignSubclass)).toBe(true)
 	})
 })

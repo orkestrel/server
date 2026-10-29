@@ -110,15 +110,16 @@ export function wrapMiddleware<TState>(
 	next: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return async (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
-		let called = false
+		const calls = [next].values()
 		return Promise.resolve(
 			layer(request, context, (nextRequest?: Request): Promise<Response> => {
-				if (called)
+				const invocation = calls.next()
+				if (invocation.done)
 					return Promise.reject(
 						new ServerError('NEXT', 'next() was already called by this middleware'),
 					)
-				called = true
-				return next(nextRequest ?? request, context)
+				const downstream = invocation.value
+				return downstream(nextRequest ?? request, context)
 			}),
 		)
 	}
@@ -160,8 +161,7 @@ export function parseCookies(header: string | undefined): Record<string, string>
 	const out: Record<string, string> = {}
 	if (header === undefined) return out
 	const segments = header.split(';')
-	for (let index = 0; index < segments.length; index += 1) {
-		const raw = segments[index] ?? ''
+	for (const [index, raw] of segments.entries()) {
 		const segment = index === 0 ? raw : raw.replace(/^[ \t]+/, '')
 		const eq = segment.indexOf('=')
 		if (eq < 0) continue
@@ -593,14 +593,9 @@ export function parseAcceptHeader(header: string): readonly AcceptEntry[] {
 		const semicolon = trimmed.indexOf(';')
 		const value = (semicolon === -1 ? trimmed : trimmed.slice(0, semicolon)).trim().toLowerCase()
 		if (value.length === 0) continue
-		let q = 1
-		if (semicolon !== -1) {
-			const match = /;\s*q=(-?[0-9.]+)/i.exec(trimmed.slice(semicolon))
-			if (match !== null) {
-				const parsed = Number(match[1])
-				if (isFiniteNumber(parsed)) q = Math.min(1, Math.max(0, parsed))
-			}
-		}
+		const match = semicolon === -1 ? null : /;\s*q=(-?[0-9.]+)/i.exec(trimmed.slice(semicolon))
+		const parsed = match === null ? undefined : Number(match[1])
+		const q = isFiniteNumber(parsed) ? Math.min(1, Math.max(0, parsed)) : 1
 		entries.push({ value, q })
 	}
 	return entries
@@ -667,16 +662,13 @@ export function resolveCoding<T extends string>(
 	entries: readonly AcceptEntry[],
 	available: readonly T[],
 ): T | undefined {
-	let best: T | undefined
-	let bestQuality = 0
-	for (const coding of available) {
+	const best = Iterator.from(available).reduce<
+		{ readonly value: T; readonly quality: number } | undefined
+	>((previous, coding) => {
 		const quality = computeCodingQuality(entries, coding)
-		if (quality > bestQuality) {
-			best = coding
-			bestQuality = quality
-		}
-	}
-	return best
+		return quality > (previous?.quality ?? 0) ? { value: coding, quality } : previous
+	}, undefined)
+	return best?.value
 }
 
 /**
@@ -738,27 +730,69 @@ export function matchMediaType(
 	entries: readonly AcceptEntry[],
 	candidate: string,
 ): MediaMatch | undefined {
+	const matches = iterateMediaMatches(entries, candidate)
+	return matches.reduce<MediaMatch | undefined>((best, match) => {
+		if (match.q === 0) return undefined
+		const preferred =
+			best === undefined || match.rank < best.rank || (match.rank === best.rank && match.q > best.q)
+		return preferred ? match : best
+	}, undefined)
+}
+
+/**
+ * Yields matching media ranges through the first exact rejection.
+ *
+ * @example
+ * ```ts
+ * Array.from(iterateMediaMatches([{ value: 'text/plain', q: 1 }], 'text/plain'))
+ * // [{ q: 1, rank: 0 }]
+ * ```
+ */
+export function* iterateMediaMatches(
+	entries: readonly AcceptEntry[],
+	candidate: string,
+): Generator<MediaMatch, void, unknown> {
 	const slash = candidate.indexOf('/')
 	const type = slash === -1 ? candidate : candidate.slice(0, slash)
-	let best: MediaMatch | undefined
 	for (const entry of entries) {
-		let rank: number | undefined
-		if (entry.value === candidate) rank = 0
-		else if (entry.value === `${type}/*`) rank = 1
-		else if (entry.value === '*/*') rank = 2
+		const rank =
+			entry.value === candidate
+				? 0
+				: entry.value === `${type}/*`
+					? 1
+					: entry.value === '*/*'
+						? 2
+						: undefined
 		if (rank === undefined) continue
 		if (entry.q === 0) {
 			// An exact `;q=0` explicitly rejects this candidate outright; a
 			// wildcard `;q=0` only rejects the wildcard's own (less specific)
 			// coverage, so a later more-specific match can still allow it.
-			if (rank === 0) return undefined
+			if (rank === 0) {
+				yield { q: 0, rank }
+				return
+			}
 			continue
 		}
-		if (best === undefined || rank < best.rank || (rank === best.rank && entry.q > best.q)) {
-			best = { q: entry.q, rank }
-		}
+		yield { q: entry.q, rank }
 	}
-	return best
+}
+
+/**
+ * Yields the same lazily collected request-body promise on every read.
+ *
+ * @example
+ * ```ts
+ * const bodies = iterateRequestBody(new Request('http://localhost/'), 1024)
+ * bodies.next().value === bodies.next().value // true
+ * ```
+ */
+export function* iterateRequestBody(
+	request: Request,
+	limit: number,
+): Generator<Promise<unknown>, never, unknown> {
+	const body = readBody(request, { limit })
+	for (;;) yield body
 }
 
 /**
@@ -785,19 +819,19 @@ export function matchMediaType(
 export function computeLanguageQuality(entries: readonly AcceptEntry[], candidate: string): number {
 	const lower = candidate.toLowerCase()
 	const primary = lower.split('-')[0]
-	let named: number | undefined
-	let prefixed: number | undefined
-	let wildcard: number | undefined
-	for (const entry of entries) {
+	const qualities = Iterator.from(entries).reduce<{
+		readonly named?: number
+		readonly prefixed?: number
+		readonly wildcard?: number
+	}>((previous, entry) => {
 		const entryPrimary = entry.value.split('-')[0]
-		if (entry.value === lower) named = entry.q
-		else if (entryPrimary === primary) {
-			if (prefixed === undefined) prefixed = entry.q
-		} else if (entry.value === '*') wildcard = entry.q
-	}
-	if (named !== undefined) return named
-	if (prefixed !== undefined) return prefixed
-	return wildcard ?? 0
+		if (entry.value === lower) return { ...previous, named: entry.q }
+		if (entryPrimary === primary) {
+			return previous.prefixed === undefined ? { ...previous, prefixed: entry.q } : previous
+		}
+		return entry.value === '*' ? { ...previous, wildcard: entry.q } : previous
+	}, {})
+	return qualities.named ?? qualities.prefixed ?? qualities.wildcard ?? 0
 }
 
 /**
@@ -1115,14 +1149,10 @@ export function computeIPv6Network(address: string): string | undefined {
 	if (halves.length === 2 && second === undefined) return undefined
 	const head = first === '' ? [] : first.split(':')
 	const tail = second === undefined || second === '' ? [] : second.split(':')
-	let groups: string[]
-	if (halves.length === 2) {
-		const missing = 8 - head.length - tail.length
-		if (missing < 0) return undefined
-		groups = [...head, ...Array.from({ length: missing }, () => '0'), ...tail]
-	} else {
-		groups = head
-	}
+	const missing = 8 - head.length - tail.length
+	if (halves.length === 2 && missing < 0) return undefined
+	const groups =
+		halves.length === 2 ? [...head, ...Array.from({ length: missing }, () => '0'), ...tail] : head
 	if (groups.length !== 8) return undefined
 	const prefix: string[] = []
 	for (const group of groups.slice(0, 4)) {
@@ -1283,24 +1313,22 @@ export async function collectRequestBody(
 ): Promise<Uint8Array<ArrayBuffer>> {
 	if (request.body === null) return new Uint8Array(0)
 	const reader = request.body.getReader()
-	const chunks: Uint8Array[] = []
-	let total = 0
+	const chunks: Array<{ readonly bytes: Uint8Array; readonly total: number }> = []
 	for (;;) {
 		const { done, value } = await reader.read()
 		if (done) break
-		total += value.byteLength
+		const total = (chunks.at(-1)?.total ?? 0) + value.byteLength
 		if (limit > 0 && total > limit) {
 			await reader.cancel()
 			throw new ContentTooLargeError(limit)
 		}
-		chunks.push(value)
+		chunks.push({ bytes: value, total })
 	}
-	const merged = new Uint8Array(total)
-	let offset = 0
-	for (const chunk of chunks) {
-		merged.set(chunk, offset)
-		offset += chunk.byteLength
-	}
+	const merged = new Uint8Array(chunks.at(-1)?.total ?? 0)
+	chunks.reduce((offset, chunk) => {
+		merged.set(chunk.bytes, offset)
+		return offset + chunk.bytes.byteLength
+	}, 0)
 	return merged
 }
 
@@ -1357,14 +1385,15 @@ export async function decompressRequestBody(
 	encoding: Exclude<Encoding, 'identity'>,
 	cap: number,
 ): Promise<Uint8Array<ArrayBuffer>> {
-	let total = 0
+	const chunks: Array<{ readonly bytes: Uint8Array; readonly total: number }> = []
 	const capStream = new TransformStream<Uint8Array, Uint8Array>({
 		transform(chunk, controller) {
-			total += chunk.byteLength
+			const total = (chunks.at(-1)?.total ?? 0) + chunk.byteLength
 			if (cap > 0 && total > cap) {
 				controller.error(new ContentTooLargeError(cap))
 				return
 			}
+			chunks.push({ bytes: chunk, total })
 			controller.enqueue(chunk)
 		},
 	})
@@ -1376,25 +1405,20 @@ export async function decompressRequestBody(
 	})
 	const decompressed = source.pipeThrough(new DecompressionStream(encoding)).pipeThrough(capStream)
 	const reader = decompressed.getReader()
-	const chunks: Uint8Array[] = []
-	let size = 0
 	try {
 		for (;;) {
-			const { done, value } = await reader.read()
+			const { done } = await reader.read()
 			if (done) break
-			chunks.push(value)
-			size += value.byteLength
 		}
 	} catch (error) {
 		if (isInstance(error, ContentTooLargeError)) throw error
 		throw new HTTPError(400, 'malformed compressed request body')
 	}
-	const merged = new Uint8Array(size)
-	let offset = 0
-	for (const chunk of chunks) {
-		merged.set(chunk, offset)
-		offset += chunk.byteLength
-	}
+	const merged = new Uint8Array(chunks.at(-1)?.total ?? 0)
+	chunks.reduce((offset, chunk) => {
+		merged.set(chunk.bytes, offset)
+		return offset + chunk.bytes.byteLength
+	}, 0)
 	return merged
 }
 
