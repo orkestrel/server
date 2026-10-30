@@ -58,7 +58,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 
 ### Factories
 
-| API                | Kind     | Summary                                                                                                                                      |
+| Name               | Kind     | Summary                                                                                                                                      |
 | ------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `createNegotiator` | function | Creates a `NegotiatorInterface` — the reusable content-negotiation machine over the weighted `Accept` family.                                |
 | `createServer`     | function | Creates a `ServerInterface` — the node face's HTTP server facade over a consumed `@orkestrel/router` dispatcher.                             |
@@ -66,7 +66,7 @@ Cross-face and substrate usage appear under [Patterns](#patterns).
 
 ### Startup ownership
 
-| API             | Kind  | Shape                     | Summary                                                                     |
+| Name            | Kind  | Shape                     | Summary                                                                     |
 | --------------- | ----- | ------------------------- | --------------------------------------------------------------------------- |
 | `ServerBinding` | class | `new () => ServerBinding` | Owns one startup attempt's listening subscription and validated bound port. |
 
@@ -79,7 +79,7 @@ cleanup finish before the start event is emitted.
 
 A `Shape` cell holds the constant's declared type.
 
-| API                          | Kind  | Shape                              | Summary                                                                                                                                                                                                                            |
+| Name                         | Kind  | Shape                              | Summary                                                                                                                                                                                                                            |
 | ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DEFAULT_DRAIN_MS`           | const | `10_000`                           | Names the default graceful-stop deadline `stop()` gives in-flight requests and claimed upgraded sockets, `10_000` ms.                                                                                                              |
 | `DEFAULT_BODY_LIMIT`         | const | `1_048_576`                        | Names the default maximum request body size `readBody` accepts before a 413, `1_048_576` bytes.                                                                                                                                    |
@@ -92,7 +92,7 @@ A `Shape` cell holds the constant's declared type.
 
 ### Helpers
 
-| API                      | Kind     | Summary                                                                                                                                                                                                                                                                       |
+| Name                     | Kind     | Summary                                                                                                                                                                                                                                                                       |
 | ------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `compose`                | function | Composes an ordered chain of `MiddlewareHandler` layers around a `terminal` handler into one request handler — the frozen middleware seam.                                                                                                                                    |
 | `wrapMiddleware`         | function | Wraps one middleware layer around its downstream handler, enforcing the one-call `next` invariant.                                                                                                                                                                            |
@@ -141,7 +141,7 @@ A `Shape` cell holds the constant's declared type.
 
 ### Classes
 
-| API                    | Kind  | Summary                                                                                                                                                                                                      |
+| Name                   | Kind  | Summary                                                                                                                                                                                                      |
 | ---------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `HTTPError`            | class | Represents an error a handler (or middleware) throws to produce an HTTP response of a specific status.                                                                                                       |
 | `ContentTooLargeError` | class | Represents the `HTTPError` thrown when a request body exceeds the body pipeline's size limit — a `413 Content Too Large`.                                                                                    |
@@ -154,7 +154,7 @@ A `Shape` cell holds the constant's declared type.
 
 A `Shape` cell holds an interface's data members as bare names in braces, `?` marking an optional member and `plus` introducing its call-signature members, and a type alias's own type literal with a union's arms escaped as `\|`.
 
-| Type                      | Kind      | Shape                                                                                                                  | Summary                                                                                                                                                                                                      |
+| Name                      | Kind      | Shape                                                                                                                  | Summary                                                                                                                                                                                                      |
 | ------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `MiddlewareContext`       | interface | `{ url, method, state } plus body`                                                                                     | Represents the composition context — plain data, one per request, shared by every middleware and, as `state`, by the route handlers behind the dispatcher.                                                   |
 | `NextFunction`            | type      | `(request?: Request) => Promise<Response>`                                                                             | Represents the downstream continuation a `MiddlewareHandler` invokes to run the rest of the onion — guarded so a second call within one invocation rejects.                                                  |
@@ -191,7 +191,7 @@ bound node `AddressInfo` while the listener is active and `undefined` otherwise.
 
 The error guards and request readers expose these primitives.
 
-| API                             | Kind     | Summary                                                                               |
+| Name                            | Kind     | Summary                                                                               |
 | ------------------------------- | -------- | ------------------------------------------------------------------------------------- |
 | `SERVER_ERROR_BRAND`            | const    | Names the identity brand carried by lifecycle errors across package copies.           |
 | `CONTENT_TOO_LARGE_ERROR_BRAND` | const    | Names the identity brand carried by body-limit errors across package copies.          |
