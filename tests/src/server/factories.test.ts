@@ -1,5 +1,5 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { NegotiatorInterface, ServerInterface, StreamInterface } from '@src/server'
+import type { NegotiatorInterface, ServerInterface, SSEStreamInterface } from '@src/server'
 import { createDispatcher } from '@orkestrel/router'
 import {
 	createNegotiator,
@@ -99,10 +99,10 @@ describe('createServer — round-trip', () => {
 })
 
 describe('createStream — round-trip', () => {
-	it('returns a Stream instance implementing StreamInterface, open and writable', () => {
+	it('returns a Stream instance implementing SSEStreamInterface, open and writable', () => {
 		const stream = createStream()
 		expect(stream).toBeInstanceOf(Stream)
-		const check: StreamInterface = stream
+		const check: SSEStreamInterface = stream
 		expect(check).toBe(stream)
 		expect(stream.closed).toBe(false)
 		stream.end()
@@ -125,7 +125,7 @@ describe('createStream — round-trip', () => {
 		)
 	})
 
-	it('returns StreamInterface — a factory return type assertion', () => {
-		expectTypeOf(createStream()).toEqualTypeOf<StreamInterface>()
+	it('returns SSEStreamInterface — a factory return type assertion', () => {
+		expectTypeOf(createStream()).toEqualTypeOf<SSEStreamInterface>()
 	})
 })

@@ -2,7 +2,7 @@ import type {
 	NegotiatorInterface,
 	ServerInterface,
 	ServerOptions,
-	StreamInterface,
+	SSEStreamInterface,
 	StreamOptions,
 } from './types.js'
 import { Negotiator } from './Negotiator.js'
@@ -78,11 +78,11 @@ export function createServer<TState>(options: ServerOptions<TState>): ServerInte
 }
 
 /**
- * Creates a {@link StreamInterface} — a generic Server-Sent-Events stream whose
+ * Creates an {@link SSEStreamInterface} — a generic Server-Sent-Events stream whose
  * `response` is a fetch-standard streaming `Response` a route returns.
  *
  * @param options - {@link StreamOptions}
- * @returns A {@link StreamInterface} whose stream is open
+ * @returns An {@link SSEStreamInterface} whose stream is open
  *
  * @example
  * ```ts
@@ -97,6 +97,6 @@ export function createServer<TState>(options: ServerOptions<TState>): ServerInte
  * // return stream.response from the route handler
  * ```
  */
-export function createStream(options?: StreamOptions): StreamInterface {
+export function createStream(options?: StreamOptions): SSEStreamInterface {
 	return new Stream(options)
 }

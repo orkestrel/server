@@ -1,5 +1,5 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { StreamInterface } from '@src/server'
+import type { SSEStreamInterface } from '@src/server'
 import { Stream } from '@src/server'
 import { ServerObservation } from '../../setupServer.js'
 
@@ -10,8 +10,8 @@ import { ServerObservation } from '../../setupServer.js'
 
 describe('Stream', () => {
 	it('exposes boolean write readiness and an asynchronous drain wakeup', () => {
-		expectTypeOf<StreamInterface['write']>().returns.toEqualTypeOf<boolean>()
-		expectTypeOf<StreamInterface['drain']>().returns.toEqualTypeOf<Promise<void>>()
+		expectTypeOf<SSEStreamInterface['write']>().returns.toEqualTypeOf<boolean>()
+		expectTypeOf<SSEStreamInterface['drain']>().returns.toEqualTypeOf<Promise<void>>()
 	})
 
 	it('opens a Response with the SSE headers', () => {
@@ -104,9 +104,9 @@ describe('Stream', () => {
 		await expect(stream.drain()).resolves.toBeUndefined()
 	})
 
-	it('implements exactly StreamInterface', () => {
+	it('implements exactly SSEStreamInterface', () => {
 		const stream = new Stream()
-		const check: StreamInterface = stream
+		const check: SSEStreamInterface = stream
 		expect(check).toBe(stream)
 		stream.end()
 	})

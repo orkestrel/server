@@ -1,10 +1,10 @@
-import type { SSEMessage, StreamInterface, StreamOptions } from './types.js'
+import type { SSEMessage, SSEStreamInterface, StreamOptions } from './types.js'
 import { serializeEvent } from './helpers.js'
 import { SSE_HEADERS } from './constants.js'
 
 /**
  * Represents the Server-Sent-Events handle over an open, fetch-standard streaming
- * `Response`. Implements exactly {@link StreamInterface}.
+ * `Response`. Implements exactly {@link SSEStreamInterface}.
  *
  * @remarks
  * Builds the `Response` at construction from
@@ -47,7 +47,7 @@ import { SSE_HEADERS } from './constants.js'
  * // return stream.response from the route handler
  * ```
  */
-export class Stream implements StreamInterface {
+export class Stream implements SSEStreamInterface {
 	readonly #encoder = new TextEncoder()
 	readonly #response: Response
 	#controller: ReadableStreamDefaultController<Uint8Array> | undefined

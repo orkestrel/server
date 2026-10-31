@@ -13,7 +13,7 @@
 //       ({@link AcceptEntry} / {@link Encoding} / {@link FormatHandlerMap} /
 //       {@link NegotiatorInterface}), conditional requests ({@link RangeSpec}),
 //       SSE ({@link SSEMessage} / {@link StreamOptions} / {@link
-//       StreamInterface}), and the body pipeline ({@link BodyOptions}) — what
+//       SSEStreamInterface}), and the body pipeline ({@link BodyOptions}) — what
 //       `helpers.ts` implements against and middleware builds on.
 // ============================================================================
 
@@ -336,7 +336,7 @@ export interface SSEMessage {
 }
 
 /**
- * Options for a {@link StreamInterface} — how `createStream` opens the
+ * Options for an {@link SSEStreamInterface} — how `createStream` opens the
  * streaming response.
  *
  * @param status - The HTTP status the streaming response is opened with;
@@ -378,7 +378,7 @@ export interface StreamOptions {
  * Return `response` before awaiting a `false` write: the consumer cannot pull
  * until it receives the response.
  */
-export interface StreamInterface {
+export interface SSEStreamInterface {
 	/** Holds the streaming `Response` to return from the route handler. */
 	readonly response: Response
 	/** Reports whether the underlying stream is done (ended, or the consumer disconnected). */
