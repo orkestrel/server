@@ -77,8 +77,6 @@ cleanup finish before the start event is emitted.
 
 ### Constants
 
-A `Shape` cell holds the constant's declared type.
-
 | Name                         | Kind  | Signature                          | Summary                                                                                                                                                                                                                            |
 | ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DEFAULT_DRAIN_MS`           | const | `10000`                            | Names the default graceful-stop deadline `stop()` gives in-flight requests and claimed upgraded sockets, `10_000` ms.                                                                                                              |
@@ -151,8 +149,6 @@ A `Shape` cell holds the constant's declared type.
 | `Stream`               | class | `new (options?: StreamOptions) => SSEStreamInterface`                                                      | Represents the Server-Sent-Events handle over an open, fetch-standard streaming `Response`. Implements exactly `SSEStreamInterface`.                                                                         |
 
 ### Types
-
-A `Shape` cell holds an interface's data members as bare names in braces, `?` marking an optional member and `plus` introducing its call-signature members, and a type alias's own type literal with a union's arms escaped as `\|`.
 
 | Name                      | Kind      | Signature                                                                                                                                                                                                                                                                                                                                                                                               | Summary                                                                                                                                                                                                      |
 | ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
