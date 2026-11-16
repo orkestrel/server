@@ -58,7 +58,9 @@ import { isAddressInfo } from './validators.js'
  * most once, so a middleware cannot fork the request into two divergent
  * downstream runs. Each `next` resolves the downstream response through
  * {@link normalizeResponse}, so a layer can set headers on a redirect or a
- * `fetch` result.
+ * `fetch` result; each run keeps its own memo of checked responses, which ends
+ * with the run. `compose` copies `middleware` when called, so a layer added to
+ * the array later never runs in the returned handler.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  * @param middleware - The ordered chain, outermost first
@@ -80,9 +82,10 @@ export function compose<TState>(
 	middleware: ReadonlyArray<MiddlewareHandler<TState>>,
 	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
+	const layers = [...middleware]
 	return (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
 		const known = new Map<Response, Response>()
-		return middleware.reduceRight<
+		return layers.reduceRight<
 			(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
 		>((next, layer) => wrapMiddleware(layer, next, known), terminal)(request, context)
 	}
@@ -101,7 +104,8 @@ export function compose<TState>(
  * @typeParam TState - The consumer's opaque per-request state type
  * @param layer - The middleware layer to invoke
  * @param next - The downstream handler wrapped by `layer`
- * @param known - The {@link normalizeResponse} memo of one composed run, shared by its layers
+ * @param known - The {@link normalizeResponse} memo of one composed run, shared by its
+ *   layers; Default: a fresh `Map` per call of the returned handler
  * @returns A handler with `layer` composed around `next`
  *
  * @example
@@ -109,16 +113,16 @@ export function compose<TState>(
  * const handle = wrapMiddleware(
  * 	async (_request, _context, next) => next(),
  * 	async () => new Response('ok'),
- * 	new Map(),
  * )
  * ```
  */
 export function wrapMiddleware<TState>(
 	layer: MiddlewareHandler<TState>,
 	next: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
-	known: Map<Response, Response>,
+	known?: Map<Response, Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return async (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
+		const memo = known ?? new Map<Response, Response>()
 		const calls = [next].values()
 		return Promise.resolve(
 			layer(request, context, (...args: readonly unknown[]): Promise<Response> => {
@@ -133,7 +137,7 @@ export function wrapMiddleware<TState>(
 					)
 				return invocation
 					.value(request, context)
-					.then((response) => normalizeResponse(response, known))
+					.then((response) => normalizeResponse(response, memo))
 			}),
 		)
 	}

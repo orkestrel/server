@@ -449,7 +449,8 @@ describe('the exchange seam — retention', () => {
 		} finally {
 			agent.destroy()
 		}
-	})
+		// Passing runs read 3,742–4,775 ms under suite load; the budget is about three times the slowest.
+	}, 15_000)
 })
 
 describe('the exchange seam — response normalization', () => {

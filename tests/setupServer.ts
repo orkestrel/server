@@ -1335,14 +1335,26 @@ export function createAbortLayer<TState>(
  * unregisters a `Request`'s abort listener from its signal, and only then can Node collect a
  * signal `AbortSignal.any` composed and prune its bookkeeping. Three rounds let that chain settle.
  *
- * @returns The number of live objects whose prototype chain holds `Object.prototype`
+ * @param kind - The constructor whose prototype the counted objects carry; Default: `Object`
+ * @returns The number of live objects whose prototype chain holds `kind.prototype`
  */
-export async function countLiveObjects(): Promise<number> {
-	queryObjects(Object, { format: 'count' })
+export async function countLiveObjects(
+	kind: abstract new (...args: never[]) => unknown = Object,
+): Promise<number> {
+	queryObjects(kind, { format: 'count' })
 	await waitForDelay(10)
-	queryObjects(Object, { format: 'count' })
+	queryObjects(kind, { format: 'count' })
 	await waitForDelay(10)
-	return queryObjects(Object, { format: 'count' })
+	return queryObjects(kind, { format: 'count' })
+}
+
+/**
+ * Creates a layer that only calls its `next`.
+ *
+ * @returns The layer
+ */
+export function createPassLayer<TState>(): MiddlewareHandler<TState> {
+	return async (_request, _context, next) => next()
 }
 
 /**

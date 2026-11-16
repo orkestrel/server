@@ -10,6 +10,7 @@ import { createRecorder } from '@orkestrel/test'
 import {
 	clearCookie,
 	compose,
+	wrapMiddleware,
 	computeBodyETag,
 	computeClientKey,
 	computeCodingQuality,
@@ -70,6 +71,8 @@ import {
 	recognizeServerRange,
 	compressServerFixture,
 	createTraceLayer,
+	countLiveObjects,
+	createPassLayer,
 	repeatServerNext,
 	raceServerNext,
 	refuseServerRequest,
@@ -85,6 +88,47 @@ import {
 // ── compose (the middleware onion) ───────────────────────────────────────────
 
 describe('compose', () => {
+	it('runs the layers the array held when compose was called, not a layer pushed later', async () => {
+		const order: string[] = []
+		const layers = [createTraceLayer(order, 'first')]
+		const handle = compose(layers, async () => {
+			order.push('terminal')
+			return new Response('ok')
+		})
+		layers.push(createTraceLayer(order, 'late'))
+		await handle(new Request('http://localhost/'), buildContext({}))
+		expect(order).toEqual(['first-before', 'terminal', 'first-after'])
+	})
+
+	it('keeps no response live after many runs of one composed handler', async () => {
+		const handle = compose<Record<string, never>>(
+			[createPassLayer(), createPassLayer()],
+			async () => new Response('ok'),
+		)
+		const request = new Request('http://localhost/')
+		const context = buildContext<Record<string, never>>({})
+		await handle(request, context)
+		const before = await countLiveObjects(Response)
+		for (const _ of Array.from({ length: 3_000 })) await handle(request, context)
+		const after = await countLiveObjects(Response)
+		// A memo that outlives its run keeps every run's response; one run keeps at most a few.
+		expect(after - before).toBeLessThan(30)
+	})
+
+	it('keeps no response live after many calls of a handler wrapped once with no memo', async () => {
+		const handle = wrapMiddleware<Record<string, never>>(
+			createPassLayer(),
+			async () => new Response('ok'),
+		)
+		const request = new Request('http://localhost/')
+		const context = buildContext<Record<string, never>>({})
+		await handle(request, context)
+		const before = await countLiveObjects(Response)
+		for (const _ of Array.from({ length: 3_000 })) await handle(request, context)
+		const after = await countLiveObjects(Response)
+		expect(after - before).toBeLessThan(30)
+	})
+
 	it('runs middleware outermost-first around the terminal', async () => {
 		const order: string[] = []
 		const first = createTraceLayer(order, 'first')
