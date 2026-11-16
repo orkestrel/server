@@ -143,7 +143,20 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
 4. The regular-expression census (2026-11-16) found one superlinear pattern outside server: middleware's `isReservedDeviceName` (`src/server/helpers.ts`, `/[. ]+$/`), reached by every `createStatic` GET, about 317 ms for a run of 16,000 dots. M6 replaces it with `/(?<![. ])[. ]+$/`, which agreed with the original on all 299,593 strings up to length 6 over space, dot, tab, U+00A0, U+3000, `a`, `¹`, and an astral character. The fix strips only U+002E and U+0020, strips a mixed trailing run whole, and trims a dots-and-spaces segment to empty. Router has none.
 5. **Upstream fixes** (user ruling, 2026-11-16): a gap a consumer meets in an `@orkestrel` package is fixed in that package, not worked around in the consumer.
    - **abort:** `linkSignal` and `createAbort({ signal })` compose through `AbortSignal.any`, which on Node 22.23.5 retains about 130 B per call while the source signal lives. Evidence on Node 22.18.0, 22.23.5, 24.22.3, and Chromium comes first, then a design consultation rules the link, then a unit, a review, and abort 0.0.19. Router keeps `createAbort({ signal })` and takes the fix by pin.
-   - **contract:** first a list of every need the fleet meets, each with its evidence and consumers, so one release carries all of it; then a design consultation over the list. M5's two gaps open the list: no shape that wraps a guard, and no optional that admits an explicit `undefined`.
+   - **contract:** the needs list (2026-11-16) holds 20 rows. The most-shared are:
+     - `preview` costs about 0.3 ms for a string longer than 62 UTF-16 units, which every refusal pays (11 packages);
+     - no guard for a host error with a string `code` (8);
+     - no optional that admits an explicit `undefined` (7);
+     - no safe-integer guard (6);
+     - no coded refusal for one argument against one guard (5);
+     - a misspelled builder option fails open (5);
+     - no once-read admission that keeps functions and instances (4);
+     - no shape that admits a foreign implementation by its members (3);
+     - no constraint across members (3);
+     - a synchronous-only `attempt` (3).
+
+     The user reopened contract `ROADMAP.md` items 3 and 4: every builder refuses an option key it does not read, and contract adds an admission that reads each member of a caller's bag once, keeps functions and instances by identity, and reports every fault in one refusal. A design consultation rules every row, the units, and each consumer's adoption, and contract 0.0.25 carries every built row.
+
    - Any other `@orkestrel` package a unit finds lacking joins this item.
 6. The mcp, browser, toolbox, and scaffold visits; the integrated `orkestrel-falsify` round; a tree-wide `verifier` run; the consumer run; the releases in layer order.
 
