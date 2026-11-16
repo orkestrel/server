@@ -143,6 +143,7 @@ cleanup finish before the start event is emitted.
 | `isAddressInfo`          | function | `(value: unknown) => value is AddressInfo`                                                                                                                                                                                                      | Checks whether a `node:net` `server.address()` return is the structured `AddressInfo` (carrying a numeric `port`) rather than a pipe `string` or `null` — the total, never-throwing narrow `discoverPort` and the `Server`'s own port resolution read the bound port through. |
 | `probePort`              | function | `(port: number) => Promise<number>`                                                                                                                                                                                                             | Binds and closes a throwaway TCP server to resolve one available port.                                                                                                                                                                                                        |
 | `discoverPort`           | function | `(preferred?: number) => Promise<number>`                                                                                                                                                                                                       | Finds a free TCP port — binds a throwaway `node:net` server on a `preferred` port where one is given and on an ephemeral port otherwise, reads the bound port, closes the server, and resolves that port.                                                                     |
+| `buildErrorResponse`     | function | `(error: unknown, expose: boolean) => Response`                                                                                                                                                                                                 | Builds the response an error boundary sends for a thrown value: an `HTTPError` whose status the `Response` constructor admits keeps that status, and every other value renders a 500 whose message stays hidden unless `expose` is `true`.                                    |
 
 ### Classes
 
@@ -399,22 +400,47 @@ These invariants hold across `src/server` ↔ `server.md`.
    `report` call, and no `response` emit, because nothing downstream ever ran
    and no parsed `Request` exists yet to derive its facts from. The outer
    phase covers everything after — a throwing `this.#state(connection)`
-   through the middleware/dispatcher run — where a thrown `HTTPError` renders
-   as its own status + message; any
-   other throw renders `500` with its message hidden unless `expose` is set,
-   `report` is invoked with the caught error plus the originating request's
-   `{ method, url }` (its own throw swallowed so reporting can never crash
-   the response), and `error` is emitted with that same `{ method, url }` as
-   its second argument. Beneath this single seam sits one server-owned last
-   resort: if writing the mapped response itself throws, the connection is
-   destroyed rather than left half-written or crashing the process — the
-   middleware package may still ship a richer boundary that short-circuits
-   earlier. On both the success path and this outer-boundary error path, a
-   `response` event fires once the response has been sent, carrying
-   `{ method, pathname, status, ms }` — so observability covers every request
-   that reached the middleware pipeline, exactly once, regardless of outcome.
-   A request rejected at the inner `buildRequest` boundary is the one
-   exception: it emits no `response` at all.
+   through the middleware/dispatcher run — and renders a throw through
+   `buildErrorResponse`, the one renderer a middleware boundary can call too:
+   - A thrown `HTTPError` whose status `Response` admits renders as its own
+     status and message, and a null body status (204, 205, or 304) renders
+     with no body.
+   - Any other throw renders `500` with its message hidden unless `expose` is
+     set. That includes an `HTTPError` whose status no `Response` carries,
+     such as 101, 600, `NaN`, or 200.5, and a returned response whose status
+     lies outside 200 through 599, such as the 0 of `Response.error()`.
+   - Each fault reaches the `error` event and the `report` sink once, with the
+     same `(error, RequestLine)`: every throw except an `HTTPError` whose
+     status the response carries and a throw after a peer disconnect. A
+     fault on the inner phase's `400` path, a failed write included, reaches
+     both with no `RequestLine`, because no `Request` exists there.
+   - A `report` sink that throws, or returns a promise that rejects, is
+     contained, and the response still goes out. A rejected native promise
+     whose species constructor cannot build a promise stays out of reach:
+     its `constructor` lookup throws or yields a value that is neither
+     `undefined` nor an object, its `Symbol.species` lookup throws or yields
+     a value that is neither `undefined`, `null`, nor a constructor, or that
+     constructor throws or never passes its executor callable resolve and
+     reject functions. Such a promise refuses every reaction, so its
+     rejection reaches `unhandledRejection`, which ends the process under
+     Node's default unhandled-rejection mode.
+   - A write that fails, at a header Node refuses or in the body after the
+     headers went out, destroys the connection, so the client reads an abort,
+     and is a fault.
+   - A peer that disconnects before the end is no fault: a throw after the
+     disconnect emits no `error` and calls no `report`.
+   - A terminal catch over the whole exchange, the inner phase's `400`
+     included, holds a throw from any step, the renderer and the write
+     included, so no exchange rejects.
+
+   A `response` event fires once for each response that finished, carrying
+   `{ method, pathname, status, ms }`: `status` is the status the server
+   wrote, and `ms` is the time from the exchange's acceptance to the last
+   byte of its body, in whole milliseconds. A response whose peer disconnected
+   first, a body-less answer included, a failed write, and the inner phase's
+   `400` fire none. An exchange the server aborted through `context.abort` and
+   then answered still fires one.
+
 7. **Upgrade fan-out is isolated, first-claimer-wins.** Registered
    `UpgradeHandler`s run in registration order; the first to return `true`
    claims the socket and stops the fan-out; a handler that throws is treated as
@@ -523,7 +549,9 @@ These invariants hold across `src/server` ↔ `server.md`.
     generic (non-`HTTPError`) throw's message is hidden behind a fixed
     `'Internal Server Error'` string unless `expose` is explicitly `true`; an
     `HTTPError`'s own `message` is always client-facing (it is the handler's
-    deliberate signal), independent of `expose`.
+    deliberate signal), independent of `expose`, when `Response` admits its
+    status. An `HTTPError` whose status no `Response` carries renders as a
+    generic throw.
 18. **Error guards recognize independent package copies through an own identity brand.**
     A recognized value is a global Error with a derived prototype. Its own brand holds the
     value itself. The guard checks the declared status or code, message, and optional context.
@@ -814,8 +842,9 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
 - **Close your upgraded sockets on the `stop` event** — the server tracks them
   so shutdown terminates, but only your handler speaks the protocol, so only
   it can close one cleanly before the deadline cuts it.
-- **Install a `report` sink for observability** — its own throw is swallowed,
-  so it can never crash a response.
+- **Install a `report` sink for observability** — its own throw and a promise
+  it returns that rejects are contained, so the response still goes out;
+  Contract item 6 names the rejected promises the server cannot adopt.
 
 ## Tests
 
@@ -834,7 +863,11 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   `context.connection` under a `state` factory that ignores it, `context.abort` on
   one exchange and on none beside it, the in-flight registry under `stop()`, the
   live-object count after thousands of requests, and response normalization of a
-  redirect and a `fetch` result.
+  redirect and a `fetch` result. Its boundary blocks answer every thrown
+  `HTTPError` status from 100 through 999 and each returned status as `Response`
+  admits it, run fit finding F3's table through the server and the renderer
+  alike, and drive a body failure after the headers, a peer disconnect before
+  the end, the `response` record, and the terminal catch.
 - [`tests/src/server/helpers.test.ts`](../tests/src/server/helpers.test.ts) —
   `compose` (outer-first ordering, double-`next` rejection, the refusal of a
   `next` argument, one request and context per chain, short-circuit,
@@ -896,7 +929,8 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   the deadline then cut, settled early when the claimant closes it, reported
   on `drain`, and force-closed by `destroy()`) against a no-socket control,
   20-parallel-none-dropped, connection facts threaded into state,
-  `context.body()` caching, boundary mapping (`HTTPError`/other/`expose`), the
+  `context.body()` caching, boundary mapping (`HTTPError`/other/`expose`), a
+  `report` sink that throws, rejects, or returns a thenable that throws, the
   stop-signal-reaches-handlers case, and the real slow-TCP proof that an SSE
   producer parks at local queue pressure, resumes on drain, and stays bounded
   when cooperative while ignored readiness retains unconditional enqueue.

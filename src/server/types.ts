@@ -580,12 +580,16 @@ export interface ResponseRecord {
  *   runs, carrying the raw method + the parsed pathname.
  * - `upgrade` — a raw protocol-upgrade fan-out settled; carries the original
  *   `IncomingMessage` and whether a registered {@link UpgradeHandler} claimed it.
- * - `error` — a server-level fault: an escaping throw past the built-in
- *   boundary, an upgrade handler's throw, or a listen failure. Carries the
- *   originating request's method + parsed `url` when the fault happened on
- *   the per-request path; `undefined` for an upgrade-handler throw (no fetch
- *   `Request` exists on that path — only a raw `IncomingMessage`) or a listen
- *   failure.
+ * - `error` — a fault, fired once per fault. On the per-request path that is
+ *   a throw the built-in boundary reports (every throw except an `HTTPError`
+ *   whose status the response carries, a returned status no `Response`
+ *   carries included), a response write that fails, or a throw the terminal
+ *   catch holds; each carries the request's {@link RequestLine}, the same
+ *   pair `report` receives. A throw after a peer disconnect is no fault and
+ *   fires nothing. The request is `undefined` for an upgrade-handler throw
+ *   (no fetch `Request` exists on that path — only a raw `IncomingMessage`),
+ *   a listen failure, and a fault on the `400` path of a request no
+ *   `Request` could be built for, a failed write of that `400` included.
  * - `stop` — `stop()` began (status moved to `'stopping'`). An upgrade
  *   handler that owns a long-lived socket closes it from here, so the drain
  *   settles instead of running out the deadline.
@@ -593,13 +597,17 @@ export interface ResponseRecord {
  *   carries the still-pending request count and the still-attached upgraded
  *   socket count. Both `0` is a clean drain; either non-zero means the close
  *   that follows was forced and cut that work.
- * - `response` — fired after the response has been sent, for every request
- *   that reaches the middleware pipeline (the success path and the
- *   outer-boundary error path); carries the method, parsed pathname, final
- *   status, and elapsed time in milliseconds. A request rejected at the
- *   `buildRequest` inner boundary (a plain `400`, for example a malformed
- *   `Host` header) emits no `response` — no parsed `Request` exists yet to derive
- *   its facts from.
+ * - `response` — fired once for each response that finished, after the
+ *   server wrote its last byte, on the success path and the outer-boundary
+ *   error path alike. It carries the method, the parsed pathname, `status`,
+ *   the status the server wrote (the handler's, or the rendered status of a
+ *   throw), and `ms`, the time from the exchange's acceptance, before
+ *   `request` fires, to that last byte, in whole milliseconds. A response
+ *   whose peer disconnected first, a body-less answer included, and a write
+ *   that failed fire no `response`,
+ *   and neither does a request rejected at the `buildRequest` inner boundary
+ *   (a plain `400`, for example a malformed `Host` header), because no parsed
+ *   `Request` exists yet to derive its facts from.
  */
 export type ServerEventMap = {
 	readonly start: readonly [port: number]
@@ -687,11 +695,23 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  * @param expose - Whether a non-`HTTPError` throw's message is sent in the
  *   500 response body (an `HTTPError`'s own message is always client-facing).
  *   Defaults to `false`.
- * @param report - A fire-and-forget sink the built-in boundary hands every
- *   caught error to (logging / metrics), along with the originating
- *   request's method + parsed `url` when one is available (absent on an
- *   upgrade-path fault); its own throw is swallowed so reporting can never
- *   crash the response.
+ * @param report - A fire-and-forget sink the built-in boundary hands each
+ *   fault to (logging / metrics), with the same `(error, RequestLine)` the
+ *   `error` event carries: every throw except an `HTTPError` whose status the
+ *   response carries, a returned status no `Response` carries, a response
+ *   write that fails, and a throw the terminal catch holds. A throw after a
+ *   peer disconnect is no fault. A sink that throws, or returns a promise
+ *   that rejects, is contained, so the response still goes out, except a
+ *   rejected native promise whose species constructor cannot build a promise:
+ *   its `constructor` lookup throws or yields a value that is neither
+ *   `undefined` nor an object, its `Symbol.species` lookup throws or yields a
+ *   value that is neither `undefined`, `null`, nor a constructor, or that
+ *   constructor throws or never passes its executor callable resolve and
+ *   reject functions. Such a promise refuses every reaction, so its rejection
+ *   reaches `unhandledRejection`, which ends the process under Node's default
+ *   unhandled-rejection mode; the response still goes out. The request is absent
+ *   only for a fault on the `400` path of a request no `Request` could be
+ *   built for, a failed write of that `400` included.
  * @param timeouts - Lifecycle and `node:http` tuning knobs: `start` (maximum
  *   time to bind the listener; `0` permits no startup window), `request` (max
  *   time to fully receive + respond, `requestTimeout`), `headers` (max time
@@ -761,8 +781,9 @@ export interface ServerOptions<TState> {
  * the composed middleware onion runs terminating in
  * `dispatcher.handle`, and the result is written back through
  * `sendResponse` — every escaping throw is caught by the
- * built-in boundary (`HTTPError` → its status; anything else → a
- * hidden-unless-`expose` `500`) so a handler error can never crash the process.
+ * built-in boundary (an `HTTPError` whose status `Response` admits → its
+ * status; anything else → a hidden-unless-`expose` `500`) so a handler error
+ * can never crash the process.
  */
 export interface ServerInterface<TState> {
 	/** Holds the instance's correlation id, minted once per `Server` and stable for its lifetime. */

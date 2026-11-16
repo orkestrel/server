@@ -17,10 +17,12 @@ import { CONTENT_TOO_LARGE_ERROR_BRAND, HTTP_ERROR_BRAND, SERVER_ERROR_BRAND } f
  * @remarks
  * Carries the HTTP `status` to send and an optional `context` record (the
  * offending field / value). The server's built-in error boundary catches it
- * and renders a response of `status` with the error's `message` as the body
- * — so an `HTTPError`'s message is always client-facing (it is the handler's
- * deliberate signal), unlike a generic throw whose message is hidden unless
- * `expose` is set. Subclass it (as {@link ContentTooLargeError} does) for
+ * and renders a response of `status` with the error's `message` as the body,
+ * and no body for 204, 205, and 304 — so an `HTTPError`'s message is always
+ * client-facing (it is the handler's deliberate signal), unlike a generic
+ * throw whose message is hidden unless `expose` is set. A `status` the
+ * `Response` constructor refuses, an integer below 200 or above 599 or a
+ * status that is not an integer, renders `500` instead. Subclass it (as {@link ContentTooLargeError} does) for
  * specific statuses, or throw it directly. Narrow a caught value with
  * {@link isHTTPError}. The machine-readable discriminator is `status`; there is
  * no separate `code`.

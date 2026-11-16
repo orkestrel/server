@@ -4,6 +4,7 @@ import type { AddressInfo } from 'node:net'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
 	ConnectionStateFunction,
+	RequestLine,
 	ServerInterface,
 	ServerOptions,
 	ServerStatus,
@@ -18,8 +19,10 @@ import { createServer, createStream, HTTPError, isServerError } from '@src/serve
 import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { waitForSocketClose } from '@orkestrel/test/server'
 import {
+	BOUNDARY_HIDDEN,
 	ServerObservation,
 	claimUpgrades,
+	createBoundaryDispatcher,
 	createEchoDispatcher,
 	createPingDispatcher,
 	createUploadDispatcher,
@@ -29,6 +32,7 @@ import {
 	probeConnectionDrop,
 	probeLoopback,
 	rawRequest,
+	readBoundaryReply,
 	upgradeRequest,
 } from '../../setupServer.js'
 
@@ -2377,5 +2381,100 @@ describe('Server — capstone', () => {
 		expect(reads.length).toBeGreaterThan(1)
 		expect(text).toContain('event: greeting\ndata: hello\n\n')
 		expect(text).toContain('event: greeting\ndata: world\n\n')
+	})
+})
+
+describe('Server — report containment', () => {
+	it.each([
+		{
+			label: 'returns a rejected promise',
+			sink: async (): Promise<void> => {
+				throw new Error('the reporting sink rejects')
+			},
+		},
+		{
+			label: 'throws',
+			sink: (): void => {
+				throw new Error('the reporting sink throws')
+			},
+		},
+		{
+			label: 'returns a thenable whose then throws',
+			sink: (): object => ({
+				then: () => {
+					throw new Error('the reporting sink then throws')
+				},
+			}),
+		},
+		{
+			label: 'returns a rejected native promise whose own then throws',
+			sink: (): Promise<void> =>
+				Object.defineProperty(Promise.reject(new Error('the reporting sink rejects')), 'then', {
+					value: () => {
+						throw new Error('the own then throws')
+					},
+				}),
+		},
+		{
+			label: 'returns a native promise whose constructor getter throws',
+			sink: (): Promise<void> =>
+				Object.defineProperty(Promise.resolve(), 'constructor', {
+					get: () => {
+						throw new Error('the constructor getter throws')
+					},
+				}),
+		},
+	])('contains a report that $label, and still sends the 500', async ({ sink }) => {
+		const rejections = createRecorder<readonly [unknown]>()
+		process.on('unhandledRejection', rejections.handler)
+		try {
+			const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createBoundaryDispatcher([]),
+					state: () => undefined,
+					host: '127.0.0.1',
+					report: (error, line) => {
+						reports.handler(error, line)
+						return sink()
+					},
+				}),
+			)
+			const port = await server.start()
+			const reply = await readBoundaryReply(port, '/boom')
+			expect([reply.status, reply.body, reply.complete]).toEqual([500, BOUNDARY_HIDDEN, true])
+			expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+			await waitForDelay(10)
+			expect(reports.count).toBe(1)
+			expect(rejections.calls).toEqual([])
+		} finally {
+			process.off('unhandledRejection', rejections.handler)
+		}
+	})
+
+	it('hands report and the error event the same error and RequestLine, and neither an HTTPError', async () => {
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher([]),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		expect((await readBoundaryReply(port, '/throw/418')).status).toBe(418)
+		expect((await readBoundaryReply(port, '/boom?probe=1')).status).toBe(500)
+		const [reported] = reports.calls
+		expect(reports.count).toBe(1)
+		expect(errors.calls).toEqual(reports.calls)
+		expect(reported?.[0]).toBeInstanceOf(Error)
+		expect(reported?.[1]?.method).toBe('GET')
+		expect(reported?.[1]?.url).toBeInstanceOf(URL)
+		expect(reported?.[1]?.url.href).toBe(`http://127.0.0.1:${port}/boom?probe=1`)
 	})
 })
