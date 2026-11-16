@@ -16,3 +16,4 @@
 | 2026-11-16 | S4 review                                                                                                                                    | reviewer (Opus 5.5)                           | server `c90ecec`                |
 | 2026-11-16 | S4b, the range grammar                                                                                                                       | opus (Opus 5.5)                               | server `c90ecec`                |
 | 2026-11-16 | S4b confirming review: a quadratic strip in `parseRange`                                                                                     | reviewer (Opus 5.5)                           | `plan.md` § Sequence            |
+| 2026-11-16 | M5 stopped on a contract gap; foreign implementation keys pass the `objectOf` combinator after `admitValue`                                  | Orchestrator                                  | `plan.md` § Deferred            |
