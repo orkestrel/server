@@ -2,6 +2,7 @@ import type { Encoding, FormatHandlerMap, MiddlewareContext, NegotiatorInterface
 import {
 	computeLanguageQuality,
 	matchMediaType,
+	mergeVary,
 	parseAcceptHeader,
 	resolveCoding,
 } from './helpers.js'
@@ -15,9 +16,10 @@ import {
  * `negotiate` is the generic media-type primitive (exact / subtype-wildcard /
  * any-range, q-sorted, `;q=0` rejected); `encoding` / `language` are its
  * sibling axes and reuse the same {@link parseAcceptHeader} q-value parser the
- * rest of the substrate uses — one parser, never two. `format` reads the
- * request `Accept`, negotiates a {@link FormatHandlerMap}'s keys, and invokes
- * the winner — or answers `406 Not Acceptable`.
+ * rest of the substrate uses — one parser, never two. A media type matches
+ * case-insensitively. `format` reads the request `Accept`, negotiates a
+ * {@link FormatHandlerMap}'s keys, and invokes the winner — or answers
+ * `406 Not Acceptable` — and sets `Vary: Accept` on either answer.
  *
  * @example
  * ```ts
@@ -69,7 +71,8 @@ export class Negotiator implements NegotiatorInterface {
 	 *
 	 * @remarks
 	 * Errors thrown by the negotiated handler propagate unmodified — the
-	 * server boundary classifies them, never this negotiator.
+	 * server boundary classifies them, never this negotiator. The answer is a
+	 * copy of the handler's response carrying `Vary: Accept`.
 	 */
 	async format<TState>(
 		request: Request,
@@ -79,9 +82,17 @@ export class Negotiator implements NegotiatorInterface {
 		const keys = Object.keys(handlers)
 		const header = request.headers.get('accept')
 		const type = header === null ? keys[0] : this.negotiate(header, keys)
-		if (type === undefined) return new Response('Not Acceptable', { status: 406 })
-		const handler = handlers[type]
-		if (handler === undefined) return new Response('Not Acceptable', { status: 406 })
-		return handler(request, context)
+		const handler = type === undefined ? undefined : handlers[type]
+		if (handler === undefined) {
+			return new Response('Not Acceptable', { status: 406, headers: { Vary: 'Accept' } })
+		}
+		const response = await handler(request, context)
+		const headers = new Headers(response.headers)
+		headers.set('Vary', mergeVary(headers.get('vary') ?? undefined, 'Accept'))
+		return new Response(response.body, {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		})
 	}
 }

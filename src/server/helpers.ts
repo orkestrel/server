@@ -15,6 +15,7 @@ import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
 import {
+	isArray,
 	isError,
 	isFiniteNumber,
 	isInstance,
@@ -28,7 +29,9 @@ import {
 	COMPRESSIBLE_TYPES,
 	DEFAULT_BODY_LIMIT,
 	DEFAULT_DECOMPRESSED_LIMIT,
+	RANGE_BOUND_PATTERN,
 	REQUEST_ID_PATTERN,
+	SSE_LINE_PATTERN,
 } from './constants.js'
 import { ContentTooLargeError, HTTPError, ServerError } from './errors.js'
 import { isAddressInfo } from './validators.js'
@@ -149,8 +152,12 @@ export function wrapMiddleware<TState>(
  * name, is skipped; a later duplicate name wins. Total — an absent/empty/
  * malformed header yields an empty record, never throws.
  *
+ * The record has a null prototype, so a name that `Object.prototype` carries
+ * (`constructor`, `toString`, `__proto__`) reads as an ordinary cookie when
+ * present and as `undefined` when absent.
+ *
  * @param header - The raw `Cookie` header value (possibly `undefined`)
- * @returns A record of every parsed cookie, `name → decoded value`
+ * @returns A null-prototype record of every parsed cookie, `name → decoded value`
  *
  * @example
  * ```ts
@@ -158,18 +165,18 @@ export function wrapMiddleware<TState>(
  * ```
  */
 export function parseCookies(header: string | undefined): Record<string, string> {
-	const out: Record<string, string> = {}
-	if (header === undefined) return out
-	const segments = header.split(';')
-	for (const [index, raw] of segments.entries()) {
-		const segment = index === 0 ? raw : raw.replace(/^[ \t]+/, '')
-		const eq = segment.indexOf('=')
-		if (eq < 0) continue
-		const name = segment.slice(0, eq)
-		if (!isCookieName(name)) continue
-		out[name] = decodeCookieValue(segment.slice(eq + 1).trim())
-	}
-	return out
+	const pairs = (header ?? '')
+		.split(';')
+		.flatMap((raw, index): ReadonlyArray<readonly [string, string]> => {
+			const segment = index === 0 ? raw : raw.replace(/^[ \t]+/, '')
+			const eq = segment.indexOf('=')
+			if (eq < 0) return []
+			const name = segment.slice(0, eq)
+			return isCookieName(name) ? [[name, decodeCookieValue(segment.slice(eq + 1).trim())]] : []
+		})
+	const cookies = Object.fromEntries(pairs)
+	Object.setPrototypeOf(cookies, null)
+	return cookies
 }
 
 /**
@@ -359,7 +366,8 @@ export async function writeSignedCookie(
  * Parses the `Cookie` header ({@link parseCookies}), takes the named cookie,
  * and verifies it with {@link verifyToken} against `secret` (a rotation list
  * accepts a cookie signed by any of its secrets). Any failure — an absent
- * cookie, a tampered value, a wrong secret — yields `undefined`, never throws.
+ * cookie, a tampered value, a wrong secret — yields `undefined`, never throws,
+ * a name such as `constructor` included.
  *
  * @param request - The `Request` to read the `Cookie` header from
  * @param name - The cookie name to read
@@ -712,7 +720,8 @@ export function negotiateEncoding<T extends string>(
  * `undefined` immediately); a wildcard `;q=0` only rejects the wildcard's own
  * (less specific) coverage, so a later more-specific match can still allow
  * it. Among multiple matching entries, the lowest `rank` wins, and among a
- * rank tie the highest `q` wins.
+ * rank tie the highest `q` wins. The candidate matches case-insensitively, as
+ * the entries do.
  *
  * @param entries - The parsed {@link AcceptEntry} list
  * @param candidate - The candidate media type to score (for example `'text/html'`)
@@ -752,11 +761,13 @@ export function* iterateMediaMatches(
 	entries: readonly AcceptEntry[],
 	candidate: string,
 ): Generator<MediaMatch, void, unknown> {
-	const slash = candidate.indexOf('/')
-	const type = slash === -1 ? candidate : candidate.slice(0, slash)
+	// `parseAcceptHeader` lower-cases each entry, and a media type matches case-insensitively.
+	const media = candidate.toLowerCase()
+	const slash = media.indexOf('/')
+	const type = slash === -1 ? media : media.slice(0, slash)
 	for (const entry of entries) {
 		const rank =
-			entry.value === candidate
+			entry.value === media
 				? 0
 				: entry.value === `${type}/*`
 					? 1
@@ -956,7 +967,9 @@ export function matchesETag(header: string, etag: string): boolean {
  * `{ satisfiable: false }` for a range wholly past the resource, and
  * `undefined` for the "serve the whole resource" case: an absent header, a
  * non-`bytes` unit, a multi-range header (`a-b, c-d` — refused outright, not
- * supported), or any malformed/non-finite bound. Never throws on a hostile
+ * supported), or a bound outside `1*DIGIT` ({@link
+ * import('./constants.js').RANGE_BOUND_PATTERN}), so a hexadecimal, exponent,
+ * signed, or fractional numeral is refused. Never throws on a malformed
  * header.
  *
  * @param header - The raw `Range` header value
@@ -967,6 +980,7 @@ export function matchesETag(header: string, etag: string): boolean {
  * ```ts
  * parseRange('bytes=0-99', 1000) // { satisfiable: true, start: 0, end: 99 }
  * parseRange('bytes=0-1, 2-3', 1000) // undefined — multi-range refused
+ * parseRange('bytes=0x10-', 1000) // undefined — not a decimal bound
  * ```
  */
 export function parseRange(header: string | undefined, size: number): RangeSpec | undefined {
@@ -982,16 +996,19 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	const startText = spec.slice(0, dash).trim()
 	const endText = spec.slice(dash + 1).trim()
 	if (startText === '') {
+		if (!RANGE_BOUND_PATTERN.test(endText)) return undefined
 		const suffix = Number(endText)
-		if (endText === '' || !isInteger(suffix) || suffix <= 0) return undefined
+		if (!isInteger(suffix) || suffix <= 0) return undefined
 		if (size === 0) return { satisfiable: false }
 		const start = Math.max(0, size - suffix)
 		return { satisfiable: true, start, end: size - 1 }
 	}
+	if (!RANGE_BOUND_PATTERN.test(startText)) return undefined
 	const start = Number(startText)
-	if (!isInteger(start) || start < 0) return undefined
+	if (!isInteger(start)) return undefined
 	if (start >= size) return { satisfiable: false }
 	if (endText === '') return { satisfiable: true, start, end: size - 1 }
+	if (!RANGE_BOUND_PATTERN.test(endText)) return undefined
 	const end = Number(endText)
 	if (!isInteger(end) || end < start) return undefined
 	return { satisfiable: true, start, end: Math.min(end, size - 1) }
@@ -1186,8 +1203,9 @@ export function computeClientKey(address: string): string {
 	return computeIPv6Network(address) ?? address
 }
 
-// The Server-Sent-Events seam (module-scope) — `serializeEvent` is the wire
-// encoder (the exact inverse of a consuming SSE parser). The stream handle
+// The Server-Sent-Events seam (module-scope) — `serializeEvent` and
+// `serializeComment` are the wire encoders, each read back by a conforming
+// SSE parser as the message or comment it was given. The stream handle
 // that writes those events over a `ReadableStream` is the `Stream` entity,
 // reached through `createStream`.
 
@@ -1197,12 +1215,19 @@ export function computeClientKey(address: string): string {
  * @remarks
  * Emits an `event:`/`id:`/`retry:` line for each present field, then one
  * `data:` line per CRLF-aware-split (`\r\n` / `\r` / `\n`) segment of `data`
- * (so a consuming parser's multi-`data` concat reproduces the original
- * `data` exactly, and no raw `\r` or `\n` can ever ride onto the wire inside
- * a `data:` line), then the terminating blank line.
+ * (so a consuming parser's multi-`data` concat reproduces `data` with each
+ * line break read as `\n`, and no raw `\r` or `\n` can ever ride onto the wire
+ * inside a `data:` line), then the terminating blank line.
+ *
+ * It refuses a field the wire cannot carry rather than emit a second field or
+ * a second event: an `event` with a line break, an `id` with a line break or
+ * a NUL (which a conforming parser drops), and a `retry` that is not a
+ * non-negative safe integer.
  *
  * @param message - The event to serialize
  * @returns The SSE wire text for the event (terminated by a blank line)
+ * @throws {ServerError} Thrown when a field is refused, with code `'EVENT'`
+ *   and `context.field` naming the field
  *
  * @example
  * ```ts
@@ -1211,12 +1236,42 @@ export function computeClientKey(address: string): string {
  * ```
  */
 export function serializeEvent(message: SSEMessage): string {
-	const lines: string[] = []
-	if (message.event !== undefined) lines.push(`event: ${message.event}`)
-	if (message.id !== undefined) lines.push(`id: ${message.id}`)
-	if (message.retry !== undefined) lines.push(`retry: ${message.retry}`)
-	for (const segment of message.data.split(/\r\n|\r|\n/)) lines.push(`data: ${segment}`)
+	const { event, id, retry } = message
+	if (event !== undefined && /[\r\n]/.test(event))
+		throw new ServerError('EVENT', 'an SSE event type must be one line', { field: 'event' })
+	if (id !== undefined && /[\r\n\0]/.test(id))
+		throw new ServerError('EVENT', 'an SSE id must be one line with no NUL', { field: 'id' })
+	if (retry !== undefined && !(Number.isSafeInteger(retry) && retry >= 0))
+		throw new ServerError('EVENT', 'an SSE retry must be a non-negative safe integer', {
+			field: 'retry',
+		})
+	const lines = [
+		...(event === undefined ? [] : [`event: ${event}`]),
+		...(id === undefined ? [] : [`id: ${id}`]),
+		...(retry === undefined ? [] : [`retry: ${retry}`]),
+		...message.data.split(SSE_LINE_PATTERN).map((segment) => `data: ${segment}`),
+	]
 	return `${lines.join('\n')}\n\n`
+}
+
+/**
+ * Serializes a comment to the SSE wire, one `: ` line per line of `text`.
+ *
+ * @remarks
+ * Splits `text` on `\r\n`, `\r`, and `\n`, so no line of the comment can
+ * reach a parser as a field and no comment can dispatch an event.
+ *
+ * @example
+ * ```ts
+ * serializeComment('keep-alive') // ': keep-alive\n\n'
+ * serializeComment('a\nb') // ': a\n: b\n\n'
+ * ```
+ */
+export function serializeComment(text: string): string {
+	return `${text
+		.split(SSE_LINE_PATTERN)
+		.map((line) => `: ${line}`)
+		.join('\n')}\n\n`
 }
 
 // The body pipeline (module-scope) —
@@ -1227,8 +1282,7 @@ export function serializeEvent(message: SSEMessage): string {
 // before materializing the bomb, since `DecompressionStream` has no
 // `maxOutputLength` knob), then decodes by content type. `scrubPrototype` /
 // `isDangerousKey` are the prototype-pollution scrub `readBody` applies to a
-// parsed JSON body, ported verbatim (pure value-walking logic, unaffected by
-// the fetch-vocabulary migration).
+// parsed JSON or urlencoded body.
 
 /**
  * Checks whether a key is a prototype-pollution vector — `__proto__`,
@@ -1249,16 +1303,20 @@ export function isDangerousKey(key: string): boolean {
 }
 
 /**
- * Strips the prototype-pollution keys from a parsed value in place, recursively.
+ * Strips the prototype-pollution keys from a parsed value in place, at every depth.
  *
  * @remarks
  * `JSON.parse('{"__proto__":{…}}')` is benign on its own — it produces an own,
  * enumerable `__proto__` data property — but that own key becomes a
  * pollution gadget the moment a downstream deep-merge copies it onto a live
  * object. This walks the value and `delete`s any own {@link isDangerousKey}
- * key at every depth, recursing into nested objects + array elements.
+ * key at every depth, into nested records and array elements.
  * Primitives/`null` pass through untouched. Total — never throws. Mutates the
  * freshly-parsed value (which nothing else holds yet).
+ *
+ * The walk keeps a worklist rather than the call stack, so a value nested as
+ * deep as the body limit admits costs no stack depth, and it reads a node
+ * reached twice once, so a self-referencing value terminates.
  *
  * @param value - The freshly `JSON.parse`d value to scrub (mutated in place)
  * @returns The same `value`, with every dangerous key removed at every depth
@@ -1270,19 +1328,21 @@ export function isDangerousKey(key: string): boolean {
  * ```
  */
 export function scrubPrototype(value: unknown): unknown {
-	if (Array.isArray(value)) {
-		for (const member of value) scrubPrototype(member)
-		return value
-	}
-	if (isRecord(value)) {
-		for (const key of Object.keys(value)) {
+	const nodes = new Set<unknown>([value])
+	for (const node of nodes) {
+		if (isArray(node)) {
+			for (const member of node) if (isArray(member) || isRecord(member)) nodes.add(member)
+			continue
+		}
+		if (!isRecord(node)) continue
+		for (const key of Object.keys(node)) {
 			if (isDangerousKey(key)) {
-				Reflect.deleteProperty(value, key)
+				Reflect.deleteProperty(node, key)
 				continue
 			}
-			scrubPrototype(value[key])
+			const member = node[key]
+			if (isArray(member) || isRecord(member)) nodes.add(member)
 		}
-		return value
 	}
 	return value
 }
@@ -1436,8 +1496,11 @@ export async function decompressRequestBody(
  * `options.decompression`, default {@link
  * import('./constants.js').DEFAULT_DECOMPRESSED_LIMIT}), then decodes by
  * content type: `application/json` is parsed by using `@orkestrel/contract`'s
- * `parseJSON` and scrubbed of prototype-pollution keys ({@link
- * scrubPrototype}); any other type decodes as UTF-8 text.
+ * `parseJSON`, `application/x-www-form-urlencoded` is read through
+ * `URLSearchParams` into a record whose repeated field keeps its last value,
+ * and both are scrubbed of prototype-pollution keys ({@link scrubPrototype});
+ * any other type decodes as UTF-8 text. The media type matches
+ * case-insensitively and ignores its parameters.
  *
  * A malformed JSON body is total: it decodes rather than throwing, so a handler
  * that must reject one checks for `undefined` itself, and nothing in the returned
@@ -1445,8 +1508,9 @@ export async function decompressRequestBody(
  *
  * @param request - The `Request` to read the body from
  * @param options - The {@link BodyOptions} `limit` + `decompression` caps
- * @returns The parsed JSON value, the raw text, or `undefined` — for an empty
- *   body, and for an `application/json` body whose text is not valid JSON
+ * @returns The parsed JSON value, the decoded form record, the raw text, or
+ *   `undefined` — for an empty body, and for an `application/json` body whose
+ *   text is not valid JSON
  * @throws {ContentTooLargeError} When the wire body or decompressed output exceeds its cap
  * @throws {HTTPError} When the compressed body is corrupt (400)
  *
@@ -1471,6 +1535,8 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 			: (semicolon === -1 ? contentType : contentType.slice(0, semicolon)).trim().toLowerCase()
 	const text = new TextDecoder().decode(bytes)
 	if (bareType === 'application/json') return scrubPrototype(parseJSON(text))
+	if (bareType === 'application/x-www-form-urlencoded')
+		return scrubPrototype(Object.fromEntries(new URLSearchParams(text)))
 	return text
 }
 

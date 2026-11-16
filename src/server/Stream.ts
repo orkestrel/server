@@ -1,5 +1,5 @@
 import type { SSEMessage, SSEStreamInterface, StreamOptions } from './types.js'
-import { serializeEvent } from './helpers.js'
+import { serializeComment, serializeEvent } from './helpers.js'
 import { SSE_HEADERS } from './constants.js'
 
 /**
@@ -16,13 +16,18 @@ import { SSE_HEADERS } from './constants.js'
  * wakeup, so the whole handle is one entity rather than a closure over four
  * bindings.
  *
+ * The stream opens with one comment line ({@link serializeComment}), so the
+ * response pump has a first chunk and the headers leave before any event.
  * `write` serializes one message ({@link serializeEvent}), enqueues it, and
- * returns whether the controller still has positive desired size. A producer
+ * returns whether the controller still has positive desired size; on an open
+ * stream it throws the `ServerError` `serializeEvent` raises for a refused
+ * field and enqueues nothing. A producer
  * receiving `false` awaits `drain()`; that promise resolves on the next
  * consumer pull restoring capacity, or on stream closure. `comment` writes a
- * `: text` keep-alive line a conforming SSE parser ignores; `end` closes the
- * stream. Every method is a safe no-op once `closed` (ended by `end()`, or
- * the consumer cancelled the stream), so a late write never throws.
+ * `: text` keep-alive line per line of its text, which a conforming SSE parser
+ * ignores; `end` closes the stream. Every method is a safe no-op once `closed`
+ * (ended by `end()`, or the consumer cancelled the stream), so a late write
+ * never throws.
  *
  * The readiness signal reflects only the process-local `ReadableStream`
  * queue — it is not proof that a remote peer consumed bytes. When the response
@@ -87,7 +92,7 @@ export class Stream implements SSEStreamInterface {
 	}
 
 	comment(text: string): void {
-		this.#enqueue(`: ${text}\n\n`)
+		this.#enqueue(serializeComment(text))
 	}
 
 	drain(): Promise<void> {
@@ -110,6 +115,8 @@ export class Stream implements SSEStreamInterface {
 	// and treats an absent one as "not yet writable".
 	#attach(controller: ReadableStreamDefaultController<Uint8Array>): void {
 		this.#controller = controller
+		// The opening comment is the pump's first chunk, so the headers leave before any event.
+		controller.enqueue(this.#encoder.encode(serializeComment('')))
 	}
 
 	// A pull that restored positive desired size is the wakeup a parked

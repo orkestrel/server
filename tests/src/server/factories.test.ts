@@ -121,7 +121,7 @@ describe('createStream — round-trip', () => {
 		stream.comment('keep-alive')
 		stream.end()
 		await expect(new Response(stream.response.body).text()).resolves.toBe(
-			'event: token\ndata: hello\n\n: keep-alive\n\n',
+			': \n\nevent: token\ndata: hello\n\n: keep-alive\n\n',
 		)
 	})
 

@@ -1,6 +1,12 @@
+import type { IncomingMessage } from 'node:http'
+import http from 'node:http'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { SSEStreamInterface } from '@src/server'
-import { Stream } from '@src/server'
+import { sendResponse } from '@orkestrel/router/server'
+import { createSSEParser } from '@orkestrel/sse'
+import { waitForEvent } from '@orkestrel/test'
+import { createLoopback } from '@orkestrel/test/server'
+import { ServerError, Stream } from '@src/server'
 import { ServerObservation } from '../../setupServer.js'
 
 // Mirror of `src/server/Stream.ts` — the SSE handle over a real
@@ -51,7 +57,7 @@ describe('Stream', () => {
 		expect(stream.write({ event: 'token', data: 'second' })).toBe(false)
 		stream.end()
 		const text = await new Response(stream.response.body).text()
-		expect(text).toBe('event: token\ndata: first\n\nevent: token\ndata: second\n\n')
+		expect(text).toBe(': \n\nevent: token\ndata: first\n\nevent: token\ndata: second\n\n')
 	})
 
 	it('writes a comment as an SSE keep-alive line a parser ignores', async () => {
@@ -60,7 +66,79 @@ describe('Stream', () => {
 		stream.write({ data: 'after' })
 		stream.end()
 		const text = await new Response(stream.response.body).text()
-		expect(text).toBe(': keep-alive\n\ndata: after\n\n')
+		expect(text).toBe(': \n\n: keep-alive\n\ndata: after\n\n')
+		expect(createSSEParser().parse(text)).toEqual([{ data: 'after' }])
+	})
+
+	it('opens with one comment line, so the body carries bytes before the first event', async () => {
+		const stream = new Stream()
+		stream.end()
+		const text = await new Response(stream.response.body).text()
+		expect(text).toBe(': \n\n')
+		expect(createSSEParser().parse(text)).toEqual([])
+	})
+
+	it('sends the response headers through the router pump before the first event', async () => {
+		const stream = new Stream()
+		const loopback = await createLoopback(
+			http.createServer((_incoming, target) => {
+				void sendResponse(stream.response, target)
+			}),
+		)
+		const client = http.get(loopback.url)
+		client.on('error', () => undefined)
+		try {
+			const [response] = await waitForEvent<[IncomingMessage]>(
+				(listener) => {
+					client.once('response', listener)
+					return () => client.off('response', listener)
+				},
+				'SSE response headers before the first event',
+				{ budget: 2_000 },
+			)
+			expect(response.statusCode).toBe(200)
+			expect(response.headers['content-type']).toContain('text/event-stream')
+			response.resume()
+		} finally {
+			stream.end()
+			client.destroy()
+			await loopback.destroy()
+		}
+	})
+
+	it('splits a multi-line comment into one comment line per line, so no line reads as a field', async () => {
+		const stream = new Stream()
+		stream.comment('keep-alive\n\ndata: forged\r\nevent: x\rid: 1')
+		stream.end()
+		const text = await new Response(stream.response.body).text()
+		expect(text).toBe(': \n\n: keep-alive\n: \n: data: forged\n: event: x\n: id: 1\n\n')
+		expect(createSSEParser().parse(text)).toEqual([])
+	})
+
+	it('throws on an open stream for a field the wire cannot carry and enqueues nothing', async () => {
+		const stream = new Stream()
+		expect(() => stream.write({ event: 'tick\ndata: injected', data: 'x' })).toThrow(ServerError)
+		expect(() => stream.write({ id: '7\r', data: 'x' })).toThrow(ServerError)
+		expect(() => stream.write({ retry: Number.NaN, data: 'x' })).toThrow(ServerError)
+		stream.end()
+		const text = await new Response(stream.response.body).text()
+		expect(text).toBe(': \n\n')
+	})
+
+	it('returns false without throwing for a refused field once the stream is closed', () => {
+		const stream = new Stream()
+		stream.end()
+		expect(stream.write({ event: 'tick\ndata: injected', data: 'x' })).toBe(false)
+	})
+
+	it('writes an ordinary event a conforming parser reads back unchanged', async () => {
+		const stream = new Stream()
+		stream.write({ event: 'token', id: '42', retry: 1_000, data: 'hello\nworld' })
+		stream.end()
+		const text = await new Response(stream.response.body).text()
+		expect(createSSEParser().parse(text)).toEqual([
+			{ event: 'token', id: '42', retry: 1_000, data: 'hello\nworld' },
+		])
 	})
 
 	it('parks at the stream high-water mark and wakes on the next consumer pull', async () => {
@@ -76,6 +154,8 @@ describe('Stream', () => {
 		expect(body).not.toBeNull()
 		if (body === null) return
 		const reader = body.getReader()
+		const opening = await reader.read()
+		expect(new TextDecoder().decode(opening.value)).toBe(': \n\n')
 		const first = await reader.read()
 		await draining
 		expect(drained.value).toBe(true)

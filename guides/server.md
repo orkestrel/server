@@ -84,6 +84,8 @@ cleanup finish before the start event is emitted.
 | `DEFAULT_DECOMPRESSED_LIMIT` | const | `16777216`                         | Names the default maximum decompressed request body size, `16_777_216` bytes — the zip-bomb cap the body pipeline's byte-counting `TransformStream` enforces when it transparently decompresses a `Content-Encoding` request body. |
 | `SSE_HEADERS`                | const | `Readonly<Record<string, string>>` | Holds the SSE response headers a `Stream` sets on its response, merged under any caller `headers` so a caller repeating one of these keys replaces its value.                                                                      |
 | `REQUEST_ID_PATTERN`         | const | `Readonly<RegExp>`                 | Defines the strict charset `isValidRequestId` requires an incoming `X-Request-ID` to match, `^[A-Za-z0-9_-]{1,200}$`.                                                                                                              |
+| `RANGE_BOUND_PATTERN`        | const | `Readonly<RegExp>`                 | Defines the `1*DIGIT` form `parseRange` requires of a `Range` bound, `^[0-9]+$`.                                                                                                                                                   |
+| `SSE_LINE_PATTERN`           | const | `Readonly<RegExp>`                 | Defines the line terminators of the SSE wire, `\r\n`, `\r`, and `\n`, which `serializeEvent` and `serializeComment` split text on.                                                                                                 |
 | `COMPRESSIBLE_TYPES`         | const | `ReadonlySet<string>`              | Holds the bare `Content-Type` values `isCompressibleType` treats as compressible, beyond the `text/*` prefix and structured-suffix (`+json`, `+xml`) rules that helper also applies.                                               |
 | `HTTP_ERROR_BRAND`           | const | `unique symbol`                    | Names the `Symbol.for`-interned brand `HTTPError` carries, `@orkestrel/server.HTTPError`, so `isHTTPError` recognizes an instance across package copies. A consumer never sets it by hand.                                         |
 | `DEFAULT_ENCODINGS`          | const | `readonly Encoding[]`              | Lists the default `Encoding` content-codings the substrate offers, in preference order — `gzip` then `deflate`.                                                                                                                    |
@@ -125,8 +127,9 @@ cleanup finish before the start event is emitted.
 | `computeIPv6Network`     | function | `(address: string) => string \| undefined`                                                                                                                                                                                             | Computes the `/64` network of a full IPv6 address, or `undefined` when the input is not a plain IPv6 address to collapse.                                                                                                                                                     |
 | `computeClientKey`       | function | `(address: string) => string`                                                                                                                                                                                                          | Collapses a client IP into its rate-limit bucket key — an IPv6 address to its `/64` network, an IPv4 (or IPv4-mapped) address unchanged.                                                                                                                                      |
 | `serializeEvent`         | function | `(message: SSEMessage) => string`                                                                                                                                                                                                      | Serializes one `SSEMessage` to the SSE wire.                                                                                                                                                                                                                                  |
+| `serializeComment`       | function | `(text: string) => string`                                                                                                                                                                                                             | Serializes a comment to the SSE wire, one `: ` line per line of `text`.                                                                                                                                                                                                       |
 | `isDangerousKey`         | function | `(key: string) => boolean`                                                                                                                                                                                                             | Checks whether a key is a prototype-pollution vector — `__proto__`, `constructor`, or `prototype`, each of which can reach and mutate `Object.prototype` when it is assigned onto a normal object.                                                                            |
-| `scrubPrototype`         | function | `(value: unknown) => unknown`                                                                                                                                                                                                          | Strips the prototype-pollution keys from a parsed value in place, recursively.                                                                                                                                                                                                |
+| `scrubPrototype`         | function | `(value: unknown) => unknown`                                                                                                                                                                                                          | Strips the prototype-pollution keys from a parsed value in place, at every depth.                                                                                                                                                                                             |
 | `collectRequestBody`     | function | `(request: Request, limit: number) => Promise<Uint8Array<ArrayBuffer>>`                                                                                                                                                                | Collects a `Request` body into a single `Uint8Array`, enforcing a size limit.                                                                                                                                                                                                 |
 | `parseEncoding`          | function | `(header: string \| null) => Exclude<Encoding, 'identity'> \| undefined`                                                                                                                                                               | Parses a raw `Content-Encoding` header value into a decompressible `Encoding` — the boundary `readBody` coerces through to decide whether a request body needs transparent decompression.                                                                                     |
 | `decompressRequestBody`  | function | `(bytes: Uint8Array<ArrayBuffer>, encoding: Exclude<Encoding, 'identity'>, cap: number) => Promise<Uint8Array<ArrayBuffer>>`                                                                                                           | Decompresses an already-collected, `gzip`/`deflate`-encoded byte sequence transparently through `DecompressionStream`, capping the decompressed output — the zip-bomb defense.                                                                                                |
@@ -143,7 +146,7 @@ cleanup finish before the start event is emitted.
 | ---------------------- | ----- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `HTTPError`            | class | `new (status: number, message: string, context?: Readonly<Record<string, unknown>>) => HTTPError`          | Represents an error a handler (or middleware) throws to produce an HTTP response of a specific status.                                                                                                       |
 | `ContentTooLargeError` | class | `new (limit: number) => ContentTooLargeError`                                                              | Represents the `HTTPError` thrown when a request body exceeds the body pipeline's size limit — a `413 Content Too Large`.                                                                                    |
-| `ServerError`          | class | `new (code: ServerErrorCode, message: string, context?: Readonly<Record<string, unknown>>) => ServerError` | Represents the error this package raises when a caller programmed a call the entity refuses, carrying `'STATUS'` or `'NEXT'` as its code.                                                                    |
+| `ServerError`          | class | `new (code: ServerErrorCode, message: string, context?: Readonly<Record<string, unknown>>) => ServerError` | Represents the error this package raises when a caller programmed a call the entity refuses, carrying `'STATUS'`, `'NEXT'`, or `'EVENT'` as its code.                                                        |
 | `Negotiator`           | class | `new () => NegotiatorInterface`                                                                            | Represents the content-negotiation machine over the weighted `Accept` family — a reusable, cross-middleware entity rather than a middleware. Implements exactly `NegotiatorInterface`.                       |
 | `Server`               | class | `new <TState>(options: ServerOptions<TState>) => ServerInterface<TState>`                                  | Represents the HTTP server facade — an observable `node:http` lifecycle composing this module's own middleware onion around a consumed `@orkestrel/router` dispatcher. Implements exactly `ServerInterface`. |
 | `Stream`               | class | `new (options?: StreamOptions) => SSEStreamInterface`                                                      | Represents the Server-Sent-Events handle over an open, fetch-standard streaming `Response`. Implements exactly `SSEStreamInterface`.                                                                         |
@@ -170,7 +173,7 @@ cleanup finish before the start event is emitted.
 | `RangeSpec`               | type      | `{ readonly satisfiable: true; readonly start: number; readonly end: number; } \| { readonly satisfiable: false; }`                                                                                                                                                                                                                                                                                     | Represents the parsed outcome of an HTTP `Range` request header.                                                                                                                                             |
 | `BodyOptions`             | interface | `{ limit?, decompression? }`                                                                                                                                                                                                                                                                                                                                                                            | Options for `readBody` — how the shared body-collection pipeline caps and decompresses a request body.                                                                                                       |
 | `ServerStatus`            | type      | `'idle' \| 'starting' \| 'listening' \| 'stopping' \| 'stopped'`                                                                                                                                                                                                                                                                                                                                        | Represents the `Server`'s lifecycle state.                                                                                                                                                                   |
-| `ServerErrorCode`         | type      | `'STATUS' \| 'NEXT'`                                                                                                                                                                                                                                                                                                                                                                                    | Represents the machine-readable category a `ServerError` carries — `'STATUS'` for a lifecycle call the current status forbids, `'NEXT'` for a middleware that called its `next` a second time.               |
+| `ServerErrorCode`         | type      | `'STATUS' \| 'NEXT' \| 'EVENT'`                                                                                                                                                                                                                                                                                                                                                                         | Represents the machine-readable category a `ServerError` carries — `'STATUS'` for a forbidden lifecycle call, `'NEXT'` for a second `next` call, `'EVENT'` for an SSE field the wire cannot carry.           |
 | `RequestLine`             | interface | `{ method, url }`                                                                                                                                                                                                                                                                                                                                                                                       | Identifies the request a server-level fault came from — its method and its parsed URL.                                                                                                                       |
 | `ResponseRecord`          | interface | `{ method, pathname, status, ms }`                                                                                                                                                                                                                                                                                                                                                                      | Records one finished request — the payload `ServerEventMap.response` carries.                                                                                                                                |
 | `ServerEventMap`          | type      | `{ readonly start: readonly [port: number]; readonly request: readonly [method: string, pathname: string]; readonly upgrade: readonly [request: IncomingMessage, handled: boolean]; readonly error: readonly [error: unknown, request?: RequestLine]; readonly stop: readonly []; readonly drain: readonly [pending: number, upgraded: number]; readonly response: readonly [event: ResponseRecord]; }` | Represents the `Server`'s observable lifecycle events.                                                                                                                                                       |
@@ -208,7 +211,11 @@ instance-method surface.
 `negotiate` is the generic media-type primitive; `encoding` / `language` are
 its sibling axes over the same q-value parser; `format` is the dispatcher —
 it reads the request `Accept`, negotiates a `FormatHandlerMap`'s keys, and
-invokes the winner, or answers `406`.
+invokes the winner, or answers `406`. A media type matches case-insensitively,
+so a key `Application/JSON` answers `Accept: application/json`. Every `format`
+answer, the `406` included, carries `Vary: Accept` merged into any `Vary` the
+handler set; the handler's response is returned as a copy, so a response with
+immutable headers, such as `Response.redirect`, carries it too.
 
 The axes diverge on an absent, empty, or unparseable header. `encoding`
 resolves to `undefined` — no compression — rather than to the first offered
@@ -224,8 +231,14 @@ coding, because an absent `Accept-Encoding` makes identity the correct answer;
 
 #### `SSEStreamInterface`
 
-`write` always accepts an event while open and returns whether the local
-`ReadableStream` queue still has positive desired size afterward. A producer
+The stream opens with one comment line, so the response pump has a first chunk
+and the headers leave before the first event. `write` accepts every event
+`serializeEvent` admits while open and returns whether the local
+`ReadableStream` queue still has positive desired size afterward; for an
+`event` or `id` with a line break, an `id` with a NUL, or a `retry` that is not
+a non-negative safe integer, it throws a `ServerError` with code `'EVENT'` and
+enqueues nothing. `comment` writes one comment line per line of its text, so a
+comment never reaches a parser as a field or an event. A producer
 receiving `false` parks on `drain` before writing again. This is process-local
 queue state, not proof that the remote peer consumed bytes; the router's
 drain-honoring response pump makes socket pressure stop pulls so the local
@@ -414,12 +427,21 @@ These invariants hold across `src/server` ↔ `server.md`.
    `limit`), transparently decompresses a `gzip`/`deflate` body through a
    byte-counting `TransformStream` that aborts the instant decompressed output
    would exceed `decompression` (fail before materializing a decompression
-   bomb, since `DecompressionStream` has no `maxOutputLength`), and scrubs
-   `__proto__`/`constructor`/`prototype` keys from a parsed JSON body
-   (`scrubPrototype`) before it is ever handed to application code.
+   bomb, since `DecompressionStream` has no `maxOutputLength`), decodes an
+   `application/x-www-form-urlencoded` body to a record whose repeated field
+   keeps its last value, and scrubs `__proto__`/`constructor`/`prototype` keys
+   from a parsed JSON or urlencoded body (`scrubPrototype`) before it is ever
+   handed to application code. The scrub walks a worklist rather than the call
+   stack, so a JSON body nested as deep as `limit` admits decodes without a
+   stack overflow; any other content type decodes to text.
 9. **Cookie + token jewels preserved.** `parseCookies` rejects a
    whitespace-padded name so a `'  __Host-x'` never reconciles into a
-   protected `__Host-` name; `serializeCookie` throws on a `Domain`/`Path`
+   protected `__Host-` name, and returns a null-prototype record, so a cookie
+   named `constructor`, `toString`, or `__proto__` reads as an ordinary cookie
+   and `readSignedCookie` resolves `undefined` for such a name when it is
+   absent; `parseRange` admits only `1*DIGIT` bounds, so `bytes=0x10-`,
+   `bytes=1e1-`, and `bytes=+5-` serve the whole resource; `serializeCookie`
+   throws on a `Domain`/`Path`
    injection attempt rather than silently dropping it; a `sameSite: 'None'`
    cookie is always `Secure` regardless of the `secure` setting;
    `resolveSecure` derives `Secure` from the connection's TLS fact whenever
@@ -782,7 +804,11 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   request substitution, response transformation), cookie parse/serialize/
   attribute-injection guards, `resolveSecure`, `clearCookie` (expiry and
   accumulation), `computeCodingQuality`/`resolveCoding`/`negotiateEncoding`,
-  the `ETag` hex digest, and `discoverPort` (default, preferred, and
+  the `ETag` hex digest, the `parseRange` table of decimal and non-decimal
+  bounds, the cookie table of every `Object.prototype` name, the
+  `serializeEvent` refusal table and its read-back through `@orkestrel/sse`,
+  the scrub at the byte limit and on a self-referencing value, urlencoded
+  bodies, and `discoverPort` (default, preferred, and
   taken-preferred-falls-back cases).
 - [`tests/src/server/validators.test.ts`](../tests/src/server/validators.test.ts) —
   `isAddressInfo` narrowing over every shape `node:net`'s `server.address()`
@@ -790,13 +816,16 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
 - [`tests/src/server/Negotiator.test.ts`](../tests/src/server/Negotiator.test.ts) —
   `negotiate`/`encoding`/`language`/`format`: exact vs subtype-wildcard vs
   any-range precedence, `;q=0` rejection semantics, q-tie server-order
-  break, `format`'s 406 fallback and handler dispatch, the empty-header
+  break, `format`'s 406 fallback and handler dispatch, case-insensitive keys,
+  `Vary: Accept` on every `format` answer, the empty-header
   divergence between `encoding` and `negotiate`, and the proof that
   `encoding` and `negotiateEncoding` agree because they run one selection leaf.
 - [`tests/src/server/Stream.test.ts`](../tests/src/server/Stream.test.ts) —
-  the opened SSE response and its header merge order, the serialized wire for
-  events and comments, readiness/drain and ignore-the-signal behavior, and the
-  ways the handle closes (`end`, and a consumer cancelling).
+  the opened SSE response and its header merge order, the opening comment and
+  the headers it sends through the router pump before any event, the
+  serialized wire for events and comments, the refused fields, readiness/drain
+  and ignore-the-signal behavior, and the ways the handle closes (`end`, and a
+  consumer cancelling).
 - [`tests/src/server/errors.test.ts`](../tests/src/server/errors.test.ts) —
   `HTTPError`/`ContentTooLargeError` shape and `isHTTPError` narrowing, and
   `ServerError` shape with `isServerError` narrowing.

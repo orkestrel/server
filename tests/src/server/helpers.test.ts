@@ -3,7 +3,9 @@ import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
 import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
+import { isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
+import { createSSEParser } from '@orkestrel/sse'
 import {
 	clearCookie,
 	compose,
@@ -15,6 +17,7 @@ import {
 	ContentTooLargeError,
 	decodeCookieValue,
 	decompressRequestBody,
+	DEFAULT_BODY_LIMIT,
 	discoverPort,
 	HTTPError,
 	isCompressibleType,
@@ -39,8 +42,10 @@ import {
 	resolveSecure,
 	resolveSecurityHeader,
 	scrubPrototype,
+	serializeComment,
 	serializeCookie,
 	serializeEvent,
+	ServerError,
 	signToken,
 	unwrapETag,
 	verifyToken,
@@ -48,8 +53,14 @@ import {
 } from '@src/server'
 import { buildContext } from '../../setup.js'
 import {
+	SERVER_EVENT_MESSAGES,
+	SERVER_EVENT_REFUSALS,
+	SERVER_PROTOTYPE_NAMES,
+	SERVER_RANGE_ADMITTED,
+	SERVER_RANGE_REFUSED,
 	ServerObservation,
 	ServerUserState,
+	buildServerCycle,
 	compressServerFixture,
 	createTraceLayer,
 	repeatServerNext,
@@ -235,6 +246,25 @@ describe('parseCookies', () => {
 	it('a later duplicate name wins', () => {
 		expect(parseCookies('a=1; a=2')).toEqual({ a: '2' })
 	})
+
+	it('covers every own property name of Object.prototype in its prototype table', () => {
+		expect([...SERVER_PROTOTYPE_NAMES].sort()).toEqual(
+			Object.getOwnPropertyNames(Object.prototype).sort(),
+		)
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)('reads a cookie named %s as an ordinary own cookie', (name) => {
+		const cookies = parseCookies(`session=abc; ${name}=value`)
+		expect(Object.getPrototypeOf(cookies)).toBeNull()
+		expect(Object.entries(cookies)).toEqual([
+			['session', 'abc'],
+			[name, 'value'],
+		])
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)('reads an absent %s as no cookie', (name) => {
+		expect(parseCookies('session=abc')[name]).toBeUndefined()
+	})
 })
 
 describe('isCookieName', () => {
@@ -343,6 +373,22 @@ describe('writeSignedCookie / readSignedCookie', () => {
 	it('an absent cookie reads as undefined', async () => {
 		const request = new Request('http://localhost/')
 		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBeUndefined()
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)(
+		'resolves an absent cookie named %s to undefined without throwing',
+		async (name) => {
+			const request = new Request('http://localhost/', { headers: { cookie: 'session=abc' } })
+			await expect(readSignedCookie(request, name, 'shh')).resolves.toBeUndefined()
+		},
+	)
+
+	it.each(SERVER_PROTOTYPE_NAMES)('round-trips a signed cookie named %s', async (name) => {
+		const headers = new Headers()
+		await writeSignedCookie(headers, name, 'user-1', 'shh')
+		const nameValue = (headers.get('set-cookie') ?? '').split(';')[0] ?? ''
+		const request = new Request('http://localhost/', { headers: { cookie: nameValue } })
+		await expect(readSignedCookie(request, name, 'shh')).resolves.toBe('user-1')
 	})
 
 	it('emits the requested attributes onto the Set-Cookie header, not just the value round-trip', async () => {
@@ -670,6 +716,14 @@ describe('parseRange', () => {
 		expect(parseRange('bytes=abc-def', 1000)).toBeUndefined()
 		expect(parseRange('items=0-1', 1000)).toBeUndefined()
 	})
+
+	it.each(SERVER_RANGE_ADMITTED)('admits the decimal bounds of $header', ({ header, expected }) => {
+		expect(parseRange(header, 1000)).toEqual(expected)
+	})
+
+	it.each(SERVER_RANGE_REFUSED)('refuses the non-decimal bound in $header', ({ header }) => {
+		expect(parseRange(header, 1000)).toBeUndefined()
+	})
 })
 
 // ── Security primitives ─────────────────────────────────────────────────────────
@@ -789,6 +843,45 @@ describe('serializeEvent', () => {
 		expect(wire).toBe('data: a\ndata: b\n\n')
 		expect(wire).not.toContain('\r')
 	})
+
+	it.each(SERVER_EVENT_REFUSALS)(
+		'refuses refusal row %# on its $field field',
+		({ message, field }) => {
+			expect(() => serializeEvent(message)).toThrow(ServerError)
+			expect(() => serializeEvent(message)).toThrow(
+				expect.objectContaining({ code: 'EVENT', context: { field } }),
+			)
+		},
+	)
+
+	it.each(SERVER_EVENT_MESSAGES)(
+		'reads admitted message %# back unchanged through a conforming parser',
+		(message) => {
+			expect(createSSEParser().parse(serializeEvent(message))).toEqual([message])
+		},
+	)
+
+	it('reads CRLF and CR line breaks in data back as LF, the SSE data join', () => {
+		expect(createSSEParser().parse(serializeEvent({ data: 'a\r\nb\rc' }))).toEqual([
+			{ data: 'a\nb\nc' },
+		])
+	})
+})
+
+describe('serializeComment', () => {
+	it('writes one comment line for single-line text', () => {
+		expect(serializeComment('keep-alive')).toBe(': keep-alive\n\n')
+	})
+
+	it('writes one comment line per line, so a parser reads no field and no event', () => {
+		const wire = serializeComment('keep-alive\n\ndata: forged\r\nid: 1\revent: x')
+		expect(wire).toBe(': keep-alive\n: \n: data: forged\n: id: 1\n: event: x\n\n')
+		expect(createSSEParser().parse(wire)).toEqual([])
+	})
+
+	it('writes an empty comment line for empty text', () => {
+		expect(serializeComment('')).toBe(': \n\n')
+	})
 })
 
 // ── Prototype-pollution scrub ────────────────────────────────────────────────────
@@ -818,6 +911,13 @@ describe('isDangerousKey / scrubPrototype', () => {
 		expect(scrubPrototype(null)).toBeNull()
 		expect(scrubPrototype({ a: 1, b: [1, 2] })).toEqual({ a: 1, b: [1, 2] })
 	})
+
+	it('reads a node reached twice once, so a self-referencing value terminates', () => {
+		const reads = new ServerObservation(0)
+		const cycle = buildServerCycle(1_000, reads)
+		expect(scrubPrototype(cycle)).toBe(cycle)
+		expect(reads.value).toBe(1)
+	})
 })
 
 // ── Body pipeline (readBody) ───────────────────────────────────────────────────
@@ -844,6 +944,85 @@ describe('readBody', () => {
 			body: 'hello world',
 		})
 		await expect(readBody(request)).resolves.toBe('hello world')
+	})
+
+	it('decodes a JSON array nested as deep as the default byte limit without overflowing the stack', async () => {
+		const depth = DEFAULT_BODY_LIMIT / 2
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'['.repeat(depth)}${']'.repeat(depth)}`,
+		})
+		const value = await readBody(request)
+		const innermost = Array.from({ length: depth - 1 }).reduce<unknown>(
+			(node) => (isArray(node) ? node[0] : undefined),
+			value,
+		)
+		expect(innermost).toEqual([])
+	})
+
+	it('scrubs a dangerous key at the deepest level of a JSON body as deep as the byte limit', async () => {
+		const leaf = '{"__proto__":{"polluted":true},"leaf":true}'
+		const depth = Math.floor((DEFAULT_BODY_LIMIT - leaf.length) / 6)
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'{"a":'.repeat(depth)}${leaf}${'}'.repeat(depth)}`,
+		})
+		const value = await readBody(request)
+		const innermost = Array.from({ length: depth }).reduce<unknown>(
+			(node) => (isRecord(node) ? node['a'] : undefined),
+			value,
+		)
+		expect(isRecord(innermost) ? Object.keys(innermost) : undefined).toEqual(['leaf'])
+	})
+
+	it('refuses a nested JSON body one level past the byte limit with a 413', async () => {
+		const depth = DEFAULT_BODY_LIMIT / 2 + 1
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'['.repeat(depth)}${']'.repeat(depth)}`,
+		})
+		await expect(readBody(request)).rejects.toThrow(ContentTooLargeError)
+	})
+
+	it('decodes an application/x-www-form-urlencoded body to a scrubbed record', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'name=Ada+Lovelace&note=fish%20%26%20chips&__proto__=x&constructor=y&prototype=z',
+		})
+		const value = await readBody(request)
+		expect(value).toEqual({ name: 'Ada Lovelace', note: 'fish & chips' })
+		expect(isRecord(value) ? Object.keys(value) : undefined).toEqual(['name', 'note'])
+	})
+
+	it('reads the urlencoded media type case-insensitively and past its parameters', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'Application/X-WWW-Form-URLEncoded; charset=UTF-8' },
+			body: 'city=Z%C3%BCrich',
+		})
+		await expect(readBody(request)).resolves.toEqual({ city: 'Zürich' })
+	})
+
+	it('keeps the last value of a repeated urlencoded field', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'role=viewer&role=editor',
+		})
+		await expect(readBody(request)).resolves.toEqual({ role: 'editor' })
+	})
+
+	it('decodes a multipart/form-data body as text', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'multipart/form-data; boundary=fence' },
+			body: 'name=Ada',
+		})
+		await expect(readBody(request)).resolves.toBe('name=Ada')
 	})
 
 	it('resolves malformed application/json to undefined instead of throwing', async () => {

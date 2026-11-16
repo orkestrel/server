@@ -10,7 +10,9 @@ import type {
 	MiddlewareContext,
 	MiddlewareHandler,
 	NextFunction,
+	RangeSpec,
 	ServerInterface,
+	SSEMessage,
 } from '@src/server'
 import type { IncomingMessage } from 'node:http'
 import { createDispatcher } from '@orkestrel/router'
@@ -133,6 +135,124 @@ export async function compressServerFixture(text: string): Promise<Uint8Array<Ar
 	return new Uint8Array(
 		await new Response(source.pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
 	)
+}
+
+/** Lists the own property names of `Object.prototype` that a cookie name can spell. */
+export const SERVER_PROTOTYPE_NAMES: readonly string[] = Object.freeze([
+	'__defineGetter__',
+	'__defineSetter__',
+	'__lookupGetter__',
+	'__lookupSetter__',
+	'__proto__',
+	'constructor',
+	'hasOwnProperty',
+	'isPrototypeOf',
+	'propertyIsEnumerable',
+	'toLocaleString',
+	'toString',
+	'valueOf',
+])
+
+/** Describes one `parseRange` row: a header against a 1000-byte resource and its answer. */
+export interface ServerRangeCase {
+	readonly header: string
+	readonly expected: RangeSpec | undefined
+}
+
+/** Lists `Range` headers whose bounds are `1*DIGIT`, the language `parseRange` admits. */
+export const SERVER_RANGE_ADMITTED: readonly ServerRangeCase[] = Object.freeze([
+	{ header: 'bytes=0-99', expected: { satisfiable: true, start: 0, end: 99 } },
+	{ header: 'bytes=0-0', expected: { satisfiable: true, start: 0, end: 0 } },
+	{ header: 'bytes=500-', expected: { satisfiable: true, start: 500, end: 999 } },
+	{ header: 'bytes=-100', expected: { satisfiable: true, start: 900, end: 999 } },
+	{ header: 'bytes=-5000', expected: { satisfiable: true, start: 0, end: 999 } },
+	{ header: 'bytes=007-009', expected: { satisfiable: true, start: 7, end: 9 } },
+	{ header: 'bytes=10-99999999999999999999', expected: { satisfiable: true, start: 10, end: 999 } },
+	{ header: 'bytes=99999999999999999999-', expected: { satisfiable: false } },
+	{ header: 'bytes=1000-', expected: { satisfiable: false } },
+	{ header: ' bytes= 5 - 9 ', expected: { satisfiable: true, start: 5, end: 9 } },
+])
+
+/** Lists `Range` headers whose bounds are numerals outside `1*DIGIT`, which `parseRange` refuses. */
+export const SERVER_RANGE_REFUSED: readonly ServerRangeCase[] = Object.freeze([
+	{ header: 'bytes=0x10-', expected: undefined },
+	{ header: 'bytes=0X10-', expected: undefined },
+	{ header: 'bytes=0b11-9', expected: undefined },
+	{ header: 'bytes=0o7-9', expected: undefined },
+	{ header: 'bytes=1e1-', expected: undefined },
+	{ header: 'bytes=1E1-20', expected: undefined },
+	{ header: 'bytes=+5-', expected: undefined },
+	{ header: 'bytes=+5-9', expected: undefined },
+	{ header: 'bytes=1.0-9', expected: undefined },
+	{ header: 'bytes=5.-9', expected: undefined },
+	{ header: 'bytes=.5-9', expected: undefined },
+	{ header: 'bytes=5-1e1', expected: undefined },
+	{ header: 'bytes=5-0x10', expected: undefined },
+	{ header: 'bytes=5-+9', expected: undefined },
+	{ header: 'bytes=5-9.0', expected: undefined },
+	{ header: 'bytes=-0x10', expected: undefined },
+	{ header: 'bytes=-1e1', expected: undefined },
+	{ header: 'bytes=-+5', expected: undefined },
+	{ header: 'bytes=-5.0', expected: undefined },
+	{ header: 'bytes=Infinity-', expected: undefined },
+	{ header: 'bytes=5-Infinity', expected: undefined },
+	{ header: 'bytes=1_0-', expected: undefined },
+	{ header: 'bytes=١-', expected: undefined },
+	{ header: 'bytes=５-', expected: undefined },
+])
+
+/** Describes one SSE message `serializeEvent` refuses and the field that carries the refusal. */
+export interface ServerEventRefusal {
+	readonly message: SSEMessage
+	readonly field: string
+}
+
+/** Lists SSE messages whose `event`, `id`, or `retry` the event-stream wire cannot carry. */
+export const SERVER_EVENT_REFUSALS: readonly ServerEventRefusal[] = Object.freeze([
+	{ message: { event: 'tick\ndata: injected', data: 'x' }, field: 'event' },
+	{ message: { event: 'tick\r', data: 'x' }, field: 'event' },
+	{ message: { event: 'tick\r\nid: 9', data: 'x' }, field: 'event' },
+	{ message: { id: '7\n\ndata: forged', data: 'x' }, field: 'id' },
+	{ message: { id: '7\r', data: 'x' }, field: 'id' },
+	{ message: { id: 'a\u0000b', data: 'x' }, field: 'id' },
+	{ message: { retry: Number.NaN, data: 'x' }, field: 'retry' },
+	{ message: { retry: Number.POSITIVE_INFINITY, data: 'x' }, field: 'retry' },
+	{ message: { retry: Number.NEGATIVE_INFINITY, data: 'x' }, field: 'retry' },
+	{ message: { retry: -1, data: 'x' }, field: 'retry' },
+	{ message: { retry: 1.5, data: 'x' }, field: 'retry' },
+	{ message: { retry: 2 ** 53, data: 'x' }, field: 'retry' },
+])
+
+/** Lists SSE messages `serializeEvent` admits, each of which a conforming parser reads back unchanged. */
+export const SERVER_EVENT_MESSAGES: readonly SSEMessage[] = Object.freeze([
+	{ data: 'hello' },
+	{ event: 'token', id: '1', retry: 500, data: 'hello' },
+	{ data: 'multi\nline' },
+	{ data: '' },
+	{ data: 'data: injected\n\nevent: forged' },
+	{ event: ' padded', id: ' 7', data: ' leading' },
+	{ event: '', id: '', data: 'empty fields' },
+	{ event: 'tick:tock', id: 'a:b', data: 'colon' },
+	{ retry: 0, data: 'zero' },
+	{ retry: Number.MAX_SAFE_INTEGER, data: 'largest' },
+	{ event: 'grüße', id: '番号', data: 'é\u0000🎉' },
+])
+
+/**
+ * Builds a node whose `self` getter returns the node itself until `bound` reads, then a
+ * primitive, and counts every read — a cycle that terminates on its own count.
+ *
+ * @param bound - The number of reads after which the getter stops returning the node
+ * @param reads - The observation the getter increments on every read
+ * @returns The self-referencing node
+ */
+export function buildServerCycle(bound: number, reads: ServerObservation<number>): object {
+	return {
+		get self(): unknown {
+			reads.value += 1
+			return reads.value < bound ? this : 0
+		},
+	}
 }
 
 export interface ServerAppState {

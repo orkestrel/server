@@ -87,6 +87,23 @@ export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
 export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-]{1,200}$/)
 
 /**
+ * Defines the `1*DIGIT` form `parseRange` requires of a `Range` bound, `^[0-9]+$`.
+ *
+ * @remarks
+ * Mirrors the `first-pos`, `last-pos`, and `suffix-length` rules of RFC 9110
+ * § 14.1.1. A numeral `Number` reads but the grammar refuses — a hexadecimal,
+ * octal, or binary prefix, an exponent, a sign, a decimal point, or a digit
+ * outside ASCII — fails the match.
+ */
+export const RANGE_BOUND_PATTERN: Readonly<RegExp> = Object.freeze(/^[0-9]+$/)
+
+/**
+ * Defines the line terminators of the SSE wire, `\r\n`, `\r`, and `\n`, which
+ * `serializeEvent` and `serializeComment` split text on.
+ */
+export const SSE_LINE_PATTERN: Readonly<RegExp> = Object.freeze(/\r\n|\r|\n/)
+
+/**
  * Holds the bare `Content-Type` values `isCompressibleType` treats as compressible,
  * beyond the `text/*` prefix and structured-suffix (`+json`, `+xml`) rules that
  * helper also applies.
