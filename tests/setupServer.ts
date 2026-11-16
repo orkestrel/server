@@ -1043,6 +1043,21 @@ export const SEAM_IMMUTABLE_RESPONSES: readonly SeamResponseCase[] = Object.free
 	},
 ])
 
+/** Represents one exchange whose `Request` constructions the construction cells count. */
+export interface SeamConstructionCase {
+	readonly label: string
+	readonly method: string
+	readonly path: string
+	readonly status: number
+}
+
+/** Lists the exchanges that each construct one `Request`: a `GET`, a `POST`, and a handler throw. */
+export const SEAM_CONSTRUCTION_CASES: readonly SeamConstructionCase[] = Object.freeze([
+	{ label: 'a GET', method: 'GET', path: '/plain', status: 200 },
+	{ label: 'a POST', method: 'POST', path: '/a', status: 200 },
+	{ label: 'a handler throw', method: 'GET', path: '/throw', status: 500 },
+])
+
 /** Reports one reply a {@link sendSeamRequest} call read. */
 export interface SeamReply {
 	readonly status: number
@@ -1093,6 +1108,7 @@ export function describeSeamReason(reason: unknown): string {
  * @remarks
  * - `GET /plain` answers `plain`.
  * - `GET /state` answers `aborted` or `open` for its signal as the handler starts.
+ * - `GET /throw` throws an `Error`, which the server's boundary answers with 500.
  * - `GET /hold` parks until its request signal aborts, then answers the reason's text.
  * - `GET /gate` parks until `gate` settles, then answers `aborted` or `open` for its signal.
  * - `POST /a` and `POST /b` answer their path and their body text.
@@ -1120,6 +1136,14 @@ export function createSeamDispatcher<TState>(
 		handler: (request) => {
 			requests.push(request)
 			return new Response(request.signal.aborted ? 'aborted' : 'open')
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/throw',
+		handler: (request) => {
+			requests.push(request)
+			throw new Error('the /throw route failed')
 		},
 	})
 	dispatcher.add({
@@ -1240,6 +1264,46 @@ export function createArgumentLayer<TState>(
 			refusal.value = error
 			throw error
 		}
+	}
+}
+
+/**
+ * Creates a layer that calls its `next` with the request, records that refusal, and then calls
+ * `next` again with no argument: the refused-then-valid order, whose second call the seam refuses.
+ *
+ * @param refusal - The observation the first call's rejection is recorded in
+ * @returns The layer
+ */
+export function createRetryLayer<TState>(
+	refusal: ServerObservation<unknown>,
+): MiddlewareHandler<TState> {
+	return async (request, _context, next) => {
+		const forward: (argument: unknown) => Promise<Response> = next
+		refusal.value = await forward(request).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
+		return next()
+	}
+}
+
+/**
+ * Replaces `globalThis.Request` with a proxy that records every construction, and returns the
+ * function that puts the original back.
+ *
+ * @param constructions - The recorder each `new Request(…)` through the global calls
+ * @returns The restore function
+ */
+export function countRequestConstructions(constructions: RecorderInterface<[]>): () => void {
+	const original = globalThis.Request
+	globalThis.Request = new Proxy(original, {
+		construct: (target, args, newTarget) => {
+			constructions.handler()
+			return Reflect.construct(target, args, newTarget)
+		},
+	})
+	return () => {
+		globalThis.Request = original
 	}
 }
 

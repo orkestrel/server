@@ -80,9 +80,12 @@ export function compose<TState>(
 	middleware: ReadonlyArray<MiddlewareHandler<TState>>,
 	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
-	return middleware.reduceRight<
-		(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
-	>((next, layer) => wrapMiddleware(layer, next), terminal)
+	return (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
+		const known = new Map<Response, Response>()
+		return middleware.reduceRight<
+			(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
+		>((next, layer) => wrapMiddleware(layer, next, known), terminal)(request, context)
+	}
 }
 
 /**
@@ -90,13 +93,15 @@ export function compose<TState>(
  * `next` invariant.
  *
  * @remarks
- * The returned handler enforces the one-call, no-argument `next` invariant, hands
- * `next` the same request and context, and keeps the middleware's synchronous or
- * asynchronous result.
+ * The returned handler enforces the one-call, no-argument `next` invariant: every
+ * call, refused or not, spends the layer's one call, so a call after a refused
+ * `next(request)` rejects too. It hands `next` the same request and context, and
+ * keeps the middleware's synchronous or asynchronous result.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  * @param layer - The middleware layer to invoke
  * @param next - The downstream handler wrapped by `layer`
+ * @param known - The {@link normalizeResponse} memo of one composed run, shared by its layers
  * @returns A handler with `layer` composed around `next`
  *
  * @example
@@ -104,27 +109,31 @@ export function compose<TState>(
  * const handle = wrapMiddleware(
  * 	async (_request, _context, next) => next(),
  * 	async () => new Response('ok'),
+ * 	new Map(),
  * )
  * ```
  */
 export function wrapMiddleware<TState>(
 	layer: MiddlewareHandler<TState>,
 	next: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
+	known: Map<Response, Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return async (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
 		const calls = [next].values()
 		return Promise.resolve(
 			layer(request, context, (...args: readonly unknown[]): Promise<Response> => {
-				if (args.length > 0)
-					return Promise.reject(
-						new ServerError('NEXT', 'next() takes no argument; every layer reads one request'),
-					)
 				const invocation = calls.next()
 				if (invocation.done)
 					return Promise.reject(
 						new ServerError('NEXT', 'next() was already called by this middleware'),
 					)
-				return invocation.value(request, context).then(normalizeResponse)
+				if (args.length > 0)
+					return Promise.reject(
+						new ServerError('NEXT', 'next() takes no argument; every layer reads one request'),
+					)
+				return invocation
+					.value(request, context)
+					.then((response) => normalizeResponse(response, known))
 			}),
 		)
 	}
@@ -139,9 +148,11 @@ export function wrapMiddleware<TState>(
  * throws on them. The copy keeps the body, the status, the status text, and every header; it
  * drops the fields a constructed `Response` cannot carry, such as `url` and `redirected`. A
  * response whose status lies outside 200 through 599, such as `Response.error()`, passes through
- * unchanged.
+ * unchanged. `known` maps each response already checked to its answer, and the copy to itself, so
+ * a response that crosses several layers of one composed run is checked once.
  *
  * @param response - The response a downstream handler resolved
+ * @param known - The memo of one composed run; Default: a fresh `Map`
  * @returns `response` itself, or its mutable copy
  *
  * @example
@@ -150,14 +161,23 @@ export function wrapMiddleware<TState>(
  * response.headers.set('X-Request-ID', 'abc') // no throw
  * ```
  */
-export function normalizeResponse(response: Response): Response {
-	if (response.status < 200 || response.status > 599 || isMutableHeaders(response.headers))
-		return response
-	return new Response(response.body, {
-		status: response.status,
-		statusText: response.statusText,
-		headers: new Headers(response.headers),
-	})
+export function normalizeResponse(
+	response: Response,
+	known: Map<Response, Response> = new Map(),
+): Response {
+	const remembered = known.get(response)
+	if (remembered !== undefined) return remembered
+	const normal =
+		response.status < 200 || response.status > 599 || supportsMutation(response.headers)
+			? response
+			: new Response(response.body, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: new Headers(response.headers),
+				})
+	known.set(response, normal)
+	if (normal !== response) known.set(normal, normal)
+	return normal
 }
 
 /**
@@ -173,11 +193,11 @@ export function normalizeResponse(response: Response): Response {
  *
  * @example
  * ```ts
- * isMutableHeaders(new Headers()) // true
- * isMutableHeaders(Response.redirect('http://localhost/', 302).headers) // false
+ * supportsMutation(new Headers()) // true
+ * supportsMutation(Response.redirect('http://localhost/', 302).headers) // false
  * ```
  */
-export function isMutableHeaders(headers: Headers): boolean {
+export function supportsMutation(headers: Headers): boolean {
 	const name = 'x-orkestrel-probe'
 	const value = headers.get(name)
 	return holds(() => {

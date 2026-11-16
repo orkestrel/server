@@ -6,6 +6,7 @@ import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { attempt, isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
+import { createRecorder } from '@orkestrel/test'
 import {
 	clearCookie,
 	compose,
@@ -25,7 +26,7 @@ import {
 	isCookieAttribute,
 	isCookieName,
 	isDangerousKey,
-	isMutableHeaders,
+	supportsMutation,
 	isServerError,
 	isValidRequestId,
 	matchesETag,
@@ -74,6 +75,7 @@ import {
 	refuseServerRequest,
 	createObservedRefusal,
 	createArgumentLayer,
+	createRetryLayer,
 	createResponseHeader,
 	createResponseLayer,
 	createSeenLayer,
@@ -154,6 +156,25 @@ describe('compose', () => {
 		expect(caught.code).toBe('NEXT')
 		expect(caught.message).toBe('next() takes no argument; every layer reads one request')
 		expect(terminalRan.value).toBe(false)
+	})
+
+	it('counts a refused next(request) as the layer’s one call, so a later next() rejects and the terminal never runs', async () => {
+		const terminalRuns = createRecorder<[]>()
+		const refusal = new ServerObservation<unknown>(undefined)
+		const handle = compose([createRetryLayer<Record<string, never>>(refusal)], async () => {
+			terminalRuns.handler()
+			return new Response('ok')
+		})
+		const caught = await handle(new Request('http://localhost/'), buildContext({})).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
+		expect(isServerError(refusal.value) ? refusal.value.code : undefined).toBe('NEXT')
+		if (!isServerError(caught))
+			throw new Error(`expected a ServerError, received ${String(caught)}`)
+		expect(caught.code).toBe('NEXT')
+		expect(caught.message).toBe('next() was already called by this middleware')
+		expect(terminalRuns.calls).toHaveLength(0)
 	})
 
 	it('hands every layer and the terminal the same request and context objects', async () => {
@@ -239,12 +260,12 @@ describe('compose', () => {
 	})
 })
 
-describe('normalizeResponse / isMutableHeaders', () => {
+describe('normalizeResponse / supportsMutation', () => {
 	it('reads mutable headers as mutable and immutable ones as immutable', () => {
-		expect(isMutableHeaders(new Headers())).toBe(true)
-		expect(isMutableHeaders(Response.json({ ok: true }).headers)).toBe(true)
-		expect(isMutableHeaders(Response.redirect('http://localhost/next', 302).headers)).toBe(false)
-		expect(isMutableHeaders(Response.error().headers)).toBe(false)
+		expect(supportsMutation(new Headers())).toBe(true)
+		expect(supportsMutation(Response.json({ ok: true }).headers)).toBe(true)
+		expect(supportsMutation(Response.redirect('http://localhost/next', 302).headers)).toBe(false)
+		expect(supportsMutation(Response.error().headers)).toBe(false)
 	})
 
 	it('leaves every entry of the headers it checks as it was, the probe name included', () => {
@@ -255,10 +276,10 @@ describe('normalizeResponse / isMutableHeaders', () => {
 			['vary', 'Accept'],
 		])
 		const before = [...headers.entries()]
-		expect(isMutableHeaders(headers)).toBe(true)
+		expect(supportsMutation(headers)).toBe(true)
 		expect([...headers.entries()]).toEqual(before)
 		const empty = new Headers()
-		expect(isMutableHeaders(empty)).toBe(true)
+		expect(supportsMutation(empty)).toBe(true)
 		expect([...empty.entries()]).toEqual([])
 	})
 
@@ -282,6 +303,22 @@ describe('normalizeResponse / isMutableHeaders', () => {
 	it('passes a response whose status lies outside 200 through 599 through unchanged', () => {
 		const error = Response.error()
 		expect(normalizeResponse(error)).toBe(error)
+	})
+
+	it('remembers each answer in the run memo, so a copy and a checked response come back as they were', () => {
+		const known = new Map<Response, Response>()
+		const mutable = new Response('ok')
+		const redirect = Response.redirect('http://localhost/next', 302)
+		const copy = normalizeResponse(redirect, known)
+		expect(normalizeResponse(mutable, known)).toBe(mutable)
+		expect([...known.entries()]).toEqual([
+			[redirect, copy],
+			[copy, copy],
+			[mutable, mutable],
+		])
+		expect(normalizeResponse(redirect, known)).toBe(copy)
+		expect(normalizeResponse(copy, known)).toBe(copy)
+		expect(known.size).toBe(3)
 	})
 })
 

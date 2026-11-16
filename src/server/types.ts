@@ -70,8 +70,9 @@ export interface MiddlewareContext<TState> {
  * and context and receive its `Response`; omit the call entirely to
  * short-circuit with a `Response` built by this middleware instead. A second
  * call, or a call that passes an argument, rejects with a `ServerError` of
- * code `'NEXT'`: each middleware runs the chain at most once, and every layer
- * sees the one `Request` the server built. A response whose headers are
+ * code `'NEXT'`, and a refused call still spends the one call: each middleware
+ * runs the chain at most once, and every layer sees the one `Request` the server
+ * built. A response whose headers are
  * immutable, such as a `Response.redirect` result, resolves as a copy whose
  * headers the layer can set.
  *

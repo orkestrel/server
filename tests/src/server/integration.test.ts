@@ -8,6 +8,7 @@ import { createRecorder, waitForCondition } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
 	SEAM_BODY,
+	SEAM_CONSTRUCTION_CASES,
 	SEAM_IMMUTABLE_RESPONSES,
 	SEAM_NEXT_ARGUMENTS,
 	SEAM_STATE_FACTORIES,
@@ -17,7 +18,9 @@ import {
 	createArgumentLayer,
 	createBodyLayer,
 	countLiveObjects,
+	countRequestConstructions,
 	createDeadlineLayer,
+	createRetryLayer,
 	createPingDispatcher,
 	createResponseLayer,
 	createSeamDispatcher,
@@ -131,6 +134,26 @@ describe('the exchange seam — next takes no argument', () => {
 		},
 	)
 
+	it('refuses a next() call after a refused next(request), so the terminal never runs and the client reads the 500', async () => {
+		const requests: Request[] = []
+		const refusal = new ServerObservation<unknown>(undefined)
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createSeamDispatcher<object>(requests, Promise.resolve()),
+				state: () => ({}),
+				host: '127.0.0.1',
+				middleware: [createRetryLayer(refusal)],
+			}),
+		)
+		const port = await server.start()
+		const response = await fetch(`http://127.0.0.1:${port}/plain`)
+		expect(response.status).toBe(500)
+		await expect(response.text()).resolves.toBe('Internal Server Error')
+		expect(isServerError(refusal.value) ? refusal.value.code : undefined).toBe('NEXT')
+		expect(requests).toHaveLength(0)
+	})
+
 	it('continues to the terminal on a next() call with no argument', async () => {
 		const seen: Array<readonly [Request, MiddlewareContext<object>]> = []
 		const server = trackServer(
@@ -150,6 +173,37 @@ describe('the exchange seam — next takes no argument', () => {
 		expect(response.status).toBe(200)
 		await expect(response.text()).resolves.toBe('/a:original body')
 	})
+})
+
+describe('the exchange seam — one Request construction per exchange', () => {
+	it.each(SEAM_CONSTRUCTION_CASES)(
+		'constructs one Request for $label',
+		async ({ method, path, status }) => {
+			const constructions = createRecorder<[]>()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createSeamDispatcher<object>([], Promise.resolve()),
+					state: () => ({}),
+					host: '127.0.0.1',
+					middleware: [createSeenLayer([]), createSeenLayer([])],
+				}),
+			)
+			const port = await server.start()
+			const restore = countRequestConstructions(constructions)
+			try {
+				const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+					method,
+					...(method === 'POST' ? { body: 'counted body' } : {}),
+				})
+				expect(response.status).toBe(status)
+				await response.text()
+			} finally {
+				restore()
+			}
+			expect(constructions.calls).toHaveLength(1)
+		},
+	)
 })
 
 describe('the exchange seam — connection', () => {
@@ -389,7 +443,8 @@ describe('the exchange seam — retention', () => {
 			const before = await countLiveObjects()
 			expect(await driveSeamRequests(port, '/ping', 3_000, agent)).toBe(0)
 			const after = await countLiveObjects()
-			// Anything a request leaves reachable keeps at least one object per request; the bar is half.
+			// Counts live JS objects only: a retained primitive string, number, or primitive Map or Set
+			// entry escapes it, and neither `queryObjects(String)` nor `heapUsed` closes that gap here.
 			expect(after - before).toBeLessThan(1_500)
 		} finally {
 			agent.destroy()
