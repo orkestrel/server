@@ -3,7 +3,7 @@ import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
 import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
-import { isArray, isRecord } from '@orkestrel/contract'
+import { attempt, isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
 import {
@@ -14,6 +14,7 @@ import {
 	computeCodingQuality,
 	computeIPv6Network,
 	computeLanguageQuality,
+	compareDigits,
 	ContentTooLargeError,
 	decodeCookieValue,
 	decompressRequestBody,
@@ -61,6 +62,9 @@ import {
 	ServerObservation,
 	ServerUserState,
 	buildServerCycle,
+	buildServerRangePopulation,
+	buildServerRangeWalk,
+	recognizeServerRange,
 	compressServerFixture,
 	createTraceLayer,
 	repeatServerNext,
@@ -717,12 +721,68 @@ describe('parseRange', () => {
 		expect(parseRange('items=0-1', 1000)).toBeUndefined()
 	})
 
-	it.each(SERVER_RANGE_ADMITTED)('admits the decimal bounds of $header', ({ header, expected }) => {
+	it.each(SERVER_RANGE_ADMITTED)('admits the grammar member $header', ({ header, expected }) => {
 		expect(parseRange(header, 1000)).toEqual(expected)
 	})
 
-	it.each(SERVER_RANGE_REFUSED)('refuses the non-decimal bound in $header', ({ header }) => {
+	it.each(SERVER_RANGE_REFUSED)('ignores the non-member $header', ({ header }) => {
 		expect(parseRange(header, 1000)).toBeUndefined()
+	})
+
+	it('answers a size that is not a non-negative safe integer with undefined', () => {
+		expect(parseRange('bytes=0-1', 1.5)).toBeUndefined()
+		expect(parseRange('bytes=0-1', -1)).toBeUndefined()
+		expect(parseRange('bytes=0-1', Number.NaN)).toBeUndefined()
+	})
+
+	it('has a reference recognizer that gives every declared table row its declared answer', () => {
+		const rows = [...SERVER_RANGE_ADMITTED, ...SERVER_RANGE_REFUSED]
+		expect(rows.map(({ header }) => recognizeServerRange(header, 1000))).toEqual(
+			rows.map(({ expected }) => expected),
+		)
+	})
+
+	it('agrees with the reference recognizer on every pair of the exhaustive walk', () => {
+		const walk = buildServerRangeWalk()
+		expect(walk.length).toBe(52_484)
+		const answers = walk.map(({ header, size }) => recognizeServerRange(header, size))
+		expect(
+			new Set(answers.map((answer) => (answer === undefined ? 'ignored' : answer.satisfiable))),
+		).toEqual(new Set(['ignored', true, false]))
+		const disagreements = walk.filter(
+			({ header, size }, index) =>
+				JSON.stringify(parseRange(header, size)) !== JSON.stringify(answers[index]),
+		)
+		expect(disagreements).toEqual([])
+	})
+
+	it('agrees with the reference recognizer on a seeded population of members and near misses', () => {
+		const population = buildServerRangePopulation(0x5eed4, 20_000)
+		const answers = population.map(({ header, size }) => recognizeServerRange(header, size))
+		expect(
+			new Set(answers.map((answer) => (answer === undefined ? 'ignored' : answer.satisfiable))),
+		).toEqual(new Set(['ignored', true, false]))
+		const disagreements = population.filter(
+			({ header, size }, index) =>
+				JSON.stringify(parseRange(header, size)) !== JSON.stringify(answers[index]),
+		)
+		expect(disagreements).toEqual([])
+	})
+})
+
+describe('compareDigits', () => {
+	it('orders decimal digit strings by value, leading zeros included', () => {
+		expect(compareDigits('9', '10')).toBe(-1)
+		expect(compareDigits('10', '9')).toBe(1)
+		expect(compareDigits('007', '7')).toBe(0)
+		expect(compareDigits('0', '000')).toBe(0)
+		expect(compareDigits('123', '124')).toBe(-1)
+	})
+
+	it('orders digit strings past the safe-integer range exactly', () => {
+		expect(compareDigits('9'.repeat(400), '9'.repeat(399))).toBe(1)
+		expect(compareDigits('9007199254740993', '9007199254740992')).toBe(1)
+		expect(compareDigits(`${'0'.repeat(400)}5`, '5')).toBe(0)
 	})
 })
 
@@ -850,6 +910,16 @@ describe('serializeEvent', () => {
 			expect(() => serializeEvent(message)).toThrow(ServerError)
 			expect(() => serializeEvent(message)).toThrow(
 				expect.objectContaining({ code: 'EVENT', context: { field } }),
+			)
+		},
+	)
+
+	it.each(SERVER_EVENT_REFUSALS)(
+		'narrows the refusal of row %# with isServerError to code EVENT',
+		({ message }) => {
+			const outcome = attempt(() => serializeEvent(message))
+			expect(outcome.success ? undefined : isServerError(outcome.error) && outcome.error.code).toBe(
+				'EVENT',
 			)
 		},
 	)

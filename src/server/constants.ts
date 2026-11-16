@@ -92,8 +92,8 @@ export const REQUEST_ID_PATTERN: Readonly<RegExp> = Object.freeze(/^[A-Za-z0-9_-
  * @remarks
  * Mirrors the `first-pos`, `last-pos`, and `suffix-length` rules of RFC 9110
  * § 14.1.1. A numeral `Number` reads but the grammar refuses — a hexadecimal,
- * octal, or binary prefix, an exponent, a sign, a decimal point, or a digit
- * outside ASCII — fails the match.
+ * octal, or binary prefix, an exponent, a sign, or a decimal point — fails the
+ * match, as does a digit outside ASCII, which `Number` reads as `NaN`.
  */
 export const RANGE_BOUND_PATTERN: Readonly<RegExp> = Object.freeze(/^[0-9]+$/)
 

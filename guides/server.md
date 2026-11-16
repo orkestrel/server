@@ -120,6 +120,7 @@ cleanup finish before the start event is emitted.
 | `unwrapETag`             | function | `(tag: string) => string`                                                                                                                                                                                                              | Strips the weak indicator (`W/`) from an entity-tag, returning its opaque comparison body — the reduction `matchesETag` applies to each side before the RFC 7232 §2.3.2 weak comparison.                                                                                      |
 | `matchesETag`            | function | `(header: string, etag: string) => boolean`                                                                                                                                                                                            | Checks whether a request's `If-None-Match` header matches a resource's current `ETag` — the RFC 7232 §2.3.2 weak comparison.                                                                                                                                                  |
 | `parseRange`             | function | `(header: string \| undefined, size: number) => RangeSpec \| undefined`                                                                                                                                                                | Parses an HTTP `Range` request header against a known resource `size` — total, returning a `RangeSpec` or `undefined`.                                                                                                                                                        |
+| `compareDigits`          | function | `(left: string, right: string) => number`                                                                                                                                                                                              | Compares two `1*DIGIT` strings by their decimal value, at any length.                                                                                                                                                                                                         |
 | `resolveOrigin`          | function | `(origin: string \| readonly string[], requestOrigin: string \| undefined) => string \| undefined`                                                                                                                                     | Resolves the `Access-Control-Allow-Origin` value for a request.                                                                                                                                                                                                               |
 | `mergeVary`              | function | `(existing: string \| undefined, value: string) => string`                                                                                                                                                                             | Merges a `Vary` value into an existing `Vary` header without duplication.                                                                                                                                                                                                     |
 | `resolveSecurityHeader`  | function | `(value: string \| false \| undefined, fallback: string) => string \| undefined`                                                                                                                                                       | Resolves one opt-out, value-bearing security header.                                                                                                                                                                                                                          |
@@ -246,8 +247,9 @@ queue can faithfully signal that transport pressure. Ignoring the boolean
 preserves the prior unconditional-enqueue behavior. The default queue strategy
 counts chunks rather than their byte lengths, so a producer needing a byte
 bound must also cap each individual event. The route must return `response`
-before its producer awaits a `false` write, because no consumer can pull the
-body before receiving that response.
+before its producer awaits a `false` write or `drain()`, because no consumer
+can pull the body before receiving that response; the opening comment fills
+the queue, so a `drain()` before any write also waits on that pull.
 
 | Method    | Returns         | Summary                                                                                                                                                                                                        |
 | --------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -439,8 +441,15 @@ These invariants hold across `src/server` ↔ `server.md`.
    protected `__Host-` name, and returns a null-prototype record, so a cookie
    named `constructor`, `toString`, or `__proto__` reads as an ordinary cookie
    and `readSignedCookie` resolves `undefined` for such a name when it is
-   absent; `parseRange` admits only `1*DIGIT` bounds, so `bytes=0x10-`,
-   `bytes=1e1-`, and `bytes=+5-` serve the whole resource; `serializeCookie`
+   absent; `parseRange` reads the RFC 9110 § 14.1 grammar
+   `range-unit "=" OWS range-set`: the unit matches `bytes`
+   case-insensitively, `range-set` follows the § 5.6.1 list rule (empty
+   elements skipped), OWS is a space or a tab and stands only around the field
+   value, after `=`, and around a `,`, and each bound is `1*DIGIT` of any
+   length, compared without `Number`. A non-member, such as `bytes=0x10-`,
+   `bytes=5 -9`, `bytes=20-garbage`, or a `last-pos` below its `first-pos`, is
+   ignored and the whole resource is served, as § 14.2 allows, and so is more
+   than one range; `bytes=-0` is unsatisfiable; `serializeCookie`
    throws on a `Domain`/`Path`
    injection attempt rather than silently dropping it; a `sameSite: 'None'`
    cookie is always `Secure` regardless of the `secure` setting;
@@ -804,8 +813,10 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   request substitution, response transformation), cookie parse/serialize/
   attribute-injection guards, `resolveSecure`, `clearCookie` (expiry and
   accumulation), `computeCodingQuality`/`resolveCoding`/`negotiateEncoding`,
-  the `ETag` hex digest, the `parseRange` table of decimal and non-decimal
-  bounds, the cookie table of every `Object.prototype` name, the
+  the `ETag` hex digest, the `parseRange` tables of grammar members and
+  non-members and its agreement with a reference recognizer of the RFC 9110
+  grammar over an exhaustive walk and a seeded population, `compareDigits`,
+  the cookie table of every `Object.prototype` name, the
   `serializeEvent` refusal table and its read-back through `@orkestrel/sse`,
   the scrub at the byte limit and on a self-referencing value, urlencoded
   bodies, and `discoverPort` (default, preferred, and

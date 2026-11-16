@@ -19,7 +19,6 @@ import {
 	isError,
 	isFiniteNumber,
 	isInstance,
-	isInteger,
 	isNumber,
 	isRecord,
 	isString,
@@ -960,17 +959,25 @@ export function matchesETag(header: string, etag: string): boolean {
  * total, returning a {@link RangeSpec} or `undefined`.
  *
  * @remarks
- * Handles the three single-range `bytes=` forms — closed (`start-end`), open
- * (`start-`), and suffix (`-suffixLength`) — clamping the window to
- * `[0, size - 1]` (the HTTP inclusive-end convention). Returns
- * `{ satisfiable: true, start, end }` for an overlapping range,
- * `{ satisfiable: false }` for a range wholly past the resource, and
- * `undefined` for the "serve the whole resource" case: an absent header, a
- * non-`bytes` unit, a multi-range header (`a-b, c-d` — refused outright, not
- * supported), or a bound outside `1*DIGIT` ({@link
- * import('./constants.js').RANGE_BOUND_PATTERN}), so a hexadecimal, exponent,
- * signed, or fractional numeral is refused. Never throws on a malformed
- * header.
+ * Reads the field value by RFC 9110 § 14.1:
+ * `range-unit "=" OWS range-set`, where the unit matches `bytes`
+ * case-insensitively and `range-set` is `1#range-spec` under the § 5.6.1 list
+ * rule, so empty list elements are skipped. OWS is a space or a tab, and it
+ * stands only around the field value, after `=`, and around a `,`; a range
+ * holds none. A range is an `int-range` (`first-pos "-" [ last-pos ]`) or a
+ * `suffix-range` (`"-" suffix-length`), each bound `1*DIGIT` ({@link
+ * import('./constants.js').RANGE_BOUND_PATTERN}). A bound of any length is
+ * compared with {@link compareDigits}, so none is misread through `Number`.
+ *
+ * Returns `{ satisfiable: true, start, end }` with the window clamped to
+ * `[0, size - 1]` (the HTTP inclusive-end convention), and
+ * `{ satisfiable: false }` when the range does not overlap the resource: a
+ * `first-pos` at or past `size`, a zero `suffix-length`, or an empty resource.
+ * Returns `undefined`, the § 14.2 "ignore the field and serve the whole
+ * resource" answer, for an absent header, another unit, text outside the
+ * grammar, a `last-pos` below its `first-pos`, more than one range (not
+ * supported), and a `size` that is not a non-negative safe integer. Never
+ * throws on a malformed header.
  *
  * @param header - The raw `Range` header value
  * @param size - The resource's total byte length
@@ -979,39 +986,67 @@ export function matchesETag(header: string, etag: string): boolean {
  * @example
  * ```ts
  * parseRange('bytes=0-99', 1000) // { satisfiable: true, start: 0, end: 99 }
+ * parseRange('Bytes=-100,', 1000) // { satisfiable: true, start: 900, end: 999 }
  * parseRange('bytes=0-1, 2-3', 1000) // undefined — multi-range refused
  * parseRange('bytes=0x10-', 1000) // undefined — not a decimal bound
+ * parseRange('bytes=5 - 9', 1000) // undefined — no OWS inside a range
  * ```
  */
 export function parseRange(header: string | undefined, size: number): RangeSpec | undefined {
-	if (header === undefined) return undefined
-	const match = /^bytes=(.*)$/.exec(header.trim())
-	if (match === null) return undefined
-	const capture = match[1]
-	if (capture === undefined) return undefined
-	const spec = capture.trim()
-	if (spec.includes(',')) return undefined
+	if (header === undefined || !Number.isSafeInteger(size) || size < 0) return undefined
+	const field = header.replace(/^[ \t]+|[ \t]+$/g, '')
+	const equals = field.indexOf('=')
+	if (equals < 0 || field.slice(0, equals).toLowerCase() !== 'bytes') return undefined
+	const specs = field
+		.slice(equals + 1)
+		.replace(/^[ \t]+/, '')
+		.split(/[ \t]*,[ \t]*/)
+		.filter((spec) => spec !== '')
+	const spec = specs[0]
+	if (spec === undefined || specs.length > 1) return undefined
 	const dash = spec.indexOf('-')
 	if (dash < 0) return undefined
-	const startText = spec.slice(0, dash).trim()
-	const endText = spec.slice(dash + 1).trim()
-	if (startText === '') {
-		if (!RANGE_BOUND_PATTERN.test(endText)) return undefined
-		const suffix = Number(endText)
-		if (!isInteger(suffix) || suffix <= 0) return undefined
-		if (size === 0) return { satisfiable: false }
-		const start = Math.max(0, size - suffix)
+	const first = spec.slice(0, dash)
+	const last = spec.slice(dash + 1)
+	const extent = String(size)
+	if (first === '') {
+		if (!RANGE_BOUND_PATTERN.test(last)) return undefined
+		if (size === 0 || compareDigits(last, '0') === 0) return { satisfiable: false }
+		const start = compareDigits(last, extent) < 0 ? size - Number(last) : 0
 		return { satisfiable: true, start, end: size - 1 }
 	}
-	if (!RANGE_BOUND_PATTERN.test(startText)) return undefined
-	const start = Number(startText)
-	if (!isInteger(start)) return undefined
-	if (start >= size) return { satisfiable: false }
-	if (endText === '') return { satisfiable: true, start, end: size - 1 }
-	if (!RANGE_BOUND_PATTERN.test(endText)) return undefined
-	const end = Number(endText)
-	if (!isInteger(end) || end < start) return undefined
-	return { satisfiable: true, start, end: Math.min(end, size - 1) }
+	if (!RANGE_BOUND_PATTERN.test(first)) return undefined
+	if (last !== '' && !RANGE_BOUND_PATTERN.test(last)) return undefined
+	if (last !== '' && compareDigits(last, first) < 0) return undefined
+	if (compareDigits(first, extent) >= 0) return { satisfiable: false }
+	const end = last === '' || compareDigits(last, extent) >= 0 ? size - 1 : Number(last)
+	return { satisfiable: true, start: Number(first), end }
+}
+
+/**
+ * Compares two `1*DIGIT` strings by their decimal value, at any length.
+ *
+ * @remarks
+ * Drops leading zeros, then compares the digit counts and, at an equal count,
+ * the digits in order, so a bound longer than any safe integer compares
+ * exactly and never passes through `Number`. Both arguments must be
+ * `1*DIGIT`; the answer for any other text is unspecified.
+ *
+ * @param left - The first digit string
+ * @param right - The second digit string
+ * @returns `-1` if `left` is less, `1` if it is greater, `0` if the two are equal
+ *
+ * @example
+ * ```ts
+ * compareDigits('9', '10') // -1
+ * compareDigits('007', '7') // 0
+ * ```
+ */
+export function compareDigits(left: string, right: string): number {
+	const a = left.replace(/^0+/, '')
+	const b = right.replace(/^0+/, '')
+	if (a.length !== b.length) return a.length < b.length ? -1 : 1
+	return a < b ? -1 : a > b ? 1 : 0
 }
 
 // The security primitives (module-scope) — CORS origin
@@ -1204,8 +1239,9 @@ export function computeClientKey(address: string): string {
 }
 
 // The Server-Sent-Events seam (module-scope) — `serializeEvent` and
-// `serializeComment` are the wire encoders, each read back by a conforming
-// SSE parser as the message or comment it was given. The stream handle
+// `serializeComment` are the wire encoders. A conforming SSE parser reads an
+// event back with each line break in its data as `\n`, and exposes no
+// comment, so a comment dispatches nothing. The stream handle
 // that writes those events over a `ReadableStream` is the `Stream` entity,
 // reached through `createStream`.
 

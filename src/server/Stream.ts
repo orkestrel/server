@@ -36,8 +36,9 @@ import { SSE_HEADERS } from './constants.js'
  * its buffering. Ignoring the return value preserves an unconditional-enqueue
  * producer. The default stream strategy counts chunks rather than their byte
  * length, so a byte-bounded producer must also cap each message. Return
- * `response` before awaiting a `false` write, because the consumer cannot pull
- * until it receives the response.
+ * `response` before awaiting a `false` write or `drain()`, because the consumer
+ * cannot pull until it receives the response, and the opening comment fills
+ * the queue, so a `drain()` before any write also waits on that pull.
  *
  * @example
  * ```ts

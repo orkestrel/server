@@ -386,8 +386,9 @@ export interface StreamOptions {
  * that ignores the boolean keeps the prior unconditional-enqueue behavior.
  * The stream's default strategy measures queued chunks, not their byte length,
  * so a producer seeking a byte bound must also bound each individual message.
- * Return `response` before awaiting a `false` write: the consumer cannot pull
- * until it receives the response.
+ * Return `response` before awaiting a `false` write or `drain()`: the consumer
+ * cannot pull until it receives the response, and the opening comment fills
+ * the queue, so a `drain()` before any write also waits on that pull.
  */
 export interface SSEStreamInterface {
 	/** Holds the streaming `Response` to return from the route handler. */
