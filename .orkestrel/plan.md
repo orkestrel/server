@@ -128,10 +128,10 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
 
 ## Sequence
 
-1. **Router:** R2, the node adapter contract (router `af49292` on `unit/r2`, under review); R1, the path contract (router `60418cd` on `unit/r1`, under review); then R4, the navigator, which also settles `navigator.match` with a raw non-ASCII path.
+1. **Router:** R2, the node adapter contract (router `af49292` on `unit/r2`, under review); R1, the path contract (router `60418cd` on `unit/r1`), whose review failed because the host `URL` parser served as the path grammar: a literal holding `\`, tab, LF, or CR answers another path, the encoder disagrees between Node and Chromium on `^`, `sensitive: false` folds ASCII only, and the Navigator's `fallback`, hash mode, and `match` skip the encoder. Cause 3 recurred, so a design consultation rules one canonical form for every door before the fix round; then R4, the navigator.
 2. **Server:** S4, the untrusted substrate (server `dbbc6b8` and `c90ecec` on `unit/s4`, fix round S4c open for a quadratic `parseRange` strip); S2a, the exchange seam, pinned to R2's tarball; then S2b, the boundary and outcomes; S3, timeouts and the server matrix; S5, measured throughput; S6, the signer.
 3. **Middleware:** M0a, the one-entry collapse (middleware `13622f4`, `7521cb2`); then, after server's tarball, M0b, adopt the seam; M1, the composed oracle; M5, admission; M2, identity and scoping; M3, CSRF and sessions after S6; M4, the response batteries; M6, multipart and static.
-4. The regular-expression census across router and middleware, feeding each package's next unit.
+4. The regular-expression census (2026-11-16) found one superlinear pattern outside server: middleware's `isReservedDeviceName` (`src/server/helpers.ts`, `/[. ]+$/`), reached by every `createStatic` GET, about 317 ms for a run of 16,000 dots. M6 replaces it with `/(?<![. ])[. ]+$/`, which agreed with the original on all 299,593 strings up to length 6 over space, dot, tab, U+00A0, U+3000, `a`, `¹`, and an astral character. The fix strips only U+002E and U+0020, strips a mixed trailing run whole, and trims a dots-and-spaces segment to empty. Router has none.
 5. The mcp, browser, toolbox, and scaffold visits; the integrated `orkestrel-falsify` round; a tree-wide `verifier` run; the consumer run; the releases in layer order.
 
 ## Deferred
@@ -150,5 +150,5 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
 
 ## State
 
-- 2026-11-16: the evidence round and the design consultation closed, and § Rulings records them. M0a landed on middleware's working branch. R1, R2, and S4 are committed on their unit branches and under review; S4c, S2a, and the regular-expression census are running.
-- Next: rule the R1 and R2 reviews, merge each passing unit into its repository's working branch through the gate chain, and dispatch R4.
+- 2026-11-16: the evidence round and the design consultation closed, and § Rulings records them. M0a landed on middleware's working branch. R1's review failed (§ Sequence item 1). R2's review, S4c, S2a, M5, and the path-grammar consultation are running.
+- Next: rule R2's review and merge it into router's working branch through the gate chain; build R1's fix round from the path-grammar ruling.
