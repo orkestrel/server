@@ -15,6 +15,7 @@ import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
 import {
+	attempt,
 	holds,
 	isArray,
 	isError,
@@ -33,7 +34,7 @@ import {
 	REQUEST_ID_PATTERN,
 	SSE_LINE_PATTERN,
 } from './constants.js'
-import { ContentTooLargeError, HTTPError, ServerError } from './errors.js'
+import { ContentTooLargeError, HTTPError, isHTTPError, ServerError } from './errors.js'
 import { isAddressInfo } from './validators.js'
 
 // The middleware seam's composition engine — a pure function, not a class:
@@ -1746,4 +1747,51 @@ export async function discoverPort(preferred?: number): Promise<number> {
 		if (isError(error) && 'code' in error && error.code === 'EADDRINUSE') return probePort(0)
 		throw error
 	}
+}
+
+/**
+ * Builds the response an error boundary sends for a thrown value: an `HTTPError` as its own status
+ * and message, and anything else as a 500 whose message stays hidden unless `expose` is `true`.
+ *
+ * @remarks
+ * The renderer is total: it returns a `Response` for every value and never throws.
+ * - An `HTTPError` whose status the `Response` constructor admits renders that status with its
+ *   message as the body, and with no body for a null body status (204, 205, and 304).
+ * - Every other value renders 500: a throw that is no `HTTPError`, and an `HTTPError` whose status
+ *   no `Response` carries (an integer below 200 or above 599, which includes 101 and 103, or a
+ *   status that is not an integer). Its body is `Internal Server Error`, or the error's own message
+ *   when `expose` is `true` and the value is an `Error`.
+ * - A thrown value is a fault to report when it is no `HTTPError`, or when the rendered status
+ *   differs from its `status`. The server's boundary reports exactly those values with their
+ *   `RequestLine`, and so does a middleware boundary that calls this renderer.
+ *
+ * @param error - The thrown value
+ * @param expose - If `true`, a 500 carries the message of the `Error` it renders; if `false`, it
+ *   carries `Internal Server Error`
+ * @returns The response to send
+ *
+ * @example
+ * ```ts
+ * import { buildErrorResponse, HTTPError } from '@src/server'
+ *
+ * buildErrorResponse(new HTTPError(404, 'no such lamp'), false).status // 404
+ * buildErrorResponse(new HTTPError(600, 'past the range'), false).status // 500
+ * buildErrorResponse(new Error('database offline'), true).status // 500, body 'database offline'
+ * ```
+ */
+export function buildErrorResponse(error: unknown, expose: boolean): Response {
+	if (isHTTPError(error)) {
+		const rendered = attempt(() => {
+			const status = error.status
+			const full = attempt(() => new Response(error.message, { status }))
+			const response = full.success ? full.value : new Response(null, { status })
+			return response.status === status ? response : undefined
+		})
+		if (rendered.success && rendered.value !== undefined) return rendered.value
+	}
+	const message = attempt(() => (expose && isError(error) ? error.message : undefined))
+	return new Response(
+		message.success && isString(message.value) ? message.value : 'Internal Server Error',
+		{ status: 500 },
+	)
 }

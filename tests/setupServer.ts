@@ -23,7 +23,14 @@ import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { queryObjects } from 'node:v8'
-import { resolveRoot, waitForAbort, waitForDelay } from '@orkestrel/test'
+import {
+	resolveRoot,
+	waitForAbort,
+	waitForCondition,
+	waitForDelay,
+	waitForEvent,
+} from '@orkestrel/test'
+import { HTTPError } from '@src/server'
 
 /** Holds the mutable observation owned by one test invocation. */
 export class ServerObservation<T> {
@@ -505,25 +512,25 @@ export const SERVER_RANGE_SHAPES: readonly ServerRangeShape[] = Object.freeze([
 ])
 
 /**
- * Times `call` over `repeat` runs, the least of 5 batches, in milliseconds.
+ * Times one batch of `repeat` runs of `call`, in milliseconds.
  *
  * @param call - The call to time
- * @param repeat - The number of runs in one batch
- * @returns The duration of the fastest batch
+ * @param repeat - The number of runs in the batch
+ * @returns The duration of the batch
  */
 export function timeServerBatch(call: () => unknown, repeat: number): number {
-	return Math.min(
-		...Array.from({ length: 5 }, () => {
-			const start = performance.now()
-			Array.from({ length: repeat }, () => call())
-			return performance.now() - start
-		}),
-	)
+	const start = performance.now()
+	Array.from({ length: repeat }, () => call())
+	return performance.now() - start
 }
 
 /**
  * Measures how a call's cost grows from size n to 4n: the batch time at 4n over the batch time
  * at n, each the least of 5 batches, with the batch sized so it takes 20 ms or more at n.
+ *
+ * @remarks
+ * The batches interleave in 5 rounds, the small batch first in the even rounds and the large batch
+ * first in the odd ones, so a burst of contention on the host reaches both sizes rather than one.
  *
  * @param build - Builds the call to time for one size
  * @param size - The size n
@@ -535,7 +542,15 @@ export function measureServerGrowth(build: (size: number) => () => unknown, size
 	small()
 	large()
 	const repeat = Math.max(1, Math.ceil(20 / Math.max(timeServerBatch(small, 1), 0.001)))
-	return timeServerBatch(large, repeat) / timeServerBatch(small, repeat)
+	const rounds = Array.from({ length: 5 }, (_, round) =>
+		round % 2 === 0
+			? { small: timeServerBatch(small, repeat), large: timeServerBatch(large, repeat) }
+			: { large: timeServerBatch(large, repeat), small: timeServerBatch(small, repeat) },
+	)
+	return (
+		Math.min(...rounds.map((times) => times.large)) /
+		Math.min(...rounds.map((times) => times.small))
+	)
 }
 
 /**
@@ -1373,4 +1388,418 @@ export async function driveSeamRequests(
 		),
 	)
 	return failures.reduce((sum, failed) => sum + failed, 0)
+}
+
+// ── The boundary and its outcomes ────────────────────────────────────────────
+//
+// The tables and routes the boundary blocks of `tests/src/server/integration.test.ts` and
+// `tests/src/server/Server.test.ts` drive through a real `Server`. Every expectation comes from the
+// Fetch standard's declarations, never from the code: `Response` admits an integer status from 200
+// through 599, and a null body status carries no body.
+
+/** Holds the message every status route throws or answers with. */
+export const BOUNDARY_MESSAGE = 'status under test'
+
+/** Holds the body the server sends for a fault whose message it hides. */
+export const BOUNDARY_HIDDEN = 'Internal Server Error'
+
+/** Lists the Fetch standard's null body statuses: a response with one of them carries no body. */
+export const BOUNDARY_NULL_BODY_STATUSES: readonly number[] = Object.freeze([
+	101, 103, 204, 205, 304,
+])
+
+/** Holds the lowest and the highest status the Fetch standard's `Response` constructor admits. */
+export const BOUNDARY_STATUS_RANGE = Object.freeze({ lowest: 200, highest: 599 })
+
+/** Lists the statuses no `Response` carries beside the range ends: past it, zero, `NaN`, and a fraction. */
+export const BOUNDARY_INVALID_STATUSES: readonly number[] = Object.freeze([
+	600,
+	0,
+	Number.NaN,
+	200.5,
+])
+
+/** Lists every status a route throws as an `HTTPError`: 100 through 999, then zero, `NaN`, and a fraction. */
+export const BOUNDARY_THROWN_STATUSES: readonly number[] = Object.freeze([
+	...Array.from({ length: 900 }, (_, index) => 100 + index),
+	0,
+	Number.NaN,
+	200.5,
+])
+
+/** Lists every status a route returns: a control, each null body status, and each invalid status. */
+export const BOUNDARY_RETURNED_STATUSES: readonly number[] = Object.freeze([
+	200,
+	...BOUNDARY_NULL_BODY_STATUSES,
+	...BOUNDARY_INVALID_STATUSES,
+])
+
+/** Holds the number of status requests in flight at once, inside the host's descriptor limit. */
+export const BOUNDARY_WIDTH = 50
+
+/** Holds how long a reply read waits on an idle socket before it reads the exchange as unanswered. */
+export const BOUNDARY_REPLY_MS = 2_000
+
+/** Holds the error the `/fail-body` route's body source fails with after its first chunk. */
+export const BOUNDARY_BODY_FAULT = new Error('body source failed after the first chunk')
+
+/** Holds the first chunk the streaming routes send. */
+export const BOUNDARY_FIRST_CHUNK = 'part1;'
+
+/** Holds how long the `/slow` route waits before its response and again before its last chunk. */
+export const BOUNDARY_SLOW_MS = 30
+
+/** Lists the values the fit finding F3 routes throw, in `/f3/:index` order. */
+export const BOUNDARY_F3_THROWS: readonly unknown[] = Object.freeze([
+	new Error('secret detail'),
+	'thrown string',
+	new HTTPError(418, 'teapot'),
+])
+
+/** Represents one row of fit finding F3: a throw, the `expose` option, and the answer it must get. */
+export interface BoundaryFitCase {
+	readonly index: number
+	readonly expose: boolean
+	readonly status: number
+	readonly body: string
+	readonly reports: number
+}
+
+/**
+ * Lists fit finding F3's table: each throw of {@link BOUNDARY_F3_THROWS} under each `expose`
+ * value, answered as one renderer answers it.
+ */
+export const BOUNDARY_F3_CASES: readonly BoundaryFitCase[] = Object.freeze([
+	{ index: 0, expose: false, status: 500, body: BOUNDARY_HIDDEN, reports: 1 },
+	{ index: 1, expose: false, status: 500, body: BOUNDARY_HIDDEN, reports: 1 },
+	{ index: 2, expose: false, status: 418, body: 'teapot', reports: 0 },
+	{ index: 0, expose: true, status: 500, body: 'secret detail', reports: 1 },
+	{ index: 1, expose: true, status: 500, body: BOUNDARY_HIDDEN, reports: 1 },
+	{ index: 2, expose: true, status: 418, body: 'teapot', reports: 0 },
+])
+
+/** Describes the answer a status route must get: its status, its body, and its report count. */
+export interface BoundaryExpectation {
+	readonly status: number
+	readonly body: string
+	readonly reports: number
+}
+
+/**
+ * Infers the answer a route that throws or returns `status` must get from a server whose `expose`
+ * is off, from the Fetch declarations alone: a status `Response` admits answers itself, with no
+ * body when it is a null body status, and every other status answers 500 with the hidden body and
+ * one report.
+ *
+ * @param status - The status the route throws or returns
+ * @returns The expected answer
+ */
+export function inferBoundaryReply(status: number): BoundaryExpectation {
+	const admitted =
+		Number.isInteger(status) &&
+		status >= BOUNDARY_STATUS_RANGE.lowest &&
+		status <= BOUNDARY_STATUS_RANGE.highest
+	if (!admitted) return { status: 500, body: BOUNDARY_HIDDEN, reports: 1 }
+	const empty = BOUNDARY_NULL_BODY_STATUSES.includes(status)
+	return { status, body: empty ? '' : BOUNDARY_MESSAGE, reports: 0 }
+}
+
+/**
+ * Builds the response a `/return/:status` route answers: `Response.error()` for zero, a platform
+ * `Response` for a status the constructor admits, and otherwise a platform `Response` whose own
+ * `status` property reads `status`, as a subclass that overrides the field would.
+ *
+ * @param status - The status to answer with
+ * @returns The response
+ */
+export function buildBoundaryResponse(status: number): Response {
+	if (status === 0) return Response.error()
+	const admitted =
+		Number.isInteger(status) &&
+		status >= BOUNDARY_STATUS_RANGE.lowest &&
+		status <= BOUNDARY_STATUS_RANGE.highest
+	if (admitted)
+		return new Response(BOUNDARY_NULL_BODY_STATUSES.includes(status) ? null : BOUNDARY_MESSAGE, {
+			status,
+		})
+	const response = new Response(null)
+	Object.defineProperty(response, 'status', { value: status })
+	return response
+}
+
+/**
+ * Builds the dispatcher the boundary blocks route into.
+ *
+ * @remarks
+ * - `GET /throw/:status` throws `new HTTPError(Number(status), BOUNDARY_MESSAGE)`.
+ * - `GET /return/:status` answers {@link buildBoundaryResponse} for `Number(status)`.
+ * - `GET /f3/:index` throws the member of {@link BOUNDARY_F3_THROWS} at `index`.
+ * - `GET /boom` throws an `Error`, and `GET /ping` answers `pong`.
+ * - `GET /hang` parks until its request signal aborts, then throws the signal's reason.
+ * - `POST /upload` reads its body as text, then answers it.
+ * - `GET /trickle` answers {@link BOUNDARY_FIRST_CHUNK}, then a body that waits until it is
+ *   cancelled.
+ * - `GET /fail-body` answers {@link BOUNDARY_FIRST_CHUNK}, then fails with
+ *   {@link BOUNDARY_BODY_FAULT} after {@link BOUNDARY_SLOW_MS}.
+ * - `GET /slow` waits {@link BOUNDARY_SLOW_MS}, answers its first chunk, waits again, then ends.
+ * - `GET /unavailable` waits {@link BOUNDARY_SLOW_MS}, then throws an `HTTPError` of 503.
+ *
+ * @param entered - The log each parking route appends its path to as it starts
+ * @returns The dispatcher
+ */
+export function createBoundaryDispatcher(entered: string[]): DispatcherInterface<undefined> {
+	const dispatcher = createDispatcher<undefined>()
+	dispatcher.add({
+		method: 'GET',
+		path: '/throw/:status',
+		handler: (_request, context) => {
+			throw new HTTPError(Number(context.params.status), BOUNDARY_MESSAGE)
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/return/:status',
+		handler: (_request, context) => buildBoundaryResponse(Number(context.params.status)),
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/f3/:index',
+		handler: (_request, context) => {
+			throw BOUNDARY_F3_THROWS[Number(context.params.index)]
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/boom',
+		handler: () => {
+			throw new Error('handler failed')
+		},
+	})
+	dispatcher.add({ method: 'GET', path: '/ping', handler: () => new Response('pong') })
+	dispatcher.add({
+		method: 'GET',
+		path: '/hang',
+		handler: async (request) => {
+			entered.push('/hang')
+			await waitForAbort(request.signal)
+			throw request.signal.reason
+		},
+	})
+	dispatcher.add({
+		method: 'POST',
+		path: '/upload',
+		handler: async (request) => {
+			entered.push('/upload')
+			return new Response(await request.text())
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/trickle',
+		handler: () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start: (controller) => controller.enqueue(new TextEncoder().encode(BOUNDARY_FIRST_CHUNK)),
+					pull: () => new Promise<void>(() => undefined),
+				}),
+			),
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/fail-body',
+		handler: () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start: (controller) => controller.enqueue(new TextEncoder().encode(BOUNDARY_FIRST_CHUNK)),
+					pull: async () => {
+						await waitForDelay(BOUNDARY_SLOW_MS)
+						throw BOUNDARY_BODY_FAULT
+					},
+				}),
+			),
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/slow',
+		handler: async () => {
+			await waitForDelay(BOUNDARY_SLOW_MS)
+			return new Response(
+				new ReadableStream<Uint8Array>({
+					start: (controller) => controller.enqueue(new TextEncoder().encode(BOUNDARY_FIRST_CHUNK)),
+					pull: async (controller) => {
+						await waitForDelay(BOUNDARY_SLOW_MS)
+						controller.close()
+					},
+				}),
+			)
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/unavailable',
+		handler: async () => {
+			await waitForDelay(BOUNDARY_SLOW_MS)
+			throw new HTTPError(503, 'unavailable')
+		},
+	})
+	return dispatcher
+}
+
+/** Reports one exchange a {@link readBoundaryReply} call read. */
+export interface BoundaryReply {
+	/** The status line's code, or `undefined` when no response arrived before the socket went idle. */
+	readonly status: number | undefined
+	/** The body as Node's client framed it. */
+	readonly body: string
+	/** Whether Node's client read the whole framed body before the connection closed. */
+	readonly complete: boolean
+	/** The bytes the server sent after the header block, before any framing is removed. */
+	readonly wire: string
+}
+
+/**
+ * Sends one `GET` on its own connection, with `Connection: close`, and reads the reply both as
+ * Node's client frames it and as the bytes after the header block.
+ *
+ * @remarks
+ * A socket idle for `ms` is destroyed, so an exchange the server never answers reads as a reply
+ * with no status rather than a hang.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param path - The request path
+ * @param ms - The idle limit. Default: {@link BOUNDARY_REPLY_MS}
+ * @returns The reply
+ */
+export function readBoundaryReply(
+	port: number,
+	path: string,
+	ms = BOUNDARY_REPLY_MS,
+): Promise<BoundaryReply> {
+	return new Promise((resolve) => {
+		const raw: Buffer[] = []
+		const chunks: Buffer[] = []
+		const request = http.get({
+			host: '127.0.0.1',
+			port,
+			path,
+			agent: false,
+			timeout: ms,
+			headers: { connection: 'close' },
+		})
+		request.once('socket', (socket) => socket.on('data', (chunk: Buffer) => raw.push(chunk)))
+		request.once('timeout', () => request.destroy())
+		request.once('error', () => resolve({ status: undefined, body: '', complete: false, wire: '' }))
+		request.once('response', (message) => {
+			message.on('data', (chunk: Buffer) => chunks.push(chunk))
+			message.on('error', () => undefined)
+			message.once('close', () => {
+				const bytes = Buffer.concat(raw).toString('latin1')
+				const end = bytes.indexOf('\r\n\r\n')
+				resolve({
+					status: message.statusCode,
+					body: Buffer.concat(chunks).toString('utf8'),
+					complete: message.complete,
+					wire: end === -1 ? '' : bytes.slice(end + 4),
+				})
+			})
+		})
+	})
+}
+
+/**
+ * Reads the reply to every path, {@link BOUNDARY_WIDTH} connections at a time.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param paths - The request paths
+ * @returns The replies, in path order
+ */
+export async function readBoundaryReplies(
+	port: number,
+	paths: readonly string[],
+): Promise<readonly BoundaryReply[]> {
+	const groups = Array.from({ length: Math.ceil(paths.length / BOUNDARY_WIDTH) }, (_, index) =>
+		paths.slice(index * BOUNDARY_WIDTH, (index + 1) * BOUNDARY_WIDTH),
+	)
+	return groups.reduce<Promise<readonly BoundaryReply[]>>(
+		async (previous, group) => [
+			...(await previous),
+			...(await Promise.all(group.map((path) => readBoundaryReply(port, path)))),
+		],
+		Promise.resolve([]),
+	)
+}
+
+/**
+ * Opens a `GET` on its own connection and destroys it after the route has started, so the peer
+ * disconnects before any response.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param path - The request path
+ * @param entered - The log the route appends its path to as it starts
+ * @returns A promise that settles after the client socket closes
+ */
+export async function abandonBoundaryRequest(
+	port: number,
+	path: string,
+	entered: readonly string[],
+): Promise<void> {
+	const before = entered.filter((member) => member === path).length
+	const request = http.get({ host: '127.0.0.1', port, path, agent: false })
+	request.on('error', () => undefined)
+	await waitForCondition(
+		`the ${path} route starts`,
+		() => entered.filter((member) => member === path).length > before,
+	)
+	const closed = waitForEvent<readonly []>((listener) => {
+		request.once('close', listener)
+	}, `the ${path} request closes`)
+	request.destroy()
+	await closed
+}
+
+/**
+ * Opens a `POST /upload` that declares a body longer than it sends, and destroys it after the route
+ * has started reading, so the peer disconnects in the middle of the body.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param entered - The log the route appends its path to as it starts
+ * @returns A promise that settles after the client socket closes
+ */
+export async function abandonBoundaryUpload(
+	port: number,
+	entered: readonly string[],
+): Promise<void> {
+	const before = entered.filter((member) => member === '/upload').length
+	const socket = net.createConnection({ host: '127.0.0.1', port })
+	socket.on('error', () => undefined)
+	await once(socket, 'connect')
+	socket.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.')
+	await waitForCondition(
+		'the /upload route starts',
+		() => entered.filter((member) => member === '/upload').length > before,
+	)
+	socket.destroy()
+	await once(socket, 'close')
+}
+
+/**
+ * Opens a `GET /trickle`, reads its first chunk, and destroys the connection, so the peer
+ * disconnects after the headers and before the end of the body.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @returns The text the client read before it disconnected
+ */
+export async function abandonBoundaryBody(port: number): Promise<string> {
+	const request = http.get({ host: '127.0.0.1', port, path: '/trickle', agent: false })
+	request.on('error', () => undefined)
+	const [message] = await once(request, 'response')
+	if (!(message instanceof http.IncomingMessage)) throw new Error('no response to GET /trickle')
+	message.on('error', () => undefined)
+	const [chunk] = await once(message, 'data')
+	const closed = waitForEvent<readonly []>((listener) => {
+		request.once('close', listener)
+	}, 'the /trickle request closes')
+	request.destroy()
+	await closed
+	return chunk instanceof Buffer ? chunk.toString('utf8') : ''
 }

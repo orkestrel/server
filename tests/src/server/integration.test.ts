@@ -1,12 +1,27 @@
-import type { Connection, MiddlewareContext } from '@src/server'
+import type { Connection, MiddlewareContext, RequestLine, ResponseRecord } from '@src/server'
 import http from 'node:http'
 import net from 'node:net'
+import { inspect, isDeepStrictEqual } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createDispatcher } from '@orkestrel/router'
-import { createServer, isServerError } from '@src/server'
-import { createRecorder, waitForCondition } from '@orkestrel/test'
+import { buildErrorResponse, createServer, isServerError } from '@src/server'
+import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
+	BOUNDARY_BODY_FAULT,
+	BOUNDARY_F3_CASES,
+	BOUNDARY_F3_THROWS,
+	BOUNDARY_FIRST_CHUNK,
+	BOUNDARY_RETURNED_STATUSES,
+	BOUNDARY_SLOW_MS,
+	BOUNDARY_THROWN_STATUSES,
+	abandonBoundaryBody,
+	abandonBoundaryRequest,
+	abandonBoundaryUpload,
+	createBoundaryDispatcher,
+	inferBoundaryReply,
+	readBoundaryReplies,
+	readBoundaryReply,
 	SEAM_BODY,
 	SEAM_IMMUTABLE_RESPONSES,
 	SEAM_NEXT_ARGUMENTS,
@@ -463,5 +478,237 @@ describe('the exchange seam — response normalization', () => {
 		await expect(response.text()).resolves.toBe('mutable')
 		expect(seen).toHaveLength(2)
 		expect(seen.every((layer) => layer === returned[0])).toBe(true)
+	})
+})
+
+// The boundary and its outcomes, driven through a real `Server` over real sockets. Every expectation
+// comes from the Fetch declarations and the ruling: a status `Response` admits answers itself, a null
+// body status sends no body, every other status answers 500 and is reported once, a body failure
+// after the headers reaches the client as an abort and `error` and `report` once, and a peer
+// disconnect is no fault and fires no `response`.
+
+describe('the boundary — status totality', () => {
+	it.each([
+		{ label: 'thrown', prefix: '/throw/', statuses: BOUNDARY_THROWN_STATUSES },
+		{ label: 'returned', prefix: '/return/', statuses: BOUNDARY_RETURNED_STATUSES },
+	])(
+		'answers every $label status as Response admits it, and reports each other one once',
+		// An unanswered exchange holds its group for the idle limit; the budget covers every group.
+		{ timeout: 60_000 },
+		async ({ prefix, statuses }) => {
+			const rejections = createRecorder<readonly [unknown]>()
+			process.on('unhandledRejection', rejections.handler)
+			try {
+				const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+				const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+				const server = trackServer(
+					running,
+					createServer({
+						dispatcher: createBoundaryDispatcher([]),
+						state: () => undefined,
+						host: '127.0.0.1',
+						report: reports.handler,
+					}),
+				)
+				server.emitter.on('error', errors.handler)
+				const port = await server.start()
+				const paths = statuses.map((status) => `${prefix}${String(status)}`)
+				const replies = await readBoundaryReplies(port, paths)
+				const rows = statuses.map((status, index) => {
+					const reply = replies[index]
+					const expected = inferBoundaryReply(status)
+					const reported = reports.calls.filter(([, line]) => line?.url.pathname === paths[index])
+					return {
+						status,
+						observed: {
+							status: reply?.status,
+							body: reply?.body,
+							empty: reply?.wire === '',
+							complete: reply?.complete,
+							reports: reported.length,
+						},
+						expected: {
+							status: expected.status,
+							body: expected.body,
+							empty: expected.body === '',
+							complete: true,
+							reports: expected.reports,
+						},
+					}
+				})
+				expect(
+					rows
+						.filter((row) => !isDeepStrictEqual(row.observed, row.expected))
+						.map((row) => inspect(row, { breakLength: Number.POSITIVE_INFINITY })),
+				).toEqual([])
+				expect(errors.count).toBe(reports.count)
+				const control = await readBoundaryReply(port, '/ping')
+				expect(control.body).toBe('pong')
+				await waitForDelay(10)
+				expect(rejections.calls).toEqual([])
+			} finally {
+				process.off('unhandledRejection', rejections.handler)
+			}
+		},
+	)
+})
+
+describe('the boundary — one renderer, fit finding F3', () => {
+	it.each(BOUNDARY_F3_CASES)(
+		'answers throw $index under expose $expose with $status through the server and the renderer alike',
+		async ({ index, expose, status, body, reports: count }) => {
+			const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createBoundaryDispatcher([]),
+					state: () => undefined,
+					host: '127.0.0.1',
+					expose,
+					report: reports.handler,
+				}),
+			)
+			const port = await server.start()
+			const reply = await readBoundaryReply(port, `/f3/${String(index)}`)
+			expect({ status: reply.status, body: reply.body }).toEqual({ status, body })
+			const rendered = buildErrorResponse(BOUNDARY_F3_THROWS[index], expose)
+			expect({ status: rendered.status, body: await rendered.text() }).toEqual({ status, body })
+			expect(
+				reports.calls.map(([error, line]) => [error, line?.method, line?.url.pathname]),
+			).toEqual(count === 0 ? [] : [[BOUNDARY_F3_THROWS[index], 'GET', `/f3/${String(index)}`]])
+		},
+	)
+})
+
+describe('the boundary — a body failure after the headers', () => {
+	it('destroys the connection, so the client reads an abort, and reaches error and report once', async () => {
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher([]),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const reply = await readBoundaryReply(port, '/fail-body')
+		expect({ status: reply.status, body: reply.body, complete: reply.complete }).toEqual({
+			status: 200,
+			body: BOUNDARY_FIRST_CHUNK,
+			complete: false,
+		})
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		const faults = [errors, reports].map((recorder) =>
+			recorder.calls.map(([error, line]) => [error, line?.method, line?.url.pathname]),
+		)
+		expect(faults).toEqual([
+			[[BOUNDARY_BODY_FAULT, 'GET', '/fail-body']],
+			[[BOUNDARY_BODY_FAULT, 'GET', '/fail-body']],
+		])
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+	})
+})
+
+describe('the boundary — the response event', () => {
+	it('fires no response, no error, and no report for a peer that disconnects before the end', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		await abandonBoundaryRequest(port, '/hang', entered)
+		await abandonBoundaryUpload(port, entered)
+		expect(await abandonBoundaryBody(port)).toBe(BOUNDARY_FIRST_CHUNK)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('records the status written and the time from acceptance to the finished body', async () => {
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher([]),
+				state: () => undefined,
+				host: '127.0.0.1',
+			}),
+		)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const [slow, unavailable] = await Promise.all([
+			readBoundaryReply(port, '/slow'),
+			readBoundaryReply(port, '/unavailable'),
+		])
+		expect([slow.status, slow.body, slow.complete]).toEqual([200, BOUNDARY_FIRST_CHUNK, true])
+		expect(unavailable.status).toBe(503)
+		await waitForCondition('both responses fire', () => responses.count === 2)
+		const records = new Map(responses.calls.map(([record]) => [record.pathname, record]))
+		expect(records.get('/slow')?.status).toBe(200)
+		expect(records.get('/unavailable')?.status).toBe(503)
+		expect(records.get('/slow')?.ms).toBeGreaterThanOrEqual(2 * BOUNDARY_SLOW_MS - 1)
+		expect(records.get('/unavailable')?.ms).toBeGreaterThanOrEqual(BOUNDARY_SLOW_MS - 1)
+	})
+})
+
+describe('the boundary — the terminal catch', () => {
+	it('never rejects an exchange, and pairs every error event with one report', async () => {
+		const rejections = createRecorder<readonly [unknown]>()
+		process.on('unhandledRejection', rejections.handler)
+		try {
+			const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createBoundaryDispatcher([]),
+					state: () => undefined,
+					host: '127.0.0.1',
+					report: async (error, line) => {
+						reports.handler(error, line)
+						throw new Error('the reporting sink rejects')
+					},
+				}),
+			)
+			server.emitter.on('error', errors.handler)
+			const port = await server.start()
+			const replies = await readBoundaryReplies(port, [
+				'/throw/600',
+				'/throw/304',
+				'/return/0',
+				'/boom',
+				'/fail-body',
+				'/ping',
+			])
+			expect(replies).toHaveLength(6)
+			await waitForDelay(10)
+			expect(rejections.calls).toEqual([])
+			expect(errors.count).toBe(reports.count)
+		} finally {
+			process.off('unhandledRejection', rejections.handler)
+		}
 	})
 })

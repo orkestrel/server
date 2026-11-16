@@ -24,8 +24,8 @@ import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { attempt, isError, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
-import { compose, iterateRequestBody } from './helpers.js'
+import { attempt, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
+import { buildErrorResponse, compose, iterateRequestBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
 import { HTTPError, isHTTPError, ServerError } from './errors.js'
@@ -321,12 +321,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		void this.#accept(message, response, exchange)
 	}
 
-	// Build the one fetch `Request` of the exchange and its `MiddlewareContext`,
-	// run the composed onion, and write the result back — every escaping throw
-	// is caught so the process can never crash on an unhandled handler (or
-	// malformed request) error. `buildRequest` runs behind its own inner
-	// boundary: a throw there (for example, a malformed `Host` header) maps to
-	// a silent `400`, never `error`.
+	// The terminal catch holds every throw after the request exists, so no exchange rejects.
 	async #accept(
 		message: IncomingMessage,
 		response: ServerResponse,
@@ -334,27 +329,48 @@ export class Server<TState> implements ServerInterface<TState> {
 	): Promise<void> {
 		const created = attempt(() => buildRequest(message, { response, signal: exchange.signal }))
 		if (!created.success) {
-			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
+			await this.#respond(
+				buildErrorResponse(new HTTPError(400, 'invalid request'), false),
+				response,
+			)
 			return
 		}
 		const request = created.value
-		// Hoisted out of the inner try (not block-scoped inside it) so that try's
-		// catch can attach real request context to the `error` emit / `report`
-		// sink — and so `response` can be emitted with the same facts on either
-		// the success or the error path.
-		const method = request.method
-		const url = new URL(request.url)
+		const line: RequestLine = { method: request.method, url: new URL(request.url) }
 		const start = performance.now()
 		try {
-			this.#emitter.emit('request', method, url.pathname)
+			this.#emitter.emit('request', line.method, line.url.pathname)
+			const result = await this.#run(request, line, message, exchange)
+			if (await this.#respond(result, response, line)) {
+				this.#emitter.emit('response', {
+					method: line.method,
+					pathname: line.url.pathname,
+					status: result.status,
+					ms: Math.round(performance.now() - start),
+				})
+			}
+		} catch (error) {
+			response.destroy()
+			this.#fault(error, line)
+		}
+	}
+
+	// A returned status no `Response` carries, as from `Response.error()`, is thrown to render 500.
+	async #run(
+		request: Request,
+		line: RequestLine,
+		message: IncomingMessage,
+		exchange: AbortController,
+	): Promise<Response> {
+		try {
 			const ip = message.socket.remoteAddress
 			const connection: Connection = {
 				...(ip === undefined ? {} : { ip }),
 				encrypted: isEncryptedSocket(message.socket),
 			}
 			const context: MiddlewareContext<TState> = {
-				url,
-				method,
+				url: line.url,
+				method: line.method,
 				state: this.#state(connection),
 				connection,
 				body: this.#createBody(request),
@@ -364,52 +380,41 @@ export class Server<TState> implements ServerInterface<TState> {
 				this.#dispatcher.handle(currentRequest, currentContext.state),
 			)
 			const result = await runner(request, context)
-			await this.#respond(result, response)
-			this.#emitter.emit('response', {
-				method,
-				pathname: url.pathname,
-				status: result.status,
-				ms: Math.round(performance.now() - start),
-			})
+			const status = result.status
+			if (isInteger(status) && status >= 200 && status <= 599) return result
+			throw new HTTPError(status, `a handler returned status ${String(status)}`)
 		} catch (error) {
-			const mapped = this.#boundary(error)
-			if (!isHTTPError(error)) {
-				this.#emitter.emit('error', error, { method, url })
-				if (this.#report !== undefined) {
-					try {
-						this.#report(error, { method, url })
-					} catch {
-						// Swallowed — reporting can never crash the response.
-					}
-				}
-			}
-			await this.#respond(mapped, response)
-			this.#emitter.emit('response', {
-				method,
-				pathname: url.pathname,
-				status: mapped.status,
-				ms: Math.round(performance.now() - start),
-			})
+			return this.#boundary(error, line, request.signal.aborted && !exchange.signal.aborted)
 		}
 	}
 
-	// The server-owned last resort: even a write failure inside
-	// `sendResponse` cannot escape and crash the process — the underlying
-	// response (and its socket) is destroyed instead.
-	async #respond(result: Response, response: ServerResponse): Promise<void> {
+	// A peer that closed first is no fault; a failed write destroys the connection and is one.
+	async #respond(result: Response, response: ServerResponse, line?: RequestLine): Promise<boolean> {
 		try {
 			await sendResponse(result, response)
-		} catch {
+		} catch (error) {
 			response.destroy()
+			this.#fault(error, line)
+			return false
 		}
+		return response.writableFinished
 	}
 
-	// The built-in boundary — an `HTTPError` renders as its status + message;
-	// any other throw renders `500` with its message hidden unless `expose`.
-	#boundary(error: unknown): Response {
-		if (isHTTPError(error)) return new Response(error.message, { status: error.status })
-		const message = this.#expose && isError(error) ? error.message : 'Internal Server Error'
-		return new Response(message, { status: 500 })
+	#boundary(error: unknown, line: RequestLine, disconnected: boolean): Response {
+		const rendered = buildErrorResponse(error, this.#expose)
+		if (!disconnected && (!isHTTPError(error) || rendered.status !== error.status))
+			this.#fault(error, line)
+		return rendered
+	}
+
+	// `Promise.resolve` adopts a rejected promise or a throwing thenable the sink returns.
+	#fault(error: unknown, line: RequestLine | undefined): void {
+		if (line === undefined) this.#emitter.emit('error', error)
+		else this.#emitter.emit('error', error, line)
+		const report = this.#report
+		if (report === undefined) return
+		const reported = attempt((): unknown => report(error, line))
+		if (reported.success) void Promise.resolve(reported.value).catch(() => undefined)
 	}
 
 	// Fan a raw protocol-upgrade out to the registered handlers in
