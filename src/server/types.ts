@@ -584,11 +584,11 @@ export interface ResponseRecord {
  *   whose status the response carries, a returned status no `Response`
  *   carries included), a response write that fails, or a throw the terminal
  *   catch holds; each carries the request's {@link RequestLine}, the same
- *   pair `report` receives. A peer that disconnects before the end is no
- *   fault and fires nothing. The request is `undefined` for an
- *   upgrade-handler throw (no fetch `Request` exists on that path — only a
- *   raw `IncomingMessage`), a listen failure, and a failed write of the `400`
- *   a request gets when no `Request` could be built.
+ *   pair `report` receives. A throw after a peer disconnect is no fault and
+ *   fires nothing. The request is `undefined` for an upgrade-handler throw
+ *   (no fetch `Request` exists on that path — only a raw `IncomingMessage`),
+ *   a listen failure, and a fault on the `400` path of a request no
+ *   `Request` could be built for, a failed write of that `400` included.
  * - `stop` — `stop()` began (status moved to `'stopping'`). An upgrade
  *   handler that owns a long-lived socket closes it from here, so the drain
  *   settles instead of running out the deadline.
@@ -602,7 +602,8 @@ export interface ResponseRecord {
  *   the status the server wrote (the handler's, or the rendered status of a
  *   throw), and `ms`, the time from the exchange's acceptance, before
  *   `request` fires, to that last byte, in whole milliseconds. A response
- *   whose peer disconnected first and a write that failed fire no `response`,
+ *   whose peer disconnected first, a body-less answer included, and a write
+ *   that failed fire no `response`,
  *   and neither does a request rejected at the `buildRequest` inner boundary
  *   (a plain `400`, for example a malformed `Host` header), because no parsed
  *   `Request` exists yet to derive its facts from.
@@ -697,11 +698,13 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   fault to (logging / metrics), with the same `(error, RequestLine)` the
  *   `error` event carries: every throw except an `HTTPError` whose status the
  *   response carries, a returned status no `Response` carries, a response
- *   write that fails, and a throw the terminal catch holds. A peer
- *   disconnect is no fault. A sink that throws, or returns a promise that
- *   rejects, is contained, so the response still goes out and no rejection
- *   escapes. The request is absent only for a failed write of the `400` a
- *   request gets when no `Request` could be built.
+ *   write that fails, and a throw the terminal catch holds. A throw after a
+ *   peer disconnect is no fault. A sink that throws, or returns a promise
+ *   that rejects, is contained, so the response still goes out, except that a
+ *   rejected native promise whose own `constructor` getter throws refuses
+ *   every reaction and reaches `unhandledRejection`. The request is absent
+ *   only for a fault on the `400` path of a request no `Request` could be
+ *   built for, a failed write of that `400` included.
  * @param timeouts - Lifecycle and `node:http` tuning knobs: `start` (maximum
  *   time to bind the listener; `0` permits no startup window), `request` (max
  *   time to fully receive + respond, `requestTimeout`), `headers` (max time

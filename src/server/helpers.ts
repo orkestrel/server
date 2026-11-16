@@ -1750,8 +1750,9 @@ export async function discoverPort(preferred?: number): Promise<number> {
 }
 
 /**
- * Builds the response an error boundary sends for a thrown value: an `HTTPError` as its own status
- * and message, and anything else as a 500 whose message stays hidden unless `expose` is `true`.
+ * Builds the response an error boundary sends for a thrown value: an `HTTPError` whose status the
+ * `Response` constructor admits keeps that status, and every other value renders a 500 whose
+ * message stays hidden unless `expose` is `true`.
  *
  * @remarks
  * The renderer is total: it returns a `Response` for every value and never throws.
@@ -1762,8 +1763,9 @@ export async function discoverPort(preferred?: number): Promise<number> {
  *   status that is not an integer). Its body is `Internal Server Error`, or the error's own message
  *   when `expose` is `true` and the value is an `Error`.
  * - A thrown value is a fault to report when it is no `HTTPError`, or when the rendered status
- *   differs from its `status`. The server's boundary reports exactly those values with their
- *   `RequestLine`, and so does a middleware boundary that calls this renderer.
+ *   differs from its `status`. The server's boundary reports those values with their
+ *   `RequestLine`, except a throw after the peer disconnected, which is no fault and reports
+ *   nothing.
  *
  * @param error - The thrown value
  * @param expose - If `true`, a 500 carries the message of the `Error` it renders; if `false`, it

@@ -24,7 +24,7 @@ import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { attempt, isFiniteNumber, isFunction, isInteger } from '@orkestrel/contract'
+import { attempt, isFiniteNumber, isFunction, isInteger, isPromise } from '@orkestrel/contract'
 import { buildErrorResponse, compose, iterateRequestBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
 import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
@@ -321,27 +321,41 @@ export class Server<TState> implements ServerInterface<TState> {
 		void this.#accept(message, response, exchange)
 	}
 
-	// The terminal catch holds every throw after the request exists, so no exchange rejects.
+	// The terminal catch: a throw here, the inner phase's `400` included, has no `RequestLine`.
 	async #accept(
 		message: IncomingMessage,
 		response: ServerResponse,
 		exchange: AbortController,
 	): Promise<void> {
-		const created = attempt(() => buildRequest(message, { response, signal: exchange.signal }))
-		if (!created.success) {
-			await this.#respond(
-				buildErrorResponse(new HTTPError(400, 'invalid request'), false),
-				response,
-			)
-			return
+		try {
+			const created = attempt(() => buildRequest(message, { response, signal: exchange.signal }))
+			if (created.success) await this.#serve(created.value, message, response, exchange)
+			else
+				await this.#respond(
+					buildErrorResponse(new HTTPError(400, 'invalid request'), false),
+					response,
+				)
+		} catch (error) {
+			response.destroy()
+			this.#fault(error, undefined)
 		}
-		const request = created.value
+	}
+
+	// The terminal catch of an exchange whose `Request` exists, so its faults carry the line.
+	async #serve(
+		request: Request,
+		message: IncomingMessage,
+		response: ServerResponse,
+		exchange: AbortController,
+	): Promise<void> {
 		const line: RequestLine = { method: request.method, url: new URL(request.url) }
 		const start = performance.now()
 		try {
 			this.#emitter.emit('request', line.method, line.url.pathname)
 			const result = await this.#run(request, line, message, exchange)
-			if (await this.#respond(result, response, line)) {
+			const sent = await this.#respond(result, response, line)
+			// A body-less answer after a disconnect still reaches `finish`, so the peer decides.
+			if (sent && !this.#disconnected(request, exchange)) {
 				this.#emitter.emit('response', {
 					method: line.method,
 					pathname: line.url.pathname,
@@ -384,8 +398,14 @@ export class Server<TState> implements ServerInterface<TState> {
 			if (isInteger(status) && status >= 200 && status <= 599) return result
 			throw new HTTPError(status, `a handler returned status ${String(status)}`)
 		} catch (error) {
-			return this.#boundary(error, line, request.signal.aborted && !exchange.signal.aborted)
+			return this.#boundary(error, line, this.#disconnected(request, exchange))
 		}
+	}
+
+	// The router aborts the request signal on a peer disconnect; the exchange's own signal aborts
+	// only on `context.abort` and `stop()`.
+	#disconnected(request: Request, exchange: AbortController): boolean {
+		return request.signal.aborted && !exchange.signal.aborted
 	}
 
 	// A peer that closed first is no fault; a failed write destroys the connection and is one.
@@ -402,19 +422,25 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	#boundary(error: unknown, line: RequestLine, disconnected: boolean): Response {
 		const rendered = buildErrorResponse(error, this.#expose)
-		if (!disconnected && (!isHTTPError(error) || rendered.status !== error.status))
-			this.#fault(error, line)
+		const carried = attempt(() => isHTTPError(error) && error.status === rendered.status)
+		if (!disconnected && !(carried.success && carried.value)) this.#fault(error, line)
 		return rendered
 	}
 
-	// `Promise.resolve` adopts a rejected promise or a throwing thenable the sink returns.
+	// `then.call` skips a promise's own `then`; `attempt` holds a throwing `constructor` getter.
 	#fault(error: unknown, line: RequestLine | undefined): void {
 		if (line === undefined) this.#emitter.emit('error', error)
 		else this.#emitter.emit('error', error, line)
 		const report = this.#report
 		if (report === undefined) return
 		const reported = attempt((): unknown => report(error, line))
-		if (reported.success) void Promise.resolve(reported.value).catch(() => undefined)
+		if (!reported.success) return
+		const value = reported.value
+		attempt(() =>
+			isPromise(value)
+				? Promise.prototype.then.call(value, undefined, () => undefined)
+				: Promise.resolve(value).catch(() => undefined),
+		)
 	}
 
 	// Fan a raw protocol-upgrade out to the registered handlers in

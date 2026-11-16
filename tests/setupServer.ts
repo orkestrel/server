@@ -1543,6 +1543,9 @@ export function buildBoundaryResponse(status: number): Response {
  *   {@link BOUNDARY_BODY_FAULT} after {@link BOUNDARY_SLOW_MS}.
  * - `GET /slow` waits {@link BOUNDARY_SLOW_MS}, answers its first chunk, waits again, then ends.
  * - `GET /unavailable` waits {@link BOUNDARY_SLOW_MS}, then throws an `HTTPError` of 503.
+ * - `GET /late-empty` and `GET /late-204` park until their request signal aborts, wait
+ *   {@link BOUNDARY_SLOW_MS}, append `<path> answered`, then answer with no body: a 200 and a 204.
+ * - `GET /answer-empty` answers a 200 with no body.
  *
  * @param entered - The log each parking route appends its path to as it starts
  * @returns The dispatcher
@@ -1642,8 +1645,183 @@ export function createBoundaryDispatcher(entered: string[]): DispatcherInterface
 			throw new HTTPError(503, 'unavailable')
 		},
 	})
+	for (const [path, status] of [
+		['/late-empty', 200],
+		['/late-204', 204],
+	] as const) {
+		dispatcher.add({
+			method: 'GET',
+			path,
+			handler: async (request) => {
+				entered.push(path)
+				await waitForAbort(request.signal)
+				await waitForDelay(BOUNDARY_SLOW_MS)
+				entered.push(`${path} answered`)
+				return new Response(null, { status })
+			},
+		})
+	}
+	dispatcher.add({ method: 'GET', path: '/answer-empty', handler: () => new Response(null) })
 	return dispatcher
 }
+
+/** Reports one exchange a {@link readBoundaryRaw} call read. */
+export interface BoundaryRawReply {
+	/** The bytes the server sent before the connection closed or went idle. */
+	readonly text: string
+	/** Whether the socket went idle for the limit before the server closed it. */
+	readonly idle: boolean
+}
+
+/**
+ * Writes `raw` on its own connection and reads every byte until the server closes the connection,
+ * or until the socket stays idle for `ms`.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param raw - The request bytes, which ask the server to close after its answer
+ * @param ms - The idle limit. Default: {@link BOUNDARY_REPLY_MS}
+ * @returns The bytes, and whether the idle limit ended the read
+ */
+export function readBoundaryRaw(
+	port: number,
+	raw: string,
+	ms = BOUNDARY_REPLY_MS,
+): Promise<BoundaryRawReply> {
+	return new Promise((resolve) => {
+		const chunks: Buffer[] = []
+		const idle = new AbortController()
+		const socket = net.createConnection({ host: '127.0.0.1', port }, () => socket.write(raw))
+		socket.setTimeout(ms, () => {
+			idle.abort()
+			socket.destroy()
+		})
+		socket.on('data', (chunk: Buffer) => chunks.push(chunk))
+		socket.on('error', () => undefined)
+		socket.once('close', () =>
+			resolve({ text: Buffer.concat(chunks).toString('latin1'), idle: idle.signal.aborted }),
+		)
+	})
+}
+
+/** Holds a request `buildRequest` refuses, a `Host` with a space, which asks to close after the answer. */
+export const BOUNDARY_REFUSED_REQUEST =
+	'GET / HTTP/1.1\r\nHost: foo bar\r\nConnection: close\r\n\r\n'
+
+/** Represents one value the renderer renders: how to build it, `expose`, and the answer it gets. */
+export interface BoundaryRenderCase {
+	readonly label: string
+	readonly build: () => unknown
+	readonly expose: boolean
+	readonly status: number
+	readonly body: string | null
+}
+
+/**
+ * Builds an `HTTPError` whose own `status` or `message` property reads through a getter that throws.
+ *
+ * @param member - The own property to replace: `status` or `message`
+ * @param status - The status the error is constructed with
+ * @returns The error
+ */
+export function buildThrowingHTTPError(member: 'status' | 'message', status: number): HTTPError {
+	const error = new HTTPError(status, 'teapot')
+	Object.defineProperty(error, member, {
+		get: () => {
+			throw new Error(`the ${member} accessor throws`)
+		},
+	})
+	return error
+}
+
+/**
+ * Builds a `Proxy` object over an `Error` whose handler has been revoked, so every read of it throws.
+ *
+ * @returns The revoked proxy
+ */
+export function buildRevokedProxy(): object {
+	const { proxy, revoke } = Proxy.revocable(new Error('behind a revoked proxy'), {})
+	revoke()
+	return proxy
+}
+
+/**
+ * Lists what the renderer answers for each value a boundary can catch, from the Fetch declarations:
+ * an `HTTPError` whose status `Response` admits keeps it, a null body status carries a `null` body,
+ * and every other value answers 500 with the hidden body, or an `Error`'s readable message under
+ * `expose`.
+ */
+export const BOUNDARY_RENDER_CASES: readonly BoundaryRenderCase[] = Object.freeze([
+	{
+		label: 'an HTTPError of 404',
+		build: (): unknown => new HTTPError(404, 'no such lamp'),
+		expose: false,
+		status: 404,
+		body: 'no such lamp',
+	},
+	...[204, 205, 304].map((status) => ({
+		label: `an HTTPError of ${String(status)}`,
+		build: (): unknown => new HTTPError(status, 'no body'),
+		expose: false,
+		status,
+		body: null,
+	})),
+	...[101, 600, Number.NaN, 200.5, 65_736].map((status) => ({
+		label: `an HTTPError of ${String(status)} under expose`,
+		build: (): unknown => new HTTPError(status, 'past the range'),
+		expose: true,
+		status: 500,
+		body: 'past the range',
+	})),
+	{
+		label: 'an HTTPError of 600 without expose',
+		build: (): unknown => new HTTPError(600, 'past the range'),
+		expose: false,
+		status: 500,
+		body: BOUNDARY_HIDDEN,
+	},
+	{
+		label: 'an HTTPError whose status accessor throws',
+		build: (): unknown => buildThrowingHTTPError('status', 404),
+		expose: true,
+		status: 500,
+		body: 'teapot',
+	},
+	{
+		label: 'an HTTPError whose message accessor throws',
+		build: (): unknown => buildThrowingHTTPError('message', 404),
+		expose: true,
+		status: 500,
+		body: BOUNDARY_HIDDEN,
+	},
+	{
+		label: 'a revoked Proxy over an Error',
+		build: buildRevokedProxy,
+		expose: true,
+		status: 500,
+		body: BOUNDARY_HIDDEN,
+	},
+	{
+		label: 'an Error under expose',
+		build: (): unknown => new Error('database offline'),
+		expose: true,
+		status: 500,
+		body: 'database offline',
+	},
+	{
+		label: 'an Error without expose',
+		build: (): unknown => new Error('database offline'),
+		expose: false,
+		status: 500,
+		body: BOUNDARY_HIDDEN,
+	},
+	...[undefined, null, 0, '', 'thrown string', Symbol('thrown'), 10n, Number.NaN].map((value) => ({
+		label: `the primitive ${String(value)}`,
+		build: (): unknown => value,
+		expose: true,
+		status: 500,
+		body: BOUNDARY_HIDDEN,
+	})),
+])
 
 /** Reports one exchange a {@link readBoundaryReply} call read. */
 export interface BoundaryReply {

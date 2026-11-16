@@ -12,6 +12,7 @@ import {
 	BOUNDARY_F3_CASES,
 	BOUNDARY_F3_THROWS,
 	BOUNDARY_FIRST_CHUNK,
+	BOUNDARY_REFUSED_REQUEST,
 	BOUNDARY_RETURNED_STATUSES,
 	BOUNDARY_SLOW_MS,
 	BOUNDARY_THROWN_STATUSES,
@@ -20,6 +21,7 @@ import {
 	abandonBoundaryUpload,
 	createBoundaryDispatcher,
 	inferBoundaryReply,
+	readBoundaryRaw,
 	readBoundaryReplies,
 	readBoundaryReply,
 	SEAM_BODY,
@@ -639,12 +641,42 @@ describe('the boundary — the response event', () => {
 		await abandonBoundaryRequest(port, '/hang', entered)
 		await abandonBoundaryUpload(port, entered)
 		expect(await abandonBoundaryBody(port)).toBe(BOUNDARY_FIRST_CHUNK)
+		await abandonBoundaryRequest(port, '/late-empty', entered)
+		await abandonBoundaryRequest(port, '/late-204', entered)
+		await waitForCondition(
+			'the null body routes answer after their peers left',
+			() => entered.includes('/late-empty answered') && entered.includes('/late-204 answered'),
+		)
 		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
 		await waitForCondition('the control response fires', () =>
 			responses.calls.some(([record]) => record.pathname === '/ping'),
 		)
 		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
 		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('fires response for an exchange the server aborted and then answered with no body', async () => {
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher([]),
+				state: () => undefined,
+				host: '127.0.0.1',
+				middleware: [createAbortLayer('/answer-empty', ['a deadline passed'])],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const reply = await readBoundaryReply(port, '/answer-empty')
+		expect([reply.status, reply.body, reply.complete]).toEqual([200, '', true])
+		await waitForCondition('the response fires', () => responses.count === 1)
+		expect(responses.calls.map(([record]) => [record.pathname, record.status])).toEqual([
+			['/answer-empty', 200],
+		])
+		expect(errors.count).toBe(0)
 	})
 
 	it('records the status written and the time from acceptance to the finished body', async () => {
@@ -707,6 +739,53 @@ describe('the boundary — the terminal catch', () => {
 			await waitForDelay(10)
 			expect(rejections.calls).toEqual([])
 			expect(errors.count).toBe(reports.count)
+		} finally {
+			process.off('unhandledRejection', rejections.handler)
+		}
+	})
+})
+
+describe('the boundary — the inner phase', () => {
+	it('answers a request buildRequest refuses with a silent 400', async () => {
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher([]),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const reply = await readBoundaryRaw(port, BOUNDARY_REFUSED_REQUEST)
+		expect(reply.text).toMatch(/^HTTP\/1\.1 400/)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () => responses.count === 1)
+		expect([errors.count, reports.count, responses.count]).toEqual([0, 0, 1])
+	})
+
+	it('settles a refused request before the idle limit, whatever fails on its 400 path', async () => {
+		const rejections = createRecorder<readonly [unknown]>()
+		process.on('unhandledRejection', rejections.handler)
+		try {
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createBoundaryDispatcher([]),
+					state: () => undefined,
+					host: '127.0.0.1',
+				}),
+			)
+			const port = await server.start()
+			const reply = await readBoundaryRaw(port, BOUNDARY_REFUSED_REQUEST)
+			expect(reply.idle).toBe(false)
+			await waitForDelay(10)
+			expect(rejections.calls).toEqual([])
 		} finally {
 			process.off('unhandledRejection', rejections.handler)
 		}

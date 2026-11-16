@@ -7,6 +7,7 @@ import { attempt, isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
 import {
+	buildErrorResponse,
 	clearCookie,
 	compose,
 	computeBodyETag,
@@ -57,6 +58,7 @@ import {
 } from '@src/server'
 import { buildContext } from '../../setup.js'
 import {
+	BOUNDARY_RENDER_CASES,
 	SERVER_EVENT_MESSAGES,
 	SERVER_EVENT_REFUSALS,
 	SERVER_BOM,
@@ -1347,4 +1349,17 @@ describe('discoverPort', () => {
 			await new Promise<void>((resolve) => holder.close(() => resolve()))
 		}
 	})
+})
+
+describe('buildErrorResponse', () => {
+	it.each(BOUNDARY_RENDER_CASES)(
+		'renders $label as $status without throwing',
+		async ({ build, expose, status, body }) => {
+			const rendered = attempt(() => buildErrorResponse(build(), expose))
+			expect(rendered.success).toBe(true)
+			if (!rendered.success) return
+			expect(rendered.value.status).toBe(status)
+			expect(body === null ? rendered.value.body : await rendered.value.text()).toBe(body)
+		},
+	)
 })

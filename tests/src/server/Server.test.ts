@@ -2406,6 +2406,24 @@ describe('Server — report containment', () => {
 				},
 			}),
 		},
+		{
+			label: 'returns a rejected native promise whose own then throws',
+			sink: (): Promise<void> =>
+				Object.defineProperty(Promise.reject(new Error('the reporting sink rejects')), 'then', {
+					value: () => {
+						throw new Error('the own then throws')
+					},
+				}),
+		},
+		{
+			label: 'returns a native promise whose constructor getter throws',
+			sink: (): Promise<void> =>
+				Object.defineProperty(Promise.resolve(), 'constructor', {
+					get: () => {
+						throw new Error('the constructor getter throws')
+					},
+				}),
+		},
 	])('contains a report that $label, and still sends the 500', async ({ sink }) => {
 		const rejections = createRecorder<readonly [unknown]>()
 		process.on('unhandledRejection', rejections.handler)

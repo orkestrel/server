@@ -22,7 +22,7 @@ import { CONTENT_TOO_LARGE_ERROR_BRAND, HTTP_ERROR_BRAND, SERVER_ERROR_BRAND } f
  * client-facing (it is the handler's deliberate signal), unlike a generic
  * throw whose message is hidden unless `expose` is set. A `status` the
  * `Response` constructor refuses, an integer below 200 or above 599 or a
- * status that is not an integer, renders a reported `500` instead. Subclass it (as {@link ContentTooLargeError} does) for
+ * status that is not an integer, renders `500` instead. Subclass it (as {@link ContentTooLargeError} does) for
  * specific statuses, or throw it directly. Narrow a caught value with
  * {@link isHTTPError}. The machine-readable discriminator is `status`; there is
  * no separate `code`.
