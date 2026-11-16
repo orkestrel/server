@@ -9,7 +9,7 @@
 //       {@link Connection} is the adapter-injected per-request fact
 //       slice a consumer's `state` function turns into its `TState`.
 //    2. The shared substrate's data shapes — cookies ({@link CookieOptions}),
-//       tokens ({@link TokenSecret} / {@link TokenOptions}), negotiation
+//       tokens ({@link TokenSecret} / {@link SignerInterface} / {@link TokenOptions}), negotiation
 //       ({@link AcceptEntry} / {@link Encoding} / {@link FormatHandlerMap} /
 //       {@link NegotiatorInterface}), conditional requests ({@link RangeSpec}),
 //       SSE ({@link SSEMessage} / {@link StreamOptions} / {@link
@@ -130,26 +130,71 @@ export interface Connection {
  *
  * @remarks
  * A single `string` is the lone secret. A `readonly string[]` is a rotation
- * list in `[current, ...older]` order: `signToken` always signs with the
- * first (current) secret, while `verifyToken` accepts a token signed by any
- * secret in the list — so a key rotates by prepending the fresh one and keeping
- * the old until every outstanding token has expired, with zero downtime.
+ * list in `[current, ...older]` order: the signer `createSigner` builds from it
+ * signs with the first (current) key and verifies a token signed by any key in
+ * the list — so a key rotates by building a signer with the fresh secret
+ * prepended and keeping the old until every outstanding token has expired.
+ * Every entry is non-blank; `createSigner` refuses a blank one.
  */
 export type TokenSecret = string | readonly string[]
 
 /**
+ * Represents an HMAC-SHA256 signer over the keys of one {@link TokenSecret}, held in
+ * `[current, ...older]` order.
+ *
+ * @remarks
+ * A changed secret list is another signer: build another one and hand it to
+ * every consumer, because no method rotates the keys in place.
+ *
+ * @example
+ * ```ts
+ * import { createSigner } from '@orkestrel/server'
+ *
+ * const signer = createSigner(['current-secret', 'previous-secret'])
+ * const signature = await signer.sign('payload')
+ * await signer.verify('payload', signature) // true
+ * ```
+ */
+export interface SignerInterface {
+	/**
+	 * Signs `message` with the first (current) key — the base64url HMAC-SHA256 of
+	 * its UTF-8 bytes.
+	 *
+	 * @param message - The text to sign; a lone surrogate encodes as U+FFFD
+	 * @returns The canonical base64url signature
+	 */
+	sign(message: string): Promise<string>
+	/**
+	 * Checks whether `signature` is the canonical base64url HMAC-SHA256 of
+	 * `message` under any held key, walking the keys in order and returning at
+	 * the first match.
+	 *
+	 * @param message - The signed text
+	 * @param signature - The candidate signature
+	 * @returns True if a held key signed `message` as `signature`; false otherwise
+	 *
+	 * @remarks
+	 * Answers `false` before reading a key when `signature` is not canonical
+	 * base64url or does not decode to the 32 bytes of an HMAC-SHA256. A valid
+	 * signature returns at its key's position, so its timing reveals that
+	 * position; an invalid one reads every key. The `Signer` class never rejects
+	 * for a pair of strings; a consumer implementation whose `verify` rejects
+	 * makes `verifyToken` and `readSignedCookie` reject with its error.
+	 */
+	verify(message: string, signature: string): Promise<boolean>
+}
+
+/**
  * Options for `signToken` — how a stateless, HMAC-signed token is minted.
  *
- * @param secret - The {@link TokenSecret} to sign with; `signToken` always
- *   uses the first secret (a single string, or the current head of a
- *   rotation list). An empty rotation list is a misconfiguration and throws.
+ * @param signer - The {@link SignerInterface} whose `sign` signs the payload.
  * @param ttl - An optional lifetime in milliseconds. When set, the expiry
  *   timestamp is bound into the signed payload (HMAC-covered, tamper-proof);
  *   `verifyToken` rejects the token once that instant has passed. Omitted ⇒
  *   the token never expires.
  */
 export interface TokenOptions {
-	readonly secret: TokenSecret
+	readonly signer: SignerInterface
 	readonly ttl?: number
 }
 
@@ -522,7 +567,7 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
  * Represents the machine-readable category a
  * {@link import('./errors.js').ServerError} carries — `'STATUS'` for a forbidden
  * lifecycle call, `'NEXT'` for a second `next` call or one with an argument, `'EVENT'` for an SSE field
- * the wire cannot carry.
+ * the wire cannot carry, `'SECRET'` for a malformed signer secret.
  *
  * @remarks
  * A `ServerError` reports a call the caller programmed and the substrate
@@ -538,6 +583,8 @@ export type ServerErrorCode =
 	| 'NEXT'
 	/** Identifies an SSE message field the event-stream wire cannot carry. */
 	| 'EVENT'
+	/** Identifies a signer secret that is not a string or a list of strings, is empty, or holds a blank entry. */
+	| 'SECRET'
 
 /**
  * Identifies the request a server-level fault came from — its method and its

@@ -1,12 +1,20 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { NegotiatorInterface, ServerInterface, SSEStreamInterface } from '@src/server'
+import type {
+	NegotiatorInterface,
+	ServerInterface,
+	SignerInterface,
+	SSEStreamInterface,
+} from '@src/server'
 import { createDispatcher } from '@orkestrel/router'
 import {
 	createNegotiator,
 	createServer,
+	createSigner,
 	createStream,
 	Negotiator,
 	Server,
+	ServerError,
+	Signer,
 	Stream,
 } from '@src/server'
 import { buildContext } from '../../setup.js'
@@ -123,5 +131,27 @@ describe('createStream — round-trip', () => {
 
 	it('returns SSEStreamInterface — a factory return type assertion', () => {
 		expectTypeOf(createStream()).toEqualTypeOf<SSEStreamInterface>()
+	})
+})
+
+describe('createSigner — round-trip', () => {
+	it('returns a Signer instance implementing SignerInterface', () => {
+		const signer = createSigner(['current-signing-secret', 'previous-signing-secret'])
+		expect(signer).toBeInstanceOf(Signer)
+		const check: SignerInterface = signer
+		expect(check).toBe(signer)
+	})
+
+	it('is independently usable — signs, then verifies its own signature', async () => {
+		const signer = createSigner('current-signing-secret')
+		await expect(signer.verify('payload', await signer.sign('payload'))).resolves.toBe(true)
+	})
+
+	it('propagates the construction refusal of an empty secret list', () => {
+		expect(() => createSigner([])).toThrow(ServerError)
+	})
+
+	it('returns SignerInterface — a factory return type assertion', () => {
+		expectTypeOf(createSigner('current-signing-secret')).toEqualTypeOf<SignerInterface>()
 	})
 })

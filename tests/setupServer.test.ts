@@ -1,5 +1,6 @@
 import type { LoopbackInterface } from '@orkestrel/test/server'
 import type { Duplex } from 'node:stream'
+import crypto, { createHmac } from 'node:crypto'
 import http from 'node:http'
 import net from 'node:net'
 import { readFileSync } from 'node:fs'
@@ -7,10 +8,15 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createRecorder, readProperty, requireValue, waitForCondition } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
+import { decodeBase64URL } from '@orkestrel/codec'
 import {
 	connectServerClient,
 	parseResponses,
 	subtractServerListeners,
+	buildMalformedSignatures,
+	buildMalformedTokens,
+	recordSignerCrypto,
+	SignerOutage,
 	trackLoopback,
 	createRawPeer,
 	createAnsweringPeer,
@@ -287,5 +293,50 @@ describe('subtractServerListeners', () => {
 			end: 1,
 			finish: -1,
 		})
+	})
+})
+
+describe('setupServer — signer fixtures', () => {
+	const valid = createHmac('sha256', 'fixture-secret').update('fixture').digest('base64url')
+
+	it('builds only signatures that do not decode to the 32 bytes of an HMAC-SHA256', () => {
+		const cases = buildMalformedSignatures(valid)
+		expect(decodeBase64URL(valid)?.byteLength).toBe(32)
+		expect(cases.filter(({ signature }) => decodeBase64URL(signature)?.byteLength === 32)).toEqual(
+			[],
+		)
+	})
+
+	it('builds malformed tokens over the valid token it was given', () => {
+		const cases = buildMalformedTokens(`payload.${valid}`)
+		expect(cases.map(({ token }) => token)).toContain(`payloadx.${valid}`)
+		expect(cases.map(({ token }) => token)).not.toContain(`payload.${valid}`)
+	})
+
+	it('records calls to the wrapped export while the run lasts, and restores the export after', async () => {
+		const before = crypto.createHmac
+		const { value, calls } = await recordSignerCrypto('createHmac', async () =>
+			createHmac('sha256', 'fixture-secret').update('fixture').digest('base64url'),
+		)
+		createHmac('sha256', 'outside').digest()
+		expect([value, calls.map(([algorithm, key]) => [algorithm, key])]).toEqual([
+			valid,
+			[['sha256', 'fixture-secret']],
+		])
+		expect(crypto.createHmac).toBe(before)
+	})
+
+	it('builds an outage signer whose sign resolves and whose verify rejects with the reason', async () => {
+		const outage = new SignerOutage('key service unavailable')
+		await expect(outage.sign()).resolves.toBe('signature')
+		await expect(outage.verify()).rejects.toThrow('key service unavailable')
+	})
+
+	it('restores the export when the run rejects', async () => {
+		const before = crypto.createSecretKey
+		await expect(
+			recordSignerCrypto('createSecretKey', async () => Promise.reject(new Error('run failed'))),
+		).rejects.toThrow('run failed')
+		expect(crypto.createSecretKey).toBe(before)
 	})
 })

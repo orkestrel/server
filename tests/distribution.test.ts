@@ -808,6 +808,7 @@ for (const [name, guard, brand, args] of [
 	['HTTPError', 'isHTTPError', 'HTTP_ERROR_BRAND', [404, 'missing']],
 	['ContentTooLargeError', 'isContentTooLargeError', 'CONTENT_TOO_LARGE_ERROR_BRAND', [1024]],
 	['ServerError', 'isServerError', 'SERVER_ERROR_BRAND', ['STATUS', 'refused']],
+	['ServerError', 'isServerError', 'SERVER_ERROR_BRAND', ['SECRET', 'refused']],
 ]) {
 	assert.equal(new Set(modules.map((module) => module[name])).size, modules.length)
 	for (const origin of modules) {

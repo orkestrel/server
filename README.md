@@ -2,7 +2,7 @@
 
 > A typed HTTP server for the `@orkestrel` line: a node-bound `Server` lifecycle entity
 > that composes a middleware onion around a consumed `@orkestrel/router` dispatcher,
-> beside the `HTTPError` vocabulary and a shared substrate for cookies, WebCrypto
+> beside the `HTTPError` vocabulary and a shared substrate for cookies, HMAC-signed
 > tokens, content negotiation, ETag and Range, security headers, Server-Sent Events,
 > and the body pipeline.
 

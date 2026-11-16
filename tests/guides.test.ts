@@ -51,6 +51,7 @@ await new GuideCommand({
 	const {
 		createNegotiator,
 		createServer,
+		createSigner,
 		decodeTokenPayload,
 		decompressRequestBody,
 		signToken,
@@ -254,10 +255,18 @@ await new GuideCommand({
 		})
 
 		it('the substrate fence resolves a bad token to undefined and round-trips a signed payload', async () => {
-			await expect(verifyToken('bad.token', 'secret')).resolves.toBeUndefined()
-			const token = await signToken('client', { secret: 'shh' })
+			const signer = createSigner(['current-secret', 'previous-secret'])
+			await expect(verifyToken('bad.token', signer)).resolves.toBeUndefined()
+			const token = await signToken('client', { signer })
 			const encoded = requireValue(token.split('.')[0], 'signToken emitted no payload segment')
 			expect(decodeTokenPayload(encoded)).toBe('client')
+		})
+
+		it('the SignerInterface fence verifies its own signature and refuses a malformed one', async () => {
+			const signer = createSigner(['current-secret', 'previous-secret'])
+			const signature = await signer.sign('payload')
+			await expect(signer.verify('payload', signature)).resolves.toBe(true)
+			await expect(signer.verify('payload', 'not-a-signature')).resolves.toBe(false)
 		})
 
 		it('the substrate fence decompresses its capped gzip body', async () => {
@@ -312,7 +321,14 @@ await new GuideCommand({
 				"negotiator.language('en-US, en;q=0.8, fr;q=0.5', ['en', 'fr']) // 'en'",
 			)
 			expect(guideText).toContain(
-				"await verifyToken('bad.token', 'secret') // undefined — total, never throws",
+				"const signer = createSigner(['current-secret', 'previous-secret'])",
+			)
+			expect(guideText).toContain("await signer.verify('payload', signature) // true")
+			expect(guideText).toContain(
+				"await signer.verify('payload', 'not-a-signature') // false — refused before any key is read",
+			)
+			expect(guideText).toContain(
+				"await verifyToken('bad.token', signer) // undefined — a malformed token never rejects",
 			)
 			expect(guideText).toContain(
 				"const body = await decompressRequestBody(gzipped, 'gzip', 1_048_576)",

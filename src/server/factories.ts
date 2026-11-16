@@ -2,11 +2,14 @@ import type {
 	NegotiatorInterface,
 	ServerInterface,
 	ServerOptions,
+	SignerInterface,
 	SSEStreamInterface,
 	StreamOptions,
+	TokenSecret,
 } from './types.js'
 import { Negotiator } from './Negotiator.js'
 import { Server } from './Server.js'
+import { Signer } from './Signer.js'
 import { Stream } from './Stream.js'
 
 /**
@@ -75,6 +78,28 @@ export function createNegotiator(): NegotiatorInterface {
  */
 export function createServer<TState>(options: ServerOptions<TState>): ServerInterface<TState> {
 	return new Server(options)
+}
+
+/**
+ * Creates a {@link SignerInterface} that holds one HMAC-SHA256 key per secret, each
+ * created at this call.
+ *
+ * @param secret - A secret, or a `[current, ...older]` rotation list; see {@link TokenSecret}
+ * @returns A {@link SignerInterface} whose first key signs and whose every key verifies
+ * @throws {ServerError} `'SECRET'` when `secret` is not a string or a list of strings,
+ *   when the list is empty, or when any entry is blank
+ *
+ * @example
+ * ```ts
+ * import { createSigner, signToken, verifyToken } from '@orkestrel/server'
+ *
+ * const signer = createSigner(['current-secret', 'previous-secret'])
+ * const token = await signToken('session-7f3a', { signer, ttl: 60_000 })
+ * await verifyToken(token, signer) // 'session-7f3a'
+ * ```
+ */
+export function createSigner(secret: TokenSecret): SignerInterface {
+	return new Signer(secret)
 }
 
 /**

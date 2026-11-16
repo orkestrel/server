@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { ServerErrorCode } from '@src/server'
 import {
 	ContentTooLargeError,
 	HTTPError,
@@ -136,6 +137,19 @@ describe('ServerError', () => {
 describe('isServerError', () => {
 	it('narrows a ServerError', () => {
 		expect(isServerError(new ServerError('STATUS', 'refused'))).toBe(true)
+	})
+
+	it.each<ServerErrorCode>(['STATUS', 'NEXT', 'EVENT', 'SECRET'])(
+		'narrows a ServerError coded %s',
+		(code) => {
+			expect(isServerError(new ServerError(code, 'refused'))).toBe(true)
+		},
+	)
+
+	it('rejects a branded ServerError whose code is not declared', () => {
+		const error = new ServerError('STATUS', 'refused')
+		Object.defineProperty(error, 'code', { value: 'TOKEN' })
+		expect(isServerError(error)).toBe(false)
 	})
 
 	it('rejects a generic Error and an HTTPError', () => {
