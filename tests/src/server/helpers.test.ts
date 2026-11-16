@@ -3,7 +3,9 @@ import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
 import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
+import { attempt, isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
+import { createSSEParser } from '@orkestrel/sse'
 import {
 	clearCookie,
 	compose,
@@ -12,9 +14,11 @@ import {
 	computeCodingQuality,
 	computeIPv6Network,
 	computeLanguageQuality,
+	compareDigits,
 	ContentTooLargeError,
 	decodeCookieValue,
 	decompressRequestBody,
+	DEFAULT_BODY_LIMIT,
 	discoverPort,
 	HTTPError,
 	isCompressibleType,
@@ -39,17 +43,36 @@ import {
 	resolveSecure,
 	resolveSecurityHeader,
 	scrubPrototype,
+	serializeComment,
 	serializeCookie,
 	serializeEvent,
+	ServerError,
 	signToken,
+	stripOWS,
 	unwrapETag,
 	verifyToken,
 	writeSignedCookie,
 } from '@src/server'
 import { buildContext } from '../../setup.js'
 import {
+	SERVER_EVENT_MESSAGES,
+	SERVER_EVENT_REFUSALS,
+	SERVER_BOM,
+	SERVER_GROWTH_BOUND,
+	SERVER_GROWTH_SIZE,
+	SERVER_NBSP,
+	SERVER_RANGE_SHAPES,
+	SERVER_WIDE_SPACE,
+	SERVER_PROTOTYPE_NAMES,
+	SERVER_RANGE_ADMITTED,
+	SERVER_RANGE_REFUSED,
 	ServerObservation,
 	ServerUserState,
+	buildServerCycle,
+	buildServerRangePopulation,
+	buildServerRangeWalk,
+	measureServerGrowth,
+	recognizeServerRange,
 	compressServerFixture,
 	createTraceLayer,
 	repeatServerNext,
@@ -235,6 +258,25 @@ describe('parseCookies', () => {
 	it('a later duplicate name wins', () => {
 		expect(parseCookies('a=1; a=2')).toEqual({ a: '2' })
 	})
+
+	it('covers every own property name of Object.prototype in its prototype table', () => {
+		expect([...SERVER_PROTOTYPE_NAMES].sort()).toEqual(
+			Object.getOwnPropertyNames(Object.prototype).sort(),
+		)
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)('reads a cookie named %s as an ordinary own cookie', (name) => {
+		const cookies = parseCookies(`session=abc; ${name}=value`)
+		expect(Object.getPrototypeOf(cookies)).toBeNull()
+		expect(Object.entries(cookies)).toEqual([
+			['session', 'abc'],
+			[name, 'value'],
+		])
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)('reads an absent %s as no cookie', (name) => {
+		expect(parseCookies('session=abc')[name]).toBeUndefined()
+	})
 })
 
 describe('isCookieName', () => {
@@ -343,6 +385,22 @@ describe('writeSignedCookie / readSignedCookie', () => {
 	it('an absent cookie reads as undefined', async () => {
 		const request = new Request('http://localhost/')
 		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBeUndefined()
+	})
+
+	it.each(SERVER_PROTOTYPE_NAMES)(
+		'resolves an absent cookie named %s to undefined without throwing',
+		async (name) => {
+			const request = new Request('http://localhost/', { headers: { cookie: 'session=abc' } })
+			await expect(readSignedCookie(request, name, 'shh')).resolves.toBeUndefined()
+		},
+	)
+
+	it.each(SERVER_PROTOTYPE_NAMES)('round-trips a signed cookie named %s', async (name) => {
+		const headers = new Headers()
+		await writeSignedCookie(headers, name, 'user-1', 'shh')
+		const nameValue = (headers.get('set-cookie') ?? '').split(';')[0] ?? ''
+		const request = new Request('http://localhost/', { headers: { cookie: nameValue } })
+		await expect(readSignedCookie(request, name, 'shh')).resolves.toBe('user-1')
 	})
 
 	it('emits the requested attributes onto the Set-Cookie header, not just the value round-trip', async () => {
@@ -670,6 +728,110 @@ describe('parseRange', () => {
 		expect(parseRange('bytes=abc-def', 1000)).toBeUndefined()
 		expect(parseRange('items=0-1', 1000)).toBeUndefined()
 	})
+
+	it.each(SERVER_RANGE_ADMITTED)('admits the grammar member $header', ({ header, expected }) => {
+		expect(parseRange(header, 1000)).toEqual(expected)
+	})
+
+	it.each(SERVER_RANGE_REFUSED)('ignores the non-member $header', ({ header }) => {
+		expect(parseRange(header, 1000)).toBeUndefined()
+	})
+
+	it('ignores a non-zero suffix range on an empty resource and refuses only a zero suffix there', () => {
+		expect(parseRange('bytes=-5', 0)).toBeUndefined()
+		expect(parseRange('bytes=-0', 0)).toEqual({ satisfiable: false })
+		expect(parseRange('bytes=0-', 0)).toEqual({ satisfiable: false })
+	})
+
+	it.each(SERVER_RANGE_SHAPES)(
+		'grows linearly on a run of spaces between $before and $after',
+		({ before, after }) => {
+			const growth = measureServerGrowth(
+				(size) => () => parseRange(`${before}${' '.repeat(size)}${after}`, 10),
+				SERVER_GROWTH_SIZE,
+			)
+			expect(growth).toBeLessThan(SERVER_GROWTH_BOUND)
+		},
+	)
+
+	it('answers a size that is not a non-negative safe integer with undefined', () => {
+		expect(parseRange('bytes=0-1', 1.5)).toBeUndefined()
+		expect(parseRange('bytes=0-1', -1)).toBeUndefined()
+		expect(parseRange('bytes=0-1', Number.NaN)).toBeUndefined()
+	})
+
+	it('has a reference recognizer that gives every declared table row its declared answer', () => {
+		const rows = [...SERVER_RANGE_ADMITTED, ...SERVER_RANGE_REFUSED]
+		expect(rows.map(({ header }) => recognizeServerRange(header, 1000))).toEqual(
+			rows.map(({ expected }) => expected),
+		)
+	})
+
+	it('agrees with the reference recognizer on every pair of the exhaustive walk', () => {
+		const walk = buildServerRangeWalk()
+		expect(walk.length).toBe(52_484)
+		const answers = walk.map(({ header, size }) => recognizeServerRange(header, size))
+		expect(
+			new Set(answers.map((answer) => (answer === undefined ? 'ignored' : answer.satisfiable))),
+		).toEqual(new Set(['ignored', true, false]))
+		const disagreements = walk.filter(
+			({ header, size }, index) =>
+				JSON.stringify(parseRange(header, size)) !== JSON.stringify(answers[index]),
+		)
+		expect(disagreements).toEqual([])
+	})
+
+	it('agrees with the reference recognizer on a seeded population of members and near misses', () => {
+		const population = buildServerRangePopulation(0x5eed4, 20_000)
+		const answers = population.map(({ header, size }) => recognizeServerRange(header, size))
+		expect(
+			new Set(answers.map((answer) => (answer === undefined ? 'ignored' : answer.satisfiable))),
+		).toEqual(new Set(['ignored', true, false]))
+		const disagreements = population.filter(
+			({ header, size }, index) =>
+				JSON.stringify(parseRange(header, size)) !== JSON.stringify(answers[index]),
+		)
+		expect(disagreements).toEqual([])
+	})
+})
+
+describe('stripOWS', () => {
+	it('strips spaces and tabs from both ends and keeps them inside', () => {
+		expect(stripOWS(' \tbytes=0-1 \t')).toBe('bytes=0-1')
+		expect(stripOWS('5 -9')).toBe('5 -9')
+		expect(stripOWS(' \t ')).toBe('')
+		expect(stripOWS('')).toBe('')
+	})
+
+	it('keeps a Unicode space that is not OWS, unlike trim', () => {
+		const text = `${SERVER_NBSP}0-1${SERVER_WIDE_SPACE}`
+		expect(stripOWS(` ${text} `)).toBe(text)
+		expect(stripOWS(`${SERVER_BOM}0-1`)).toBe(`${SERVER_BOM}0-1`)
+	})
+
+	it('grows linearly on a run of spaces before another character', () => {
+		const growth = measureServerGrowth(
+			(size) => () => stripOWS(`a${' '.repeat(size)}x`),
+			SERVER_GROWTH_SIZE,
+		)
+		expect(growth).toBeLessThan(SERVER_GROWTH_BOUND)
+	})
+})
+
+describe('compareDigits', () => {
+	it('orders decimal digit strings by value, leading zeros included', () => {
+		expect(compareDigits('9', '10')).toBe(-1)
+		expect(compareDigits('10', '9')).toBe(1)
+		expect(compareDigits('007', '7')).toBe(0)
+		expect(compareDigits('0', '000')).toBe(0)
+		expect(compareDigits('123', '124')).toBe(-1)
+	})
+
+	it('orders digit strings past the safe-integer range exactly', () => {
+		expect(compareDigits('9'.repeat(400), '9'.repeat(399))).toBe(1)
+		expect(compareDigits('9007199254740993', '9007199254740992')).toBe(1)
+		expect(compareDigits(`${'0'.repeat(400)}5`, '5')).toBe(0)
+	})
 })
 
 // ── Security primitives ─────────────────────────────────────────────────────────
@@ -789,6 +951,55 @@ describe('serializeEvent', () => {
 		expect(wire).toBe('data: a\ndata: b\n\n')
 		expect(wire).not.toContain('\r')
 	})
+
+	it.each(SERVER_EVENT_REFUSALS)(
+		'refuses refusal row %# on its $field field',
+		({ message, field }) => {
+			expect(() => serializeEvent(message)).toThrow(ServerError)
+			expect(() => serializeEvent(message)).toThrow(
+				expect.objectContaining({ code: 'EVENT', context: { field } }),
+			)
+		},
+	)
+
+	it.each(SERVER_EVENT_REFUSALS)(
+		'narrows the refusal of row %# with isServerError to code EVENT',
+		({ message }) => {
+			const outcome = attempt(() => serializeEvent(message))
+			expect(outcome.success ? undefined : isServerError(outcome.error) && outcome.error.code).toBe(
+				'EVENT',
+			)
+		},
+	)
+
+	it.each(SERVER_EVENT_MESSAGES)(
+		'reads admitted message %# back unchanged through a conforming parser',
+		(message) => {
+			expect(createSSEParser().parse(serializeEvent(message))).toEqual([message])
+		},
+	)
+
+	it('reads CRLF and CR line breaks in data back as LF, the SSE data join', () => {
+		expect(createSSEParser().parse(serializeEvent({ data: 'a\r\nb\rc' }))).toEqual([
+			{ data: 'a\nb\nc' },
+		])
+	})
+})
+
+describe('serializeComment', () => {
+	it('writes one comment line for single-line text', () => {
+		expect(serializeComment('keep-alive')).toBe(': keep-alive\n\n')
+	})
+
+	it('writes one comment line per line, so a parser reads no field and no event', () => {
+		const wire = serializeComment('keep-alive\n\ndata: forged\r\nid: 1\revent: x')
+		expect(wire).toBe(': keep-alive\n: \n: data: forged\n: id: 1\n: event: x\n\n')
+		expect(createSSEParser().parse(wire)).toEqual([])
+	})
+
+	it('writes an empty comment line for empty text', () => {
+		expect(serializeComment('')).toBe(': \n\n')
+	})
 })
 
 // ── Prototype-pollution scrub ────────────────────────────────────────────────────
@@ -818,6 +1029,13 @@ describe('isDangerousKey / scrubPrototype', () => {
 		expect(scrubPrototype(null)).toBeNull()
 		expect(scrubPrototype({ a: 1, b: [1, 2] })).toEqual({ a: 1, b: [1, 2] })
 	})
+
+	it('reads a node reached twice once, so a self-referencing value terminates', () => {
+		const reads = new ServerObservation(0)
+		const cycle = buildServerCycle(1_000, reads)
+		expect(scrubPrototype(cycle)).toBe(cycle)
+		expect(reads.value).toBe(1)
+	})
 })
 
 // ── Body pipeline (readBody) ───────────────────────────────────────────────────
@@ -844,6 +1062,85 @@ describe('readBody', () => {
 			body: 'hello world',
 		})
 		await expect(readBody(request)).resolves.toBe('hello world')
+	})
+
+	it('decodes a JSON array nested as deep as the default byte limit without overflowing the stack', async () => {
+		const depth = DEFAULT_BODY_LIMIT / 2
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'['.repeat(depth)}${']'.repeat(depth)}`,
+		})
+		const value = await readBody(request)
+		const innermost = Array.from({ length: depth - 1 }).reduce<unknown>(
+			(node) => (isArray(node) ? node[0] : undefined),
+			value,
+		)
+		expect(innermost).toEqual([])
+	})
+
+	it('scrubs a dangerous key at the deepest level of a JSON body as deep as the byte limit', async () => {
+		const leaf = '{"__proto__":{"polluted":true},"leaf":true}'
+		const depth = Math.floor((DEFAULT_BODY_LIMIT - leaf.length) / 6)
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'{"a":'.repeat(depth)}${leaf}${'}'.repeat(depth)}`,
+		})
+		const value = await readBody(request)
+		const innermost = Array.from({ length: depth }).reduce<unknown>(
+			(node) => (isRecord(node) ? node['a'] : undefined),
+			value,
+		)
+		expect(isRecord(innermost) ? Object.keys(innermost) : undefined).toEqual(['leaf'])
+	})
+
+	it('refuses a nested JSON body one level past the byte limit with a 413', async () => {
+		const depth = DEFAULT_BODY_LIMIT / 2 + 1
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: `${'['.repeat(depth)}${']'.repeat(depth)}`,
+		})
+		await expect(readBody(request)).rejects.toThrow(ContentTooLargeError)
+	})
+
+	it('decodes an application/x-www-form-urlencoded body to a scrubbed record', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'name=Ada+Lovelace&note=fish%20%26%20chips&__proto__=x&constructor=y&prototype=z',
+		})
+		const value = await readBody(request)
+		expect(value).toEqual({ name: 'Ada Lovelace', note: 'fish & chips' })
+		expect(isRecord(value) ? Object.keys(value) : undefined).toEqual(['name', 'note'])
+	})
+
+	it('reads the urlencoded media type case-insensitively and past its parameters', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'Application/X-WWW-Form-URLEncoded; charset=UTF-8' },
+			body: 'city=Z%C3%BCrich',
+		})
+		await expect(readBody(request)).resolves.toEqual({ city: 'Zürich' })
+	})
+
+	it('keeps the last value of a repeated urlencoded field', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded' },
+			body: 'role=viewer&role=editor',
+		})
+		await expect(readBody(request)).resolves.toEqual({ role: 'editor' })
+	})
+
+	it('decodes a multipart/form-data body as text', async () => {
+		const request = new Request('http://localhost/', {
+			method: 'POST',
+			headers: { 'content-type': 'multipart/form-data; boundary=fence' },
+			body: 'name=Ada',
+		})
+		await expect(readBody(request)).resolves.toBe('name=Ada')
 	})
 
 	it('resolves malformed application/json to undefined instead of throwing', async () => {

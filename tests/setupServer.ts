@@ -5,14 +5,18 @@ import { stripTypeScriptTypes } from 'node:module'
 import type { Duplex } from 'node:stream'
 import type { LoopbackInterface } from '@orkestrel/test/server'
 import type { RecorderInterface } from '@orkestrel/test'
+import type { RandomFunction } from '@orkestrel/contract'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
 	MiddlewareContext,
 	MiddlewareHandler,
 	NextFunction,
+	RangeSpec,
 	ServerInterface,
+	SSEMessage,
 } from '@src/server'
 import type { IncomingMessage } from 'node:http'
+import { seededRandom } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import http from 'node:http'
 import net from 'node:net'
@@ -133,6 +137,494 @@ export async function compressServerFixture(text: string): Promise<Uint8Array<Ar
 	return new Uint8Array(
 		await new Response(source.pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
 	)
+}
+
+/** Lists the own property names of `Object.prototype` that a cookie name can spell. */
+export const SERVER_PROTOTYPE_NAMES: readonly string[] = Object.freeze([
+	'__defineGetter__',
+	'__defineSetter__',
+	'__lookupGetter__',
+	'__lookupSetter__',
+	'__proto__',
+	'constructor',
+	'hasOwnProperty',
+	'isPrototypeOf',
+	'propertyIsEnumerable',
+	'toLocaleString',
+	'toString',
+	'valueOf',
+])
+
+/** Holds U+00A0, the no-break space, a space outside OWS. */
+export const SERVER_NBSP = String.fromCharCode(0x00a0)
+
+/** Holds U+FEFF, the byte-order mark, a space outside OWS. */
+export const SERVER_BOM = String.fromCharCode(0xfeff)
+
+/** Holds U+3000, the ideographic space, a space outside OWS. */
+export const SERVER_WIDE_SPACE = String.fromCharCode(0x3000)
+
+/** Describes one `parseRange` row: a header against a 1000-byte resource and its answer. */
+export interface ServerRangeCase {
+	readonly header: string
+	readonly expected: RangeSpec | undefined
+}
+
+/** Lists `Range` headers whose bounds are `1*DIGIT`, the language `parseRange` admits. */
+export const SERVER_RANGE_ADMITTED: readonly ServerRangeCase[] = Object.freeze([
+	{ header: 'bytes=0-99', expected: { satisfiable: true, start: 0, end: 99 } },
+	{ header: 'bytes=0-0', expected: { satisfiable: true, start: 0, end: 0 } },
+	{ header: 'bytes=500-', expected: { satisfiable: true, start: 500, end: 999 } },
+	{ header: 'bytes=-100', expected: { satisfiable: true, start: 900, end: 999 } },
+	{ header: 'bytes=-5000', expected: { satisfiable: true, start: 0, end: 999 } },
+	{ header: 'bytes=007-009', expected: { satisfiable: true, start: 7, end: 9 } },
+	{ header: 'bytes=10-99999999999999999999', expected: { satisfiable: true, start: 10, end: 999 } },
+	{ header: 'bytes=99999999999999999999-', expected: { satisfiable: false } },
+	{ header: 'bytes=1000-', expected: { satisfiable: false } },
+	{ header: ' bytes= 5-9 ', expected: { satisfiable: true, start: 5, end: 9 } },
+	{ header: '\tbytes=\t5-9\t', expected: { satisfiable: true, start: 5, end: 9 } },
+	{ header: 'Bytes=0-1', expected: { satisfiable: true, start: 0, end: 1 } },
+	{ header: 'BYTES=0-1', expected: { satisfiable: true, start: 0, end: 1 } },
+	{ header: 'bytes=0-1,', expected: { satisfiable: true, start: 0, end: 1 } },
+	{ header: 'bytes=,0-1', expected: { satisfiable: true, start: 0, end: 1 } },
+	{ header: 'bytes=0-1 , ,', expected: { satisfiable: true, start: 0, end: 1 } },
+	{ header: 'bytes=-0', expected: { satisfiable: false } },
+	{ header: `bytes=${'9'.repeat(400)}-`, expected: { satisfiable: false } },
+	{ header: `bytes=0-${'9'.repeat(400)}`, expected: { satisfiable: true, start: 0, end: 999 } },
+	{ header: `bytes=-${'9'.repeat(400)}`, expected: { satisfiable: true, start: 0, end: 999 } },
+	{ header: `bytes=${'0'.repeat(400)}5-9`, expected: { satisfiable: true, start: 5, end: 9 } },
+])
+
+/** Lists `Range` headers outside the RFC 9110 § 14.1 grammar, which `parseRange` ignores. */
+export const SERVER_RANGE_REFUSED: readonly ServerRangeCase[] = Object.freeze([
+	{ header: 'bytes=2000-0x10', expected: undefined },
+	{ header: 'bytes=2000-garbage', expected: undefined },
+	{ header: 'bytes=1000-+5', expected: undefined },
+	{ header: 'bytes=2000-1000', expected: undefined },
+	{ header: `bytes=${'9'.repeat(400)}-${'9'.repeat(399)}`, expected: undefined },
+	{ header: 'bytes=5 -9', expected: undefined },
+	{ header: 'bytes=5- 9', expected: undefined },
+	{ header: ' bytes= 5 - 9 ', expected: undefined },
+	{ header: `bytes=${SERVER_NBSP}5-9`, expected: undefined },
+	{ header: `bytes=5-9${SERVER_BOM}`, expected: undefined },
+	{ header: `bytes=5${SERVER_WIDE_SPACE}-9`, expected: undefined },
+	{ header: `${SERVER_NBSP}bytes=0-1`, expected: undefined },
+	{ header: `${SERVER_BOM}bytes=0-1`, expected: undefined },
+	{ header: `bytes=0-1${SERVER_WIDE_SPACE}`, expected: undefined },
+	{ header: 'bytes =0-1', expected: undefined },
+	{ header: 'bytes=0-1 0-2', expected: undefined },
+	{ header: 'bytes=', expected: undefined },
+	{ header: 'bytes=,', expected: undefined },
+	{ header: 'bytes=0-1,2-3', expected: undefined },
+	{ header: 'bytes=0-1-2', expected: undefined },
+	{ header: 'bytes=garbage', expected: undefined },
+	{ header: 'bytes=0x10-', expected: undefined },
+	{ header: 'bytes=0X10-', expected: undefined },
+	{ header: 'bytes=0b11-9', expected: undefined },
+	{ header: 'bytes=0o7-9', expected: undefined },
+	{ header: 'bytes=1e1-', expected: undefined },
+	{ header: 'bytes=1E1-20', expected: undefined },
+	{ header: 'bytes=+5-', expected: undefined },
+	{ header: 'bytes=+5-9', expected: undefined },
+	{ header: 'bytes=1.0-9', expected: undefined },
+	{ header: 'bytes=5.-9', expected: undefined },
+	{ header: 'bytes=.5-9', expected: undefined },
+	{ header: 'bytes=5-1e1', expected: undefined },
+	{ header: 'bytes=5-0x10', expected: undefined },
+	{ header: 'bytes=5-+9', expected: undefined },
+	{ header: 'bytes=5-9.0', expected: undefined },
+	{ header: 'bytes=-0x10', expected: undefined },
+	{ header: 'bytes=-1e1', expected: undefined },
+	{ header: 'bytes=-+5', expected: undefined },
+	{ header: 'bytes=-5.0', expected: undefined },
+	{ header: 'bytes=Infinity-', expected: undefined },
+	{ header: 'bytes=5-Infinity', expected: undefined },
+	{ header: 'bytes=1_0-', expected: undefined },
+	{ header: 'bytes=١-', expected: undefined },
+	{ header: 'bytes=５-', expected: undefined },
+])
+
+/** Holds the `tchar` characters of RFC 9110 § 5.6.2, which a range unit is made of. */
+export const SERVER_TCHAR =
+	"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+/** Names the place a reference scan has reached in the `Range` field grammar. */
+export type ServerRangePhase =
+	| 'lead'
+	| 'unit'
+	| 'space'
+	| 'element'
+	| 'tail'
+	| 'separator'
+	| 'reject'
+
+/**
+ * Describes a reference scan of a `Range` field value: its phase, the span of its unit, the
+ * start of the element it is reading, and the spans of the list elements it has closed.
+ */
+export interface ServerRangeScan {
+	readonly phase: ServerRangePhase
+	readonly unit: readonly [number, number]
+	readonly start: number
+	readonly elements: ReadonlyArray<readonly [number, number]>
+}
+
+/** Describes one `parseRange` input: a header and a resource size. */
+export interface ServerRangeProbe {
+	readonly header: string
+	readonly size: number
+}
+
+/**
+ * Advances a reference scan of the `Range` field value by one character, written from the
+ * RFC 9110 ABNF: `OWS range-unit "=" OWS range-set OWS`, where `range-set` is `1#range-spec`
+ * under the § 5.6.1 recipient list rule and a `range-spec` is a run of VCHAR other than `,`.
+ *
+ * @param scan - The scan so far
+ * @param char - The next UTF-16 code unit
+ * @param index - The position of `char` in the field value
+ * @returns The advanced scan
+ */
+export function stepServerRange(
+	scan: ServerRangeScan,
+	char: string,
+	index: number,
+): ServerRangeScan {
+	const space = char === ' ' || char === '\t'
+	const code = char.charCodeAt(0)
+	const visible = code >= 0x21 && code <= 0x7e && char !== ','
+	const token = SERVER_TCHAR.includes(char)
+	switch (scan.phase) {
+		case 'lead':
+			if (space) return scan
+			return token
+				? { ...scan, phase: 'unit', unit: [index, index + 1] }
+				: { ...scan, phase: 'reject' }
+		case 'unit':
+			if (char === '=') return { ...scan, phase: 'space' }
+			return token ? { ...scan, unit: [scan.unit[0], index + 1] } : { ...scan, phase: 'reject' }
+		case 'space':
+			if (space) return scan
+			if (char === ',') return { ...scan, phase: 'separator' }
+			return visible ? { ...scan, phase: 'element', start: index } : { ...scan, phase: 'reject' }
+		case 'element':
+			if (space)
+				return { ...scan, phase: 'tail', elements: [...scan.elements, [scan.start, index]] }
+			if (char === ',') {
+				return { ...scan, phase: 'separator', elements: [...scan.elements, [scan.start, index]] }
+			}
+			return visible ? scan : { ...scan, phase: 'reject' }
+		case 'tail':
+			if (space) return scan
+			return char === ',' ? { ...scan, phase: 'separator' } : { ...scan, phase: 'reject' }
+		case 'separator':
+			if (space || char === ',') return scan
+			return visible ? { ...scan, phase: 'element', start: index } : { ...scan, phase: 'reject' }
+		case 'reject':
+			return scan
+	}
+}
+
+/**
+ * Checks whether text is `1*DIGIT`, one ASCII digit or more, by its characters.
+ *
+ * @param text - The candidate bound
+ * @returns True if every character is `0` through `9` and there is one at least; false otherwise
+ */
+export function isServerDigits(text: string): boolean {
+	return text.length > 0 && text.split('').every((char) => char >= '0' && char <= '9')
+}
+
+/**
+ * Recognizes a `Range` field value against a resource size, the reference oracle for
+ * `parseRange`: a character scan of the RFC 9110 § 14.1 grammar, with every bound compared
+ * as a `BigInt`.
+ *
+ * @param header - The `Range` field value
+ * @param size - The resource's length in bytes
+ * @returns The answer RFC 9110 § 14.1.2 and § 14.2 give for one byte range, or `undefined`
+ *   when the field is ignored: outside the grammar, another unit, more than one range, an
+ *   invalid range, or a size that is not a non-negative safe integer
+ */
+export function recognizeServerRange(header: string, size: number): RangeSpec | undefined {
+	if (!Number.isSafeInteger(size) || size < 0) return undefined
+	const initial: ServerRangeScan = { phase: 'lead', unit: [0, 0], start: 0, elements: [] }
+	const scan = header
+		.split('')
+		.reduce<ServerRangeScan>((state, char, index) => stepServerRange(state, char, index), initial)
+	const closed = scan.phase === 'element' || scan.phase === 'tail' || scan.phase === 'separator'
+	const open: readonly [number, number] = [scan.start, header.length]
+	const spans = scan.phase === 'element' ? [...scan.elements, open] : scan.elements
+	if (!closed || spans.length !== 1) return undefined
+	if (header.slice(scan.unit[0], scan.unit[1]).toLowerCase() !== 'bytes') return undefined
+	const parts = header.slice(spans[0]?.[0], spans[0]?.[1]).split('-')
+	if (parts.length !== 2) return undefined
+	const [first = '', last = ''] = parts
+	const extent = BigInt(size)
+	if (first === '') {
+		if (!isServerDigits(last)) return undefined
+		const suffix = BigInt(last)
+		// § 14.1.2: a non-zero suffix on an empty representation selects no window, so § 14.2's ignore applies.
+		if (suffix === 0n) return { satisfiable: false }
+		if (extent === 0n) return undefined
+		return {
+			satisfiable: true,
+			start: suffix >= extent ? 0 : Number(extent - suffix),
+			end: size - 1,
+		}
+	}
+	if (!isServerDigits(first) || (last !== '' && !isServerDigits(last))) return undefined
+	const start = BigInt(first)
+	if (last !== '' && BigInt(last) < start) return undefined
+	if (start >= extent) return { satisfiable: false }
+	const end = last === '' || BigInt(last) >= extent ? size - 1 : Number(BigInt(last))
+	return { satisfiable: true, start: Number(start), end }
+}
+
+/**
+ * Lists every string of one length over an alphabet, in counting order.
+ *
+ * @param alphabet - The characters to draw from
+ * @param length - The length of each string
+ * @returns Every one of the `alphabet.length ** length` strings
+ */
+export function listServerStrings(alphabet: readonly string[], length: number): readonly string[] {
+	return Array.from({ length: alphabet.length ** length }, (_, count) =>
+		Array.from(
+			{ length },
+			(__, place) => alphabet[Math.floor(count / alphabet.length ** place) % alphabet.length],
+		).join(''),
+	)
+}
+
+/** Holds the characters the exhaustive `Range` walk builds its range sets from. */
+export const SERVER_RANGE_WALK_ALPHABET: readonly string[] = Object.freeze([
+	'0',
+	'1',
+	'9',
+	'-',
+	',',
+	' ',
+	'\t',
+	'x',
+	'+',
+])
+
+/** Holds the field prefixes the exhaustive `Range` walk puts before its short range sets. */
+export const SERVER_RANGE_WALK_PREFIXES: readonly string[] = Object.freeze([
+	'bytes=',
+	'Bytes=',
+	'BYTES=',
+	' bytes=',
+	'bytes= ',
+	'bytes =',
+	'byte=',
+	'items=',
+])
+
+/** Holds the resource sizes the exhaustive `Range` walk pairs with every header. */
+export const SERVER_RANGE_WALK_SIZES: readonly number[] = Object.freeze([0, 1, 2, 10])
+
+/**
+ * Builds the exhaustive `Range` walk: every prefix before every range set of up to 3 walk
+ * characters, `bytes=` before every range set of exactly 4, each paired with every walk size.
+ *
+ * @returns The header and size pairs, 52,484 of them
+ */
+export function buildServerRangeWalk(): readonly ServerRangeProbe[] {
+	const short = [0, 1, 2, 3].flatMap((length) =>
+		listServerStrings(SERVER_RANGE_WALK_ALPHABET, length),
+	)
+	const headers = [
+		...SERVER_RANGE_WALK_PREFIXES.flatMap((prefix) => short.map((set) => `${prefix}${set}`)),
+		...listServerStrings(SERVER_RANGE_WALK_ALPHABET, 4).map((set) => `bytes=${set}`),
+	]
+	return headers.flatMap((header) => SERVER_RANGE_WALK_SIZES.map((size) => ({ header, size })))
+}
+
+/** Holds the parts the seeded `Range` population assembles headers from. */
+export const SERVER_RANGE_PARTS = Object.freeze({
+	ends: Object.freeze(['', '', ' ', '\t', SERVER_NBSP, SERVER_BOM, SERVER_WIDE_SPACE]),
+	units: Object.freeze(['bytes', 'bytes', 'Bytes', 'BYTES', 'bYtEs', 'items', 'byte', 'by tes']),
+	equals: Object.freeze(['=', '=', '= ', '=\t', ' =', `=${SERVER_NBSP}`]),
+	bounds: Object.freeze([
+		'',
+		'0',
+		'5',
+		'9',
+		'10',
+		'999',
+		'1000',
+		'007',
+		'9'.repeat(400),
+		`${'0'.repeat(400)}5`,
+		'0x10',
+		'1e1',
+		'+5',
+		'1.0',
+		'5.',
+		'.5',
+		'1_0',
+		'١',
+		'５',
+		'Infinity',
+		'garbage',
+		' 5',
+		'5 ',
+	]),
+	dashes: Object.freeze(['-', '-', '-', ' -', '- ', '--', '']),
+	joins: Object.freeze([',', ', ', ' , ', ',,', ' ']),
+	sizes: Object.freeze([0, 1, 10, 1000, Number.MAX_SAFE_INTEGER, 1.5, -1]),
+})
+
+/**
+ * Bounds the growth ratio t(4n)/t(n) that a linear call may show in a cost row. On 2026-11-16, at
+ * n = 4,000 with the host's load average near 1.1, 30 solo readings per shape of the base
+ * `parseRange` (`2eb2876`, linear) read 0.91 to 4.36, and the quadratic `parseRange` of
+ * `c90ecec` read 15.93 to 18.28; 8 sits near twice the linear maximum and half the quadratic
+ * minimum.
+ */
+export const SERVER_GROWTH_BOUND = 8
+
+/** Holds the run length n at which a cost row reads t(n), and 4n for t(4n). */
+export const SERVER_GROWTH_SIZE = 4_000
+
+/** Describes one cost-row header: the text before and after a run of spaces of size n. */
+export interface ServerRangeShape {
+	readonly before: string
+	readonly after: string
+}
+
+/** Lists the `Range` header shapes a review found quadratic: a run of spaces inside the field. */
+export const SERVER_RANGE_SHAPES: readonly ServerRangeShape[] = Object.freeze([
+	{ before: 'bytes=0', after: 'x' },
+	{ before: 'bytes', after: 'x=0-1' },
+	{ before: 'bytes=0-1', after: 'x,' },
+])
+
+/**
+ * Times `call` over `repeat` runs, the least of 5 batches, in milliseconds.
+ *
+ * @param call - The call to time
+ * @param repeat - The number of runs in one batch
+ * @returns The duration of the fastest batch
+ */
+export function timeServerBatch(call: () => unknown, repeat: number): number {
+	return Math.min(
+		...Array.from({ length: 5 }, () => {
+			const start = performance.now()
+			Array.from({ length: repeat }, () => call())
+			return performance.now() - start
+		}),
+	)
+}
+
+/**
+ * Measures how a call's cost grows from size n to 4n: the batch time at 4n over the batch time
+ * at n, each the least of 5 batches, with the batch sized so it takes 20 ms or more at n.
+ *
+ * @param build - Builds the call to time for one size
+ * @param size - The size n
+ * @returns t(4n)/t(n), near 4 for a linear call and near 16 for a quadratic one
+ */
+export function measureServerGrowth(build: (size: number) => () => unknown, size: number): number {
+	const small = build(size)
+	const large = build(4 * size)
+	small()
+	large()
+	const repeat = Math.max(1, Math.ceil(20 / Math.max(timeServerBatch(small, 1), 0.001)))
+	return timeServerBatch(large, repeat) / timeServerBatch(small, repeat)
+}
+
+/**
+ * Picks one member of a list with a seeded random source.
+ *
+ * @param random - The seeded source
+ * @param list - The list to pick from, which must not be empty
+ * @returns The picked member
+ */
+export function pickServer<T>(random: RandomFunction, list: readonly T[]): T {
+	const member = list[Math.floor(random() * list.length)]
+	if (member === undefined) throw new Error('pickServer needs a non-empty list')
+	return member
+}
+
+/**
+ * Builds a seeded `Range` population of grammar members and near misses from
+ * {@link SERVER_RANGE_PARTS}, most headers holding one range and some holding two or three.
+ *
+ * @param seed - The seed of the random source
+ * @param count - The number of header and size pairs
+ * @returns The pairs, the same for the same seed and count
+ */
+export function buildServerRangePopulation(
+	seed: number,
+	count: number,
+): readonly ServerRangeProbe[] {
+	const random = seededRandom(seed)
+	return Array.from({ length: count }, () => {
+		const ranges = Array.from(
+			{ length: pickServer(random, [1, 1, 1, 1, 2, 3]) },
+			() =>
+				`${pickServer(random, SERVER_RANGE_PARTS.bounds)}${pickServer(random, SERVER_RANGE_PARTS.dashes)}${pickServer(random, SERVER_RANGE_PARTS.bounds)}`,
+		)
+		const header = `${pickServer(random, SERVER_RANGE_PARTS.ends)}${pickServer(random, SERVER_RANGE_PARTS.units)}${pickServer(random, SERVER_RANGE_PARTS.equals)}${ranges.join(pickServer(random, SERVER_RANGE_PARTS.joins))}${pickServer(random, SERVER_RANGE_PARTS.ends)}`
+		return { header, size: pickServer(random, SERVER_RANGE_PARTS.sizes) }
+	})
+}
+
+/** Describes one SSE message `serializeEvent` refuses and the field that carries the refusal. */
+export interface ServerEventRefusal {
+	readonly message: SSEMessage
+	readonly field: string
+}
+
+/** Lists SSE messages whose `event`, `id`, or `retry` the event-stream wire cannot carry. */
+export const SERVER_EVENT_REFUSALS: readonly ServerEventRefusal[] = Object.freeze([
+	{ message: { event: 'tick\ndata: injected', data: 'x' }, field: 'event' },
+	{ message: { event: 'tick\r', data: 'x' }, field: 'event' },
+	{ message: { event: 'tick\r\nid: 9', data: 'x' }, field: 'event' },
+	{ message: { id: '7\n\ndata: forged', data: 'x' }, field: 'id' },
+	{ message: { id: '7\r', data: 'x' }, field: 'id' },
+	{ message: { id: 'a\u0000b', data: 'x' }, field: 'id' },
+	{ message: { retry: Number.NaN, data: 'x' }, field: 'retry' },
+	{ message: { retry: Number.POSITIVE_INFINITY, data: 'x' }, field: 'retry' },
+	{ message: { retry: Number.NEGATIVE_INFINITY, data: 'x' }, field: 'retry' },
+	{ message: { retry: -1, data: 'x' }, field: 'retry' },
+	{ message: { retry: 1.5, data: 'x' }, field: 'retry' },
+	{ message: { retry: 2 ** 53, data: 'x' }, field: 'retry' },
+])
+
+/** Lists SSE messages `serializeEvent` admits, each of which a conforming parser reads back unchanged. */
+export const SERVER_EVENT_MESSAGES: readonly SSEMessage[] = Object.freeze([
+	{ data: 'hello' },
+	{ event: 'token', id: '1', retry: 500, data: 'hello' },
+	{ data: 'multi\nline' },
+	{ data: '' },
+	{ data: 'data: injected\n\nevent: forged' },
+	{ event: ' padded', id: ' 7', data: ' leading' },
+	{ event: '', id: '', data: 'empty fields' },
+	{ event: 'tick:tock', id: 'a:b', data: 'colon' },
+	{ retry: 0, data: 'zero' },
+	{ retry: Number.MAX_SAFE_INTEGER, data: 'largest' },
+	{ event: 'grüße', id: '番号', data: 'é\u0000🎉' },
+])
+
+/**
+ * Builds a node whose `self` getter returns the node itself until `bound` reads, then a
+ * primitive, and counts every read — a cycle that terminates on its own count.
+ *
+ * @param bound - The number of reads after which the getter stops returning the node
+ * @param reads - The observation the getter increments on every read
+ * @returns The self-referencing node
+ */
+export function buildServerCycle(bound: number, reads: ServerObservation<number>): object {
+	return {
+		get self(): unknown {
+			reads.value += 1
+			return reads.value < bound ? this : 0
+		},
+	}
 }
 
 export interface ServerAppState {

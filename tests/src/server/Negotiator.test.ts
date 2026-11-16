@@ -54,6 +54,14 @@ describe('Negotiator#negotiate', () => {
 		expect(negotiator.negotiate('*/*', [])).toBeUndefined()
 	})
 
+	it('matches an offered media type case-insensitively and returns it as offered', () => {
+		const negotiator = new Negotiator()
+		expect(negotiator.negotiate('application/json', ['text/html', 'Application/JSON'])).toBe(
+			'Application/JSON',
+		)
+		expect(negotiator.negotiate('TEXT/*', ['application/json', 'Text/HTML'])).toBe('Text/HTML')
+	})
+
 	it('treats an empty/unparseable header as the any-range (first offered)', () => {
 		const negotiator = new Negotiator()
 		expect(negotiator.negotiate('', ['application/json', 'text/html'])).toBe('application/json')
@@ -145,6 +153,65 @@ describe('Negotiator#format', () => {
 		})
 		expect(response.status).toBe(200)
 		await expect(response.json()).resolves.toEqual({ ok: true })
+	})
+
+	it('dispatches to a handler key whose media type differs only in case', async () => {
+		const negotiator = new Negotiator()
+		const request = new Request('http://localhost/', { headers: { accept: 'application/json' } })
+		const response = await negotiator.format(request, buildContext(undefined), {
+			'Text/HTML': () => new Response('<p>ok</p>'),
+			'Application/JSON': () => Response.json({ ok: true }),
+		})
+		expect(response.status).toBe(200)
+		await expect(response.json()).resolves.toEqual({ ok: true })
+	})
+
+	it('sets Vary: Accept on the negotiated response', async () => {
+		const negotiator = new Negotiator()
+		const request = new Request('http://localhost/', { headers: { accept: 'application/json' } })
+		const response = await negotiator.format(request, buildContext(undefined), {
+			'application/json': () => Response.json({ ok: true }),
+		})
+		expect(response.headers.get('vary')).toBe('Accept')
+	})
+
+	it('sets Vary: Accept on the 406 and on the answer to an absent Accept', async () => {
+		const negotiator = new Negotiator()
+		const refused = await negotiator.format(
+			new Request('http://localhost/', { headers: { accept: 'application/xml' } }),
+			buildContext(undefined),
+			{ 'application/json': () => Response.json({ ok: true }) },
+		)
+		expect(refused.status).toBe(406)
+		expect(refused.headers.get('vary')).toBe('Accept')
+		const defaulted = await negotiator.format(
+			new Request('http://localhost/'),
+			buildContext(undefined),
+			{ 'application/json': () => Response.json({ ok: true }) },
+		)
+		expect(defaulted.status).toBe(200)
+		expect(defaulted.headers.get('vary')).toBe('Accept')
+	})
+
+	it('merges Accept into a Vary the handler already set', async () => {
+		const negotiator = new Negotiator()
+		const request = new Request('http://localhost/', { headers: { accept: 'text/plain' } })
+		const response = await negotiator.format(request, buildContext(undefined), {
+			'text/plain': () => new Response('ok', { headers: { vary: 'Origin' } }),
+		})
+		expect(response.headers.get('vary')).toBe('Origin, Accept')
+		await expect(response.text()).resolves.toBe('ok')
+	})
+
+	it('sets Vary: Accept on a handler response whose headers are immutable', async () => {
+		const negotiator = new Negotiator()
+		const request = new Request('http://localhost/', { headers: { accept: 'text/html' } })
+		const response = await negotiator.format(request, buildContext(undefined), {
+			'text/html': () => Response.redirect('http://localhost/login', 303),
+		})
+		expect(response.status).toBe(303)
+		expect(response.headers.get('location')).toBe('http://localhost/login')
+		expect(response.headers.get('vary')).toBe('Accept')
 	})
 
 	it('treats an absent Accept header as the any-range (first handler key)', async () => {

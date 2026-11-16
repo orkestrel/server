@@ -137,15 +137,17 @@ export function isContentTooLargeError(value: unknown): value is ContentTooLarge
 
 /**
  * Represents the error this package raises when a caller programmed a call the
- * entity refuses, carrying `'STATUS'` or `'NEXT'` as its code.
+ * entity refuses, carrying `'STATUS'`, `'NEXT'`, or `'EVENT'` as its code.
  *
  * @remarks
  * Carries a machine-readable {@link ServerErrorCode} and an optional `context`
  * record naming the offending facts. This is a programmer error, so it carries
  * no HTTP `status`: a `'STATUS'` lifecycle refusal is raised to the caller that
- * invoked the lifecycle method, and a `'NEXT'` double-`next` refusal escapes its
+ * invoked the lifecycle method, a `'NEXT'` double-`next` refusal escapes its
  * middleware into the request boundary, which reaches it as a generic 500 with
- * the message hidden unless `expose` is set. Throw an {@link HTTPError} for a
+ * the message hidden unless `expose` is set, and an `'EVENT'` refusal is raised
+ * to the caller that serialized an SSE message, its `context.field` naming the
+ * refused field. Throw an {@link HTTPError} for a
  * client-facing fault instead. Narrow a caught value with
  * {@link isServerError}.
  *
@@ -207,7 +209,7 @@ export function isServerError(value: unknown): value is ServerError {
 		const code: unknown = INTRINSICS.reflect.read(value, 'code')
 		const context: unknown = INTRINSICS.reflect.read(value, 'context')
 		return (
-			(code === 'STATUS' || code === 'NEXT') &&
+			(code === 'STATUS' || code === 'NEXT' || code === 'EVENT') &&
 			isString(INTRINSICS.reflect.read(value, 'message')) &&
 			(context === undefined || isObject(context) || isFunction(context))
 		)

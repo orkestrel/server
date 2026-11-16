@@ -227,7 +227,7 @@ export type Encoding = 'gzip' | 'deflate' | 'identity'
  * answers `406 Not Acceptable` when none of the offered types is acceptable.
  * The keys are the `available` set negotiation chooses from, so their order
  * is the server's tie-break preference (a client accepting the any-media-
- * range gets the first key).
+ * range gets the first key). A key matches its media type case-insensitively.
  */
 export type FormatHandlerMap<TState> = Readonly<
 	Record<
@@ -300,6 +300,13 @@ export interface NegotiatorInterface {
 	 * reads the request `Accept`, negotiates against `handlers`' keys, and
 	 * invokes the winner; `406` when none is acceptable.
 	 *
+	 * @remarks
+	 * Every response it returns, the `406` included, carries `Vary: Accept`
+	 * merged into any `Vary` the handler set, because `Accept` selected it. The
+	 * handler's response is returned as a copy with those headers, so a
+	 * response whose headers are immutable, such as `Response.redirect`, also
+	 * carries the field.
+	 *
 	 * @typeParam TState - The consumer's opaque per-request state type
 	 * @param request - The in-flight `Request`
 	 * @param context - The request's {@link MiddlewareContext}
@@ -318,8 +325,9 @@ export interface NegotiatorInterface {
  *
  * @remarks
  * - `data` — the event payload (required). Serialized as one or more `data:`
- *   lines: the value is split on `\n` into a `data:` line per segment, so it
- *   round-trips through a consumer's multi-`data` concat.
+ *   lines: the value is split on `\r\n`, `\r`, and `\n` into a `data:` line
+ *   per segment, so it round-trips through a consumer's multi-`data` concat
+ *   with each line break read as `\n`.
  * - `event` — the optional event type, emitted as an `event:` line; omitted
  *   ⇒ the consumer's default (`message`).
  * - `id` — the optional last-event-id, emitted as an `id:` line.
@@ -328,10 +336,11 @@ export interface NegotiatorInterface {
  */
 export interface SSEMessage {
 	readonly data: string
-	/** Requires a single-line value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires one line; `serializeEvent` refuses a line break. */
 	readonly event?: string
-	/** Requires a single-line value — an embedded newline would corrupt the SSE wire format. */
+	/** Requires one line with no NUL; `serializeEvent` refuses a line break or a NUL. */
 	readonly id?: string
+	/** Requires a non-negative safe integer; `serializeEvent` refuses any other number. */
 	readonly retry?: number
 }
 
@@ -363,9 +372,11 @@ export interface StreamOptions {
  * message to the wire, enqueues it, and reports whether that process-local
  * queue still has capacity; a producer that receives `false` parks on
  * `drain()` before writing again. `comment` writes a `: text` keep-alive line
- * (ignored by a conforming SSE parser — no spurious event); `end` closes the
- * stream. Every method is a safe no-op once `closed` is `true`, so a late
- * `write` never throws.
+ * per line of its text (ignored by a conforming SSE parser — no spurious
+ * event); `end` closes the stream. The stream opens with one comment line, so
+ * the response pump has a first chunk and the headers leave before any event.
+ * Every method is a safe no-op once `closed` is `true`, so a late `write`
+ * never throws.
  *
  * The readiness signal is deliberately local: it reflects the
  * `ReadableStream` controller's queue, not proof that a remote peer consumed
@@ -375,8 +386,9 @@ export interface StreamOptions {
  * that ignores the boolean keeps the prior unconditional-enqueue behavior.
  * The stream's default strategy measures queued chunks, not their byte length,
  * so a producer seeking a byte bound must also bound each individual message.
- * Return `response` before awaiting a `false` write: the consumer cannot pull
- * until it receives the response.
+ * Return `response` before awaiting a `false` write or `drain()`: the consumer
+ * cannot pull until it receives the response, and the opening comment fills
+ * the queue, so a `drain()` before any write also waits on that pull.
  */
 export interface SSEStreamInterface {
 	/** Holds the streaming `Response` to return from the route handler. */
@@ -393,13 +405,15 @@ export interface SSEStreamInterface {
 	 *   accepting the event; false otherwise — the queue is full or the stream
 	 *   is closed. A `false` event was still accepted unless `closed` was already
 	 *   `true`; await {@link drain} before producing another event.
+	 * @throws {ServerError} Thrown when the stream is open and `serializeEvent`
+	 *   refuses a field of `message`, with code `'EVENT'`; nothing is enqueued
 	 */
 	write(message: SSEMessage): boolean
 	/**
 	 * Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores,
 	 * and a no-op once the stream is closed.
 	 *
-	 * @param text - The comment text (sent after the `: ` prefix)
+	 * @param text - The comment text (sent after the `: ` prefix, one comment line per line)
 	 */
 	comment(text: string): void
 	/**
@@ -492,9 +506,9 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
 
 /**
  * Represents the machine-readable category a
- * {@link import('./errors.js').ServerError} carries — `'STATUS'` for a lifecycle
- * call the current status forbids, `'NEXT'` for a middleware that called its `next`
- * a second time.
+ * {@link import('./errors.js').ServerError} carries — `'STATUS'` for a forbidden
+ * lifecycle call, `'NEXT'` for a second `next` call, `'EVENT'` for an SSE field
+ * the wire cannot carry.
  *
  * @remarks
  * A `ServerError` reports a call the caller programmed and the substrate
@@ -508,6 +522,8 @@ export type ServerErrorCode =
 	| 'STATUS'
 	/** Identifies a middleware that called its `next` a second time within one invocation. */
 	| 'NEXT'
+	/** Identifies an SSE message field the event-stream wire cannot carry. */
+	| 'EVENT'
 
 /**
  * Identifies the request a server-level fault came from — its method and its
