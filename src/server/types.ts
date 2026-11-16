@@ -701,9 +701,12 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   write that fails, and a throw the terminal catch holds. A throw after a
  *   peer disconnect is no fault. A sink that throws, or returns a promise
  *   that rejects, is contained, so the response still goes out, except a
- *   rejected native promise whose species constructor cannot be found,
- *   because its `constructor` or `Symbol.species` lookup throws or yields no
- *   constructor. Such a promise refuses every reaction, so its rejection
+ *   rejected native promise whose species constructor cannot build a promise:
+ *   its `constructor` lookup throws or yields a value that is neither
+ *   `undefined` nor an object, its `Symbol.species` lookup throws or yields a
+ *   value that is neither `undefined`, `null`, nor a constructor, or that
+ *   constructor throws or never passes its executor callable resolve and
+ *   reject functions. Such a promise refuses every reaction, so its rejection
  *   reaches `unhandledRejection`, which ends the process under Node's default
  *   unhandled-rejection mode; the response still goes out. The request is absent
  *   only for a fault on the `400` path of a request no `Request` could be

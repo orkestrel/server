@@ -416,11 +416,14 @@ These invariants hold across `src/server` ↔ `server.md`.
      both with no `RequestLine`, because no `Request` exists there.
    - A `report` sink that throws, or returns a promise that rejects, is
      contained, and the response still goes out. A rejected native promise
-     whose species constructor cannot be found, because its `constructor` or
-     `Symbol.species` lookup throws or yields no constructor, stays out of
-     reach: it refuses every reaction, so its rejection reaches
-     `unhandledRejection`, which ends the process under Node's default
-     unhandled-rejection mode.
+     whose species constructor cannot build a promise stays out of reach:
+     its `constructor` lookup throws or yields a value that is neither
+     `undefined` nor an object, its `Symbol.species` lookup throws or yields
+     a value that is neither `undefined`, `null`, nor a constructor, or that
+     constructor throws or never passes its executor callable resolve and
+     reject functions. Such a promise refuses every reaction, so its
+     rejection reaches `unhandledRejection`, which ends the process under
+     Node's default unhandled-rejection mode.
    - A write that fails, at a header Node refuses or in the body after the
      headers went out, destroys the connection, so the client reads an abort,
      and is a fault.
