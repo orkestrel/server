@@ -712,17 +712,36 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   unhandled-rejection mode; the response still goes out. The request is absent
  *   only for a fault on the `400` path of a request no `Request` could be
  *   built for, a failed write of that `400` included.
- * @param timeouts - Lifecycle and `node:http` tuning knobs: `start` (maximum
- *   time to bind the listener; `0` permits no startup window), `request` (max
- *   time to fully receive + respond, `requestTimeout`), `headers` (max time
- *   to receive the request headers, `headersTimeout`), and `keepalive` (idle
- *   keep-alive socket timeout, `keepAliveTimeout`). `headers` must not exceed
- *   `keepalive` (the Slowloris footgun) — construction throws a `TypeError`
- *   otherwise. A present `start` must be an integer from 0 through
- *   2_147_483_647, and every other present value a non-negative finite
- *   number; construction throws a `TypeError` otherwise. A startup expiry
- *   rejects with a `DOMException` named `TimeoutError`; caller
- *   cancellation rejects with the caller signal's `reason`.
+ * @param timeouts - Timeouts in milliseconds: `start` (the maximum time to
+ *   bind the listener; `0` permits no startup window), and three that
+ *   `start()` passes to `node:http`'s `createServer` as options: `headers`
+ *   (`headersTimeout`, the time to receive the request headers), `request`
+ *   (`requestTimeout`, the time to receive the whole request; no server
+ *   timeout bounds the response), and `keepalive` (`keepAliveTimeout`, the
+ *   idle time a kept-alive connection waits for its next request; Node adds
+ *   its `keepAliveTimeoutBuffer`, 1_000 ms by default, so a `keepalive` of
+ *   400 closes an idle connection after about 1_400 ms). `0` disables each
+ *   of those three. An omitted one keeps Node's default: `request` is
+ *   `DEFAULT_REQUEST_TIMEOUT_MS`, `headers` the lesser of
+ *   `DEFAULT_HEADERS_TIMEOUT_MS` and `request`, and `keepalive` Node's
+ *   `keepAliveTimeout` default. When `headers` or `request` passes while a
+ *   response is being sent, Node closes the connection, which cuts that
+ *   response short; otherwise, including after a response has finished
+ *   while its upload continues, Node answers `408` and closes the
+ *   connection. The server sets Node's
+ *   `connectionsCheckingInterval` to `Math.ceil(m / 2)` milliseconds, where
+ *   `m` is the smaller positive of `headers` and `request` as Node applies
+ *   them, so each expires at most one such interval after it passes; with
+ *   neither positive, Node keeps its own interval. `start`, `headers`, and
+ *   `request` must be integers from 0 through 2_147_483_647, and
+ *   `keepalive` an integer from 0 through 2_147_482_647, so that Node's
+ *   timer of `keepalive` plus its buffer stays within that limit; `headers`
+ *   must not exceed `request` while `request` is positive, Node's own
+ *   relation. Construction throws a `TypeError` otherwise. A response deadline belongs to a middleware, such as
+ *   `@orkestrel/middleware`'s `createDeadline`, which aborts the exchange
+ *   through `context.abort`. A startup expiry rejects with a `DOMException`
+ *   named `TimeoutError`; caller cancellation rejects with the caller
+ *   signal's `reason`.
  * @param sockets - `node:http` socket caps: `connections` maps to
  *   `maxConnections` (`0` rejects every incoming connection), `headers` maps
  *   to `maxHeadersCount` (`0` disables the limit), and `requests` maps to
@@ -853,19 +872,19 @@ export interface ServerInterface<TState> {
 	 * request or an upgrade that a connection sends after the listener closes
 	 * is refused: the server destroys that connection before the request is
 	 * counted or a handler sees it. An exchange opens when a request reaches
-	 * the handler and stays open until its request message has ended or closed
-	 * and its response has finished or closed. The `error` listeners that this
-	 * tracking attaches to the message and the response stay attached, so a
-	 * later error on either raises no uncaught exception. After a clean drain
+	 * the handler and stays open until its request message and its response
+	 * have closed. The `close` listeners that this tracking attaches leave when
+	 * they fire, so none outlives the exchange. After a clean drain
 	 * the close destroys every connection with no open exchange: an idle
 	 * keep-alive one, one that never sent a request, and one partway through
 	 * any header block, because a request whose headers never completed is not
 	 * counted work. A connection that still carries an open exchange, including
 	 * one whose handler answered while its body still uploads, ends when its
 	 * last exchange completes, and the `stop()` call resolves after that
-	 * connection closes. Each body byte restarts Node's keep-alive socket
-	 * timer, so no Node timeout bounds an upload that keeps sending. The
-	 * deadline that bounds the drain therefore stays armed through this wait:
+	 * connection closes. Node's `request` timeout bounds an upload that keeps
+	 * sending after its response, unless `timeouts.request` is `0`, when no
+	 * Node timeout bounds it. The deadline that bounds the drain therefore
+	 * stays armed through this wait:
 	 * when it expires before the server's `close` event, the server destroys
 	 * every socket still open, as an expired drain does, so no connection
 	 * holds the `stop()` call past the `drain` deadline. A request Node

@@ -80,6 +80,8 @@ cleanup finish before the start event is emitted.
 | Name                         | Kind  | Signature                          | Summary                                                                                                                                                                                                                            |
 | ---------------------------- | ----- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DEFAULT_DRAIN_MS`           | const | `10000`                            | Names the default graceful-stop deadline `stop()` gives in-flight requests and claimed upgraded sockets, `10_000` ms.                                                                                                              |
+| `DEFAULT_REQUEST_TIMEOUT_MS` | const | `300000`                           | Names the `node:http` default `requestTimeout`, `300_000` ms, which applies when `timeouts.request` is omitted.                                                                                                                    |
+| `DEFAULT_HEADERS_TIMEOUT_MS` | const | `60000`                            | Names the cap of the `node:http` default `headersTimeout`, `60_000` ms: when `timeouts.headers` is omitted, the header timeout is the lesser of this cap and the request timeout.                                                  |
 | `DEFAULT_BODY_LIMIT`         | const | `1048576`                          | Names the default maximum request body size `readBody` accepts before a 413, `1_048_576` bytes.                                                                                                                                    |
 | `DEFAULT_DECOMPRESSED_LIMIT` | const | `16777216`                         | Names the default maximum decompressed request body size, `16_777_216` bytes — the zip-bomb cap the body pipeline's byte-counting `TransformStream` enforces when it transparently decompresses a `Content-Encoding` request body. |
 | `SSE_HEADERS`                | const | `Readonly<Record<string, string>>` | Holds the SSE response headers a `Stream` sets on its response, merged under any caller `headers` so a caller repeating one of these keys replaces its value.                                                                      |
@@ -326,10 +328,10 @@ These invariants hold across `src/server` ↔ `server.md`.
    the listener. The server counts the open request exchanges on each
    connection, because a pipelining client can hold several: an exchange
    opens when a request reaches the handler and stays open until its request
-   message has ended or closed and its response has finished or closed.
-   The `error` listeners that this tracking attaches to the message and the
-   response stay attached, so a later error on either raises no uncaught
-   exception.
+   message and its response have closed, which each does after it ends or is
+   destroyed. The server attaches one `close` listener to the message and two
+   to the response, for this count and the in-flight registry, and each
+   leaves when it fires, so none outlives the exchange.
    After a clean drain the close destroys every connection with no open
    exchange. That covers an idle keep-alive connection. It covers a
    connection that never sent a request: Node doesn't count it as idle, and
@@ -342,9 +344,10 @@ These invariants hold across `src/server` ↔ `server.md`.
    while its body still uploads: destroying it can reset the connection and
    lose that response. The server ends that connection when its last
    exchange completes, and the `stop()` call resolves after that connection
-   closes. Each body byte restarts Node's keep-alive socket timer, so no Node
-   timeout bounds an upload that keeps sending. The deadline that bounds the
-   drain therefore stays armed through the clean close's wait: when it
+   closes. Node's `request` timeout bounds an upload that keeps sending after
+   its response, unless `timeouts.request` is `0`, when no Node timeout bounds
+   it. The deadline that bounds the drain therefore stays armed through the
+   clean close's wait: when it
    expires before the server's `close` event, the server destroys every
    socket still open, as an expired drain does, so no connection holds the
    `stop()` call past the `drain` deadline. The `drain` event has already
@@ -524,16 +527,41 @@ These invariants hold across `src/server` ↔ `server.md`.
     changes nothing), or when `stop()` runs, and on no other exchange's
     account, including the next one on the same keep-alive connection. The
     server keeps each in-flight exchange's controller in a registry until its
-    response finishes or closes; `stop()` aborts each one, a request that
+    response closes; `stop()` aborts each one, a request that
     arrives during the drain is served with its signal already aborted, and
     the `drain` event's pending count is the registry's size. No request
     signal links to a signal that outlives its exchange, so nothing per
     request stays reachable after the exchange ends.
-14. **Enterprise timeout knobs, Slowloris-guarded.** `timeouts.request` /
-    `timeouts.headers` / `timeouts.keepalive` map onto `node:http`'s
-    `requestTimeout` / `headersTimeout` / `keepAliveTimeout`; construction
-    throws a `TypeError` when `headers` exceeds `keepalive` (the Slowloris
-    footgun) — a guard at the boundary, never on the hot path.
+14. **Receipt timeouts are delegated to `node:http`.** `start()` passes
+    `timeouts.headers`, `timeouts.request`, and `timeouts.keepalive` to
+    `node:http`'s `createServer` as its `headersTimeout`, `requestTimeout`,
+    and `keepAliveTimeout` options. `headers` bounds the receipt of the
+    request headers, `request` the receipt of the whole request, and
+    `keepalive` the idle wait of a kept-alive connection for its next
+    request, to which Node adds its `keepAliveTimeoutBuffer`, 1_000 ms by
+    default: a `keepalive` of 400 closes an idle connection after about
+    1_400 ms. `0` disables each. An omitted one keeps Node's default:
+    `DEFAULT_REQUEST_TIMEOUT_MS` for `request`, the lesser of
+    `DEFAULT_HEADERS_TIMEOUT_MS` and `request` for `headers`, and Node's
+    `keepAliveTimeout` default for `keepalive`. When `headers` or `request`
+    passes while a response is being sent, Node closes the connection, which
+    cuts that response short; otherwise, including after a response has
+    finished while its upload continues, Node answers `408` and closes the
+    connection. The server sets Node's
+    `connectionsCheckingInterval` to `Math.ceil(m / 2)` milliseconds, where
+    `m` is the smaller positive of `headers` and `request` as Node applies
+    them, so each expires at most one such interval after it passes; with
+    neither positive, Node keeps its own interval. Construction refuses,
+    with a `TypeError` that names the key and its limit, a `headers` or
+    `request` that is not an integer from 0 through 2_147_483_647 and a
+    `keepalive` that is not an integer from 0 through 2_147_482_647, because
+    Node arms `keepalive` plus its buffer as one timer; and it refuses, with a
+    `TypeError` that names both keys, a `headers` above `request` while
+    `request` is positive: Node's own `headersTimeout ≤ requestTimeout`
+    relation. No server timeout bounds the response; a response deadline is
+    a middleware's, such as the `createDeadline` middleware of
+    `@orkestrel/middleware`, which aborts the exchange through
+    `context.abort`.
 15. **Socket caps map without policy.** `sockets.connections` /
     `sockets.headers` / `sockets.requests` apply directly to node's
     `maxConnections` / `maxHeadersCount` / `maxRequestsPerSocket` before bind.
@@ -867,7 +895,20 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   `HTTPError` status from 100 through 999 and each returned status as `Response`
   admits it, run fit finding F3's table through the server and the renderer
   alike, and drive a body failure after the headers, a peer disconnect before
-  the end, the `response` record, and the terminal catch.
+  the end, the `response` record, and the terminal catch. Its server matrix feeds a real `Server` and a bare
+  `node:http` control the same bytes over raw sockets and frames each answer with the
+  raw client's own parse: the `connectionsCheckingInterval` the live `node:http` server
+  reads under each timeout shape; a header drip and a body drip that outlast their
+  timeouts, each answered in the control's class no sooner than its timeout and within
+  one and a half times it plus a scheduling slack; an idle keep-alive connection, closed
+  in the control's class no sooner than `keepalive` and within `keepalive` plus Node's
+  buffer and the slack;
+  the routed `405`, automatic `HEAD`, and automatic `OPTIONS`; the
+  framing class of a pipelined pair, conflicting or duplicate framing headers, an
+  obsolete line fold, a bare LF, an oversized header block, and `100-continue` and
+  unknown `Expect` values, with no `request` or `response` event where Node answers
+  before the handler; and the server's own listeners per event on each message and
+  response, at most two at the handler's entry and none after the exchange ends.
 - [`tests/src/server/helpers.test.ts`](../tests/src/server/helpers.test.ts) —
   `compose` (outer-first ordering, double-`next` rejection, the refusal of a
   `next` argument, one request and context per chain, short-circuit,
@@ -907,7 +948,11 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   guards, and `createStream` option threading.
 - [`tests/src/server/Server.test.ts`](../tests/src/server/Server.test.ts) —
   the status matrix, restart-fresh-abort, caller-cancelled / timed-out / clean
-  bounded startup, `EADDRINUSE` honesty, host/port binds, ephemeral default,
+  bounded startup, the edges of the `headers ≤ request` relation against
+  `node:http`'s own refusal, the former `headers ≤ keepalive` refusals that
+  construct and serve, the timeout values construction refuses with each key's limit,
+  the `0` and limit values it accepts, and the `keepalive` edge one below Node's
+  buffered-timer overflow, `EADDRINUSE` honesty, host/port binds, ephemeral default,
   connection / header / per-socket request caps, graceful-vs-forced drain,
   the clean stop that ends a never-used connection inside the deadline after
   the request in flight beside it finishes, the clean stop that counts and

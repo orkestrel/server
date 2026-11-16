@@ -1,4 +1,9 @@
-import type { IncomingMessage, Server as NodeHTTPServer, ServerResponse } from 'node:http'
+import type {
+	IncomingMessage,
+	Server as NodeHTTPServer,
+	ServerOptions as NodeHTTPServerOptions,
+	ServerResponse,
+} from 'node:http'
 import type { AddressInfo, Socket } from 'node:net'
 import type { Duplex } from 'node:stream'
 import type { AbortInterface } from '@orkestrel/abort'
@@ -19,7 +24,6 @@ import type {
 } from './types.js'
 import { addAbortListener, once } from 'node:events'
 import { createServer as createHTTPServer } from 'node:http'
-import { finished } from 'node:stream/promises'
 import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
@@ -27,7 +31,12 @@ import { Emitter } from '@orkestrel/emitter'
 import { attempt, isFiniteNumber, isFunction, isInteger, isPromise } from '@orkestrel/contract'
 import { buildErrorResponse, compose, iterateRequestBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
-import { DEFAULT_BODY_LIMIT, DEFAULT_DRAIN_MS } from './constants.js'
+import {
+	DEFAULT_BODY_LIMIT,
+	DEFAULT_DRAIN_MS,
+	DEFAULT_HEADERS_TIMEOUT_MS,
+	DEFAULT_REQUEST_TIMEOUT_MS,
+} from './constants.js'
 import { HTTPError, isHTTPError, ServerError } from './errors.js'
 import { ServerBinding } from './ServerBinding.js'
 
@@ -62,7 +71,7 @@ import { ServerBinding } from './ServerBinding.js'
  *   socket. A `stop()` call made while a stop runs returns that stop's
  *   promise. `destroy()` is the idempotent final teardown.
  * - **Per request.** The exchange's own `AbortController` joins the
- *   in-flight registry until the response's `finish` or `close`; the one
+ *   in-flight registry until the response's `close`; the one
  *   `Request` of the exchange is built through the router's `buildRequest`
  *   with that controller's signal, so `request.signal` aborts on a peer
  *   disconnect, on `context.abort(reason)`, or on `stop()`, and no request
@@ -115,12 +124,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #limit: number
 	readonly #expose: boolean
 	readonly #report: ((error: unknown, request?: RequestLine) => void) | undefined
-	readonly #timeouts: {
-		readonly start?: number
-		readonly request?: number
-		readonly headers?: number
-		readonly keepalive?: number
-	}
+	readonly #startup: number | undefined
+	readonly #options: NodeHTTPServerOptions
 	readonly #sockets: {
 		readonly connections?: number
 		readonly headers?: number
@@ -143,22 +148,27 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (!isFiniteNumber(limit) || limit < 0)
 			throw new TypeError('ServerOptions.limit must be a non-negative finite number')
 		const timeouts = options.timeouts ?? {}
-		if (timeouts.start !== undefined && !isTimeoutDuration(timeouts.start)) {
+		for (const [name, value] of Object.entries(timeouts)) {
+			// Node arms `keepalive` plus its default 1_000 ms `keepAliveTimeoutBuffer` as one timer.
+			const keepalive = name === 'keepalive'
+			if (
+				value !== undefined &&
+				!(isTimeoutDuration(value) && (!keepalive || isTimeoutDuration(value + 1_000)))
+			) {
+				throw new TypeError(
+					`ServerOptions.timeouts.${name} must be an integer from 0 through ${keepalive ? '2_147_482_647' : '2_147_483_647'}`,
+				)
+			}
+		}
+		// Node's own defaults, so the relation and the checking interval read the values Node enforces.
+		const request = timeouts.request ?? DEFAULT_REQUEST_TIMEOUT_MS
+		const headers = timeouts.headers ?? Math.min(DEFAULT_HEADERS_TIMEOUT_MS, request)
+		if (request > 0 && headers > request) {
 			throw new TypeError(
-				'ServerOptions.timeouts.start must be an integer from 0 through 2_147_483_647',
+				'ServerOptions.timeouts.headers must not exceed ServerOptions.timeouts.request (300_000 when omitted) while timeouts.request is positive',
 			)
 		}
-		for (const [name, value] of Object.entries(timeouts)) {
-			if (value !== undefined && (!isFiniteNumber(value) || value < 0))
-				throw new TypeError(`ServerOptions.timeouts.${name} must be a non-negative finite number`)
-		}
-		if (
-			timeouts.headers !== undefined &&
-			timeouts.keepalive !== undefined &&
-			timeouts.headers > timeouts.keepalive
-		) {
-			throw new TypeError('ServerOptions.timeouts.headers must not exceed timeouts.keepalive')
-		}
+		const checked = [headers, request].filter((ms) => ms > 0)
 		const sockets = options.sockets ?? {}
 		for (const [name, value] of Object.entries(sockets)) {
 			if (value !== undefined && (!isInteger(value) || value < 0))
@@ -174,7 +184,15 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#limit = limit
 		this.#expose = options.expose ?? false
 		this.#report = options.report
-		this.#timeouts = timeouts
+		this.#startup = timeouts.start
+		this.#options = {
+			headersTimeout: headers,
+			requestTimeout: request,
+			...(timeouts.keepalive === undefined ? {} : { keepAliveTimeout: timeouts.keepalive }),
+			...(checked.length === 0
+				? {}
+				: { connectionsCheckingInterval: Math.ceil(Math.min(...checked) / 2) }),
+		}
 		this.#sockets = sockets
 		this.#emitter = new Emitter<ServerEventMap>({
 			...(options.on === undefined ? {} : { on: options.on }),
@@ -227,10 +245,9 @@ export class Server<TState> implements ServerInterface<TState> {
 			)
 		}
 		this.#status = 'starting'
-		const server = createHTTPServer((request, response) => this.#handle(request, response))
-		if (this.#timeouts.request !== undefined) server.requestTimeout = this.#timeouts.request
-		if (this.#timeouts.headers !== undefined) server.headersTimeout = this.#timeouts.headers
-		if (this.#timeouts.keepalive !== undefined) server.keepAliveTimeout = this.#timeouts.keepalive
+		const server = createHTTPServer(this.#options, (request, response) =>
+			this.#handle(request, response),
+		)
 		if (this.#sockets.connections !== undefined) server.maxConnections = this.#sockets.connections
 		if (this.#sockets.headers !== undefined) server.maxHeadersCount = this.#sockets.headers
 		if (this.#sockets.requests !== undefined) server.maxRequestsPerSocket = this.#sockets.requests
@@ -322,7 +339,6 @@ export class Server<TState> implements ServerInterface<TState> {
 		const exchange = new AbortController()
 		const release = this.#register(exchange)
 		if (this.#status === 'stopping') exchange.abort()
-		response.once('finish', release)
 		response.once('close', release)
 		void this.#trackExchange(message, response)
 		void this.#accept(message, response, exchange)
@@ -476,8 +492,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	async #listen(server: NodeHTTPServer, signal?: AbortSignal): Promise<number> {
-		const deadline =
-			this.#timeouts.start === undefined ? undefined : createTimeout({ ms: this.#timeouts.start })
+		const deadline = this.#startup === undefined ? undefined : createTimeout({ ms: this.#startup })
 		const startup = deadline === undefined ? signal : linkSignal(deadline.signal, signal)
 		const binding = createAbort()
 		const relay =
@@ -577,20 +592,22 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Count one exchange open on its connection until both its request message
-	// has ended or closed and its response has finished or closed; a count, not
-	// a flag, because a pipelining client holds several at once. While a clean
-	// close waits, the connection ends as its count returns to zero. Each body
-	// byte restarts Node's keep-alive socket timer, so no Node timeout bounds an
-	// upload that keeps sending after its response; the stop's deadline does.
-	// The `error` listeners that the `finished` helper attaches stay after it
-	// settles, so a later `error` event on the message or the response raises
-	// no uncaught exception.
+	// and its response have closed; a count, not a flag, because a pipelining
+	// client holds several at once. Each closes after it ends or is destroyed,
+	// so one `close` listener apiece covers both paths and leaves when it fires.
+	// While a clean close waits, the connection ends as its count returns to
+	// zero. Node's `requestTimeout` bounds an upload that keeps sending after
+	// its response unless `timeouts.request` is 0; then only the stop's
+	// deadline does.
 	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)
 		if (open === undefined) return
 		this.#exchanges.set(socket, open + 1)
-		await Promise.allSettled([finished(message), finished(response)])
+		await Promise.all([
+			new Promise((resolve) => message.once('close', resolve)),
+			new Promise((resolve) => response.once('close', resolve)),
+		])
 		const left = this.#exchanges.get(socket)
 		if (left === undefined) return
 		this.#exchanges.set(socket, left - 1)
@@ -628,7 +645,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	}
 
 	// Register one in-flight exchange's abort handle; returns the idempotent
-	// removal its response's `finish` or `close` runs.
+	// removal its response's `close` runs.
 	#register(exchange: AbortController): () => void {
 		this.#enter()
 		this.#requests.add(exchange)

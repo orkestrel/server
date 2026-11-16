@@ -17,8 +17,10 @@ import type {
 	SSEMessage,
 } from '@src/server'
 import type { IncomingMessage } from 'node:http'
-import { seededRandom } from '@orkestrel/contract'
+import { isRecord, seededRandom } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
+import { buildRequest, sendResponse } from '@orkestrel/router/server'
+import diagnostics from 'node:diagnostics_channel'
 import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -2056,4 +2058,807 @@ export async function abandonBoundaryBody(port: number): Promise<string> {
 	request.destroy()
 	await closed
 	return chunk instanceof Buffer ? chunk.toString('utf8') : ''
+}
+
+// ── The server matrix ────────────────────────────────────────────────────────
+//
+// The fixtures `tests/src/server/integration.test.ts` drives the server matrix with. Each cell feeds
+// a real `Server` and a bare `node:http` control the same bytes over raw sockets, frames what each
+// answered with the raw client's own parse, and reads from the client whether the server closed
+// the connection. The expectation is the control's answer or the declared contract, never the code.
+
+/** Represents one HTTP/1.1 response a raw client framed from the bytes it read. */
+export interface ServerRawResponse {
+	readonly status: number
+	readonly headers: Readonly<Record<string, string>>
+	readonly body: string
+	readonly complete: boolean
+}
+
+/** Represents one framed body and the offset where its framing ended. */
+export interface ServerFramedBody {
+	readonly body: string
+	readonly complete: boolean
+	readonly end: number
+}
+
+/**
+ * Decodes a chunked body from raw response bytes, stopping where its framing stops.
+ *
+ * @remarks
+ * The last chunk ends at the blank line after its trailer section, which may hold fields.
+ *
+ * @param bytes - The raw bytes the client read
+ * @param offset - Where the next chunk-size line starts
+ * @returns The decoded body, whether the last chunk arrived, and the offset after it
+ */
+export function decodeServerChunks(bytes: Buffer, offset: number): ServerFramedBody {
+	const line = bytes.indexOf('\r\n', offset)
+	if (line < 0) return { body: '', complete: false, end: bytes.length }
+	const size = Number.parseInt(bytes.subarray(offset, line).toString('latin1'), 16)
+	if (size === 0) {
+		const trailer = bytes.indexOf('\r\n\r\n', line)
+		return trailer < 0
+			? { body: '', complete: false, end: bytes.length }
+			: { body: '', complete: true, end: trailer + 4 }
+	}
+	const data = line + 2 + size
+	const part = bytes.subarray(line + 2, Math.min(data, bytes.length)).toString()
+	if (bytes.length < data + 2) return { body: part, complete: false, end: bytes.length }
+	const rest = decodeServerChunks(bytes, data + 2)
+	return { body: part + rest.body, complete: rest.complete, end: rest.end }
+}
+
+/**
+ * Frames one response body that starts at `start`, by the framing its status and headers declare.
+ *
+ * @remarks
+ * Follows RFC 9112 section 6.3: a response to `HEAD`, and a 1xx, 204, or 304 response, ends at the
+ * blank line whatever its framing headers say; then chunked, then `Content-Length`; any other
+ * response runs to the end of the connection, so it is complete only after the connection closed.
+ *
+ * @param bytes - The raw bytes the client read
+ * @param start - Where the body starts
+ * @param status - The response status
+ * @param headers - The response headers, keyed in lower case
+ * @param closed - If `true`, the connection closed after `bytes`; if `false`, it is open
+ * @param head - If `true`, the response answers a `HEAD` request; if `false`, any other method
+ * @returns The body, whether its framing ended, and the offset after it
+ */
+export function frameServerBody(
+	bytes: Buffer,
+	start: number,
+	status: number,
+	headers: Readonly<Record<string, string>>,
+	closed: boolean,
+	head: boolean,
+): ServerFramedBody {
+	if (head || status < 200 || status === 204 || status === 304)
+		return { body: '', complete: true, end: start }
+	if (headers['transfer-encoding'] === 'chunked') return decodeServerChunks(bytes, start)
+	const length = headers['content-length']
+	if (length !== undefined) {
+		const end = start + Number(length)
+		return {
+			body: bytes.subarray(start, end).toString(),
+			complete: bytes.length >= end,
+			end,
+		}
+	}
+	return { body: bytes.subarray(start).toString(), complete: closed, end: bytes.length }
+}
+
+/**
+ * Frames HTTP/1.1 responses from the raw bytes a client read, in wire order.
+ *
+ * @remarks
+ * An interim 1xx response answers the same request as the response after it, so it takes no
+ * method from `methods`. The last response is returned incomplete while its framing is open, and
+ * bytes that hold no complete status line and header block frame as nothing.
+ *
+ * @param bytes - The raw bytes the client read
+ * @param closed - If `true`, the connection closed after `bytes`; if `false`, it is open
+ * @param methods - The request methods the responses answer, in order; a missing one reads as `GET`
+ * @param offset - Where the next status line starts
+ * @returns Each response, in wire order
+ */
+export function parseResponses(
+	bytes: Buffer,
+	closed: boolean,
+	methods: readonly string[],
+	offset = 0,
+): readonly ServerRawResponse[] {
+	const head = bytes.indexOf('\r\n\r\n', offset)
+	if (head < 0) return []
+	const [line = '', ...fields] = bytes.subarray(offset, head).toString('latin1').split('\r\n')
+	const status = Number(line.split(' ')[1])
+	const headers = Object.fromEntries(
+		fields.map((field) => {
+			const colon = field.indexOf(':')
+			return [field.slice(0, colon).trim().toLowerCase(), field.slice(colon + 1).trim()]
+		}),
+	)
+	const framed = frameServerBody(bytes, head + 4, status, headers, closed, methods[0] === 'HEAD')
+	const response = { status, headers, body: framed.body, complete: framed.complete }
+	const rest = status < 200 ? methods : methods.slice(1)
+	return framed.complete
+		? [response, ...parseResponses(bytes, closed, rest, framed.end)]
+		: [response]
+}
+
+/** Represents the framing class of what one connection answered: each complete status, and the close. */
+export interface ServerFraming {
+	readonly statuses: readonly number[]
+	readonly closed: boolean
+}
+
+/** Drives one raw TCP connection, frames what it reads, and records when the peer closed it. */
+export class ServerRawClient {
+	readonly #socket: net.Socket
+	readonly #methods: readonly string[]
+	readonly #chunks: Buffer[] = []
+	readonly #closed = Promise.withResolvers<number>()
+
+	constructor(socket: net.Socket, methods: readonly string[]) {
+		this.#socket = socket
+		this.#methods = methods
+		socket.on('data', (chunk: Buffer) => {
+			this.#chunks.push(chunk)
+		})
+		socket.on('error', () => undefined)
+		socket.once('close', () => this.#closed.resolve(performance.now()))
+	}
+
+	/** Lists every response read so far, the last one incomplete while its framing is open. */
+	get responses(): readonly ServerRawResponse[] {
+		return parseResponses(Buffer.concat(this.#chunks), this.closed, this.#methods)
+	}
+
+	/** Lists the responses whose framing ended. */
+	get complete(): readonly ServerRawResponse[] {
+		return this.responses.filter((response) => response.complete)
+	}
+
+	/** Reports whether the connection closed. */
+	get closed(): boolean {
+		return this.#socket.closed
+	}
+
+	/** Resolves with the `performance.now()` reading taken when the connection closed. */
+	get ended(): Promise<number> {
+		return this.#closed.promise
+	}
+
+	/** Writes raw request bytes. */
+	write(data: string): void {
+		this.#socket.write(data)
+	}
+
+	/** Writes `count` copies of `piece`, waiting `gap` milliseconds after each, while the socket is open. */
+	async drip(piece: string, count: number, gap: number): Promise<void> {
+		if (count === 0 || this.#socket.destroyed) return
+		this.#socket.write(piece)
+		await waitForDelay(gap)
+		await this.drip(piece, count - 1, gap)
+	}
+
+	/** Waits until `count` complete responses arrived or the connection closed. */
+	async wait(count: number, description: string, budget = 2_000): Promise<void> {
+		await waitForCondition(description, () => this.closed || this.complete.length >= count, {
+			budget,
+		})
+	}
+
+	/**
+	 * Waits for `count` complete responses, then for the close the last one announces with
+	 * `Connection: close`, and reads the framing class.
+	 */
+	async classify(count: number, description: string): Promise<ServerFraming> {
+		await this.wait(count, description)
+		if (this.complete.at(-1)?.headers.connection === 'close')
+			await waitForCondition(`${description}: the announced close`, () => this.closed)
+		return {
+			statuses: this.complete.map((response) => response.status),
+			closed: this.closed,
+		}
+	}
+
+	/** Closes the connection from the client side. */
+	destroy(): void {
+		this.#socket.destroy()
+	}
+}
+
+/**
+ * Opens a raw TCP connection on `127.0.0.1`.
+ *
+ * @param port - The server's port
+ * @param methods - The request methods the client sends, in order, which frame each response
+ * @returns A connected {@link ServerRawClient}
+ */
+export async function connectServerClient(
+	port: number,
+	methods: readonly string[] = [],
+): Promise<ServerRawClient> {
+	const socket = net.createConnection({ port, host: '127.0.0.1' })
+	const client = new ServerRawClient(socket, methods)
+	await once(socket, 'connect')
+	return client
+}
+
+/**
+ * Builds the dispatcher the server matrix routes into.
+ *
+ * @remarks
+ * `GET /a` and `GET /b` answer `ok`; `POST /a` and `POST /b` read the whole body and answer `ok`.
+ *
+ * @returns The dispatcher
+ */
+export function createMatrixDispatcher<TState>(): DispatcherInterface<TState> {
+	const dispatcher = createDispatcher<TState>()
+	for (const path of ['/a', '/b']) {
+		dispatcher.add({ method: 'GET', path, handler: () => new Response('ok') })
+		dispatcher.add({
+			method: 'POST',
+			path,
+			handler: async (request) => {
+				await request.text()
+				return new Response('ok')
+			},
+		})
+	}
+	return dispatcher
+}
+
+/**
+ * Creates the bare `node:http` control of the server matrix: it reads each request body whole
+ * and answers `200` with `ok`.
+ *
+ * @param options - The `node:http` server options the control runs under
+ * @param calls - The recorder each request that reaches the handler is recorded on
+ * @returns The unstarted control
+ */
+export function createMatrixControl(
+	options: http.ServerOptions,
+	calls: RecorderInterface<[string | undefined]>,
+): http.Server {
+	return http.createServer(options, async (request, response) => {
+		calls.handler(request.url)
+		try {
+			for await (const part of request) void part
+			response.end('ok')
+		} catch {
+			response.destroy()
+		}
+	})
+}
+
+/**
+ * Holds the checking interval the timeout control runs under, in milliseconds: fine enough that
+ * the control answers close to its configured timeout.
+ */
+export const SERVER_CONTROL_INTERVAL = 10
+
+/**
+ * Holds the scheduling allowance a timeout cell adds to its window's end on a loaded host, in
+ * milliseconds.
+ */
+export const SERVER_TIMEOUT_SLACK = 500
+
+/** Holds the gap between two drip writes of a timeout cell, in milliseconds. */
+export const SERVER_DRIP_GAP = 50
+
+/**
+ * Holds the timeouts the timeout cells configure: `headers` below `request`, so each cell reads
+ * the timeout it names.
+ */
+export const SERVER_MATRIX_TIMEOUTS = Object.freeze({ headers: 400, request: 800, keepalive: 400 })
+
+/**
+ * Maps `timeouts` keys onto the `node:http` options they name, for the control.
+ *
+ * @param timeouts - The `ServerOptions.timeouts` keys to map
+ * @param interval - The control's `connectionsCheckingInterval`
+ * @returns The `node:http` server options
+ */
+export function buildControlOptions(
+	timeouts: { readonly headers?: number; readonly request?: number; readonly keepalive?: number },
+	interval?: number,
+): http.ServerOptions {
+	return {
+		...(timeouts.headers === undefined ? {} : { headersTimeout: timeouts.headers }),
+		...(timeouts.request === undefined ? {} : { requestTimeout: timeouts.request }),
+		...(timeouts.keepalive === undefined ? {} : { keepAliveTimeout: timeouts.keepalive }),
+		...(interval === undefined ? {} : { connectionsCheckingInterval: interval }),
+	}
+}
+
+/** Represents the framing class of one timeout cell's connection and the milliseconds until it closed. */
+export interface ServerTimedFraming {
+	readonly framing: ServerFraming
+	readonly elapsed: number
+}
+
+/**
+ * Writes `head`, then drips `piece` every {@link SERVER_DRIP_GAP} milliseconds until the server
+ * closes the connection, and reads the framing class and the time from the first write to the close.
+ *
+ * @param port - The server's port on `127.0.0.1`
+ * @param head - The bytes written first
+ * @param piece - The bytes each drip writes
+ * @param budget - The milliseconds the close may take
+ * @returns The framing class and the elapsed milliseconds
+ */
+export async function driveServerDrip(
+	port: number,
+	head: string,
+	piece: string,
+	budget: number,
+): Promise<ServerTimedFraming> {
+	const client = await connectServerClient(port)
+	try {
+		const start = performance.now()
+		client.write(head)
+		void client.drip(piece, Math.ceil(budget / SERVER_DRIP_GAP) + 1, SERVER_DRIP_GAP)
+		await waitForCondition('the server closes the dripping connection', () => client.closed, {
+			budget,
+		})
+		const elapsed = (await client.ended) - start
+		return {
+			framing: { statuses: client.complete.map((response) => response.status), closed: true },
+			elapsed,
+		}
+	} finally {
+		client.destroy()
+	}
+}
+
+/**
+ * Sends one `GET /a`, reads its answer whole, and reads the framing class and the time from the
+ * answer to the server's close of the idle connection.
+ *
+ * @param port - The server's port on `127.0.0.1`
+ * @param budget - The milliseconds the close may take after the answer
+ * @returns The framing class and the elapsed milliseconds
+ */
+export async function driveServerIdle(port: number, budget: number): Promise<ServerTimedFraming> {
+	const client = await connectServerClient(port, ['GET'])
+	try {
+		client.write('GET /a HTTP/1.1\r\nHost: x\r\n\r\n')
+		await client.wait(1, 'the idle cell answer')
+		const start = performance.now()
+		await waitForCondition('the server closes the idle connection', () => client.closed, {
+			budget,
+		})
+		const elapsed = (await client.ended) - start
+		return {
+			framing: { statuses: client.complete.map((response) => response.status), closed: true },
+			elapsed,
+		}
+	} finally {
+		client.destroy()
+	}
+}
+
+/** Represents one timeout relation row: the `timeouts` given and whether construction refuses them. */
+export interface ServerTimeoutRelation {
+	readonly label: string
+	readonly timeouts: {
+		readonly headers?: number
+		readonly request?: number
+		readonly keepalive?: number
+	}
+	readonly refused: boolean
+}
+
+/**
+ * Lists the edges of Node's `headersTimeout ≤ requestTimeout` relation, which holds while
+ * `requestTimeout` is positive, and the refusals of the former `headers ≤ keepalive` check.
+ * `requestTimeout` defaults to `300_000`, and an omitted `headersTimeout` to the lesser of
+ * `60_000` and `requestTimeout`.
+ */
+export const SERVER_TIMEOUT_RELATIONS: readonly ServerTimeoutRelation[] = Object.freeze([
+	{ label: 'headers equal to request', timeouts: { headers: 500, request: 500 }, refused: false },
+	{ label: 'headers one above request', timeouts: { headers: 501, request: 500 }, refused: true },
+	{ label: 'headers above a request of 0', timeouts: { headers: 501, request: 0 }, refused: false },
+	{
+		label: 'headers of 0 beside a request',
+		timeouts: { headers: 0, request: 500 },
+		refused: false,
+	},
+	{ label: 'headers and request of 0', timeouts: { headers: 0, request: 0 }, refused: false },
+	{ label: 'headers at the default request', timeouts: { headers: 300_000 }, refused: false },
+	{ label: 'headers one above the default request', timeouts: { headers: 300_001 }, refused: true },
+	{ label: 'request alone below the header default', timeouts: { request: 1_000 }, refused: false },
+	{ label: 'request of 0 alone', timeouts: { request: 0 }, refused: false },
+	{
+		label: 'headers above keepalive, a former refusal',
+		timeouts: { headers: 5_000, keepalive: 1_000 },
+		refused: false,
+	},
+	{
+		label: 'headers one above keepalive, a former refusal',
+		timeouts: { headers: 1_001, keepalive: 1_000 },
+		refused: false,
+	},
+])
+
+/** Represents one `timeouts` value construction refuses, and the key the refusal names. */
+export interface ServerTimeoutRefusal {
+	readonly key: 'headers' | 'request' | 'keepalive'
+	readonly value: number
+	readonly limit: string
+}
+
+/**
+ * Lists the values each `node:http` timeout key refuses: off-integer, negative, `NaN`, infinite,
+ * and one past its limit. `headers` and `request` stop at the 2_147_483_647 timer limit;
+ * `keepalive` stops 1_000 below it, because Node arms it plus its default 1_000 ms
+ * `keepAliveTimeoutBuffer` as one timer.
+ */
+export const SERVER_TIMEOUT_REFUSALS: readonly ServerTimeoutRefusal[] = Object.freeze([
+	...(['headers', 'request'] as const).flatMap((key) =>
+		[1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648].map((value) => ({
+			key,
+			value,
+			limit: '2_147_483_647',
+		})),
+	),
+	...[1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_482_648, 2_147_483_647].map((value) => ({
+		key: 'keepalive' as const,
+		value,
+		limit: '2_147_482_647',
+	})),
+])
+
+/** Represents one `timeouts` value and the `connectionsCheckingInterval` Node must read under it. */
+export interface ServerIntervalCase {
+	readonly label: string
+	readonly target: string
+	readonly timeouts: {
+		readonly headers?: number
+		readonly request?: number
+	}
+	readonly interval: number
+}
+
+/**
+ * Lists the checking intervals `Server` must hand Node: half the smaller positive of `headers`
+ * and `request` as Node applies them, rounded up, and Node's own 30_000 when neither is positive.
+ * Node's `request` defaults to 300_000 and its `headers` to the lesser of 60_000 and `request`.
+ * Each `target` is the request target the case's capture is keyed by.
+ */
+export const SERVER_INTERVAL_CASES: readonly ServerIntervalCase[] = Object.freeze([
+	{
+		label: 'the matrix timeouts, headers 400 and request 800',
+		target: '/a?interval=matrix',
+		timeouts: { headers: 400, request: 800 },
+		interval: 200,
+	},
+	{
+		label: 'an odd headers of 401 below request 800',
+		target: '/a?interval=odd',
+		timeouts: { headers: 401, request: 800 },
+		interval: 201,
+	},
+	{
+		label: 'headers 0 beside request 803',
+		target: '/a?interval=request',
+		timeouts: { headers: 0, request: 803 },
+		interval: 402,
+	},
+	{
+		label: 'request 1_000 alone, which caps the header default',
+		target: '/a?interval=capped',
+		timeouts: { request: 1_000 },
+		interval: 500,
+	},
+	{
+		label: 'headers 120_000 alone, below the request default',
+		target: '/a?interval=headers',
+		timeouts: { headers: 120_000 },
+		interval: 60_000,
+	},
+	{
+		label: 'no timeouts, Node defaults',
+		target: '/a?interval=none',
+		timeouts: {},
+		interval: 30_000,
+	},
+	{
+		label: 'request 0 alone, which disables both',
+		target: '/a?interval=disabled',
+		timeouts: { request: 0 },
+		interval: 30_000,
+	},
+])
+
+/** Represents one input of the framing differential. */
+export interface ServerFramingInput {
+	readonly label: string
+	readonly raw: string
+	readonly rest: string | undefined
+	readonly methods: readonly string[]
+	readonly count: number
+}
+
+/**
+ * Lists the inputs the `Server` arm and the bare control must frame alike.
+ *
+ * @remarks
+ * `rest` is written after the first complete response, the interim `100 Continue`. `count` is the
+ * number of complete responses each arm waits for before its class is read. The oversized header
+ * block passes the `16_384` bytes of Node's default `maxHeaderSize`.
+ */
+export const SERVER_FRAMING_INPUTS: readonly ServerFramingInput[] = Object.freeze([
+	{
+		label: 'a pipelined pair',
+		raw: 'GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n',
+		rest: undefined,
+		methods: ['GET', 'GET'],
+		count: 2,
+	},
+	{
+		label: 'Content-Length beside Transfer-Encoding',
+		raw: 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n',
+		rest: undefined,
+		methods: ['POST'],
+		count: 1,
+	},
+	{
+		label: 'two Content-Length values',
+		raw: 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!',
+		rest: undefined,
+		methods: ['POST'],
+		count: 1,
+	},
+	{
+		label: 'an obsolete line fold',
+		raw: 'GET /a HTTP/1.1\r\nHost: x\r\nX-Folded: one\r\n two\r\n\r\n',
+		rest: undefined,
+		methods: ['GET'],
+		count: 1,
+	},
+	{
+		label: 'a bare LF',
+		raw: 'GET /a HTTP/1.1\nHost: x\n\n',
+		rest: undefined,
+		methods: ['GET'],
+		count: 1,
+	},
+	{
+		label: 'an oversized header block',
+		raw: `GET /a HTTP/1.1\r\nHost: x\r\nX-Big: ${'a'.repeat(20_000)}\r\n\r\n`,
+		rest: undefined,
+		methods: ['GET'],
+		count: 1,
+	},
+	{
+		label: 'Expect: 100-continue',
+		raw: 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n',
+		rest: 'hello',
+		methods: ['POST'],
+		count: 2,
+	},
+	{
+		label: 'an unknown Expect',
+		raw: 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nExpect: something-else\r\n\r\n',
+		rest: undefined,
+		methods: ['POST'],
+		count: 1,
+	},
+])
+
+/**
+ * Feeds one framing input to a connection and reads the framing class of what it answered.
+ *
+ * @param port - The server's port on `127.0.0.1`
+ * @param input - The framing input
+ * @returns The framing class
+ */
+export async function frameServerInput(
+	port: number,
+	input: ServerFramingInput,
+): Promise<ServerFraming> {
+	const client = await connectServerClient(port, input.methods)
+	try {
+		client.write(input.raw)
+		if (input.rest !== undefined) {
+			await client.wait(1, `${input.label}: the interim response`)
+			client.write(input.rest)
+		}
+		return await client.classify(input.count, input.label)
+	} finally {
+		client.destroy()
+	}
+}
+
+/** Represents the listeners per event on one message and one response. */
+export interface ServerListenerReading {
+	readonly message: Readonly<Record<string, number>>
+	readonly response: Readonly<Record<string, number>>
+}
+
+/**
+ * Counts the listeners on `emitter` per event name.
+ *
+ * @param emitter - The emitter to read
+ * @returns Each string event name with listeners, mapped to its listener count
+ */
+export function countServerListeners(
+	emitter: NodeJS.EventEmitter,
+): Readonly<Record<string, number>> {
+	return Object.fromEntries(
+		emitter
+			.eventNames()
+			.filter((name) => typeof name === 'string')
+			.map((name) => [name, emitter.listenerCount(name)]),
+	)
+}
+
+/**
+ * Subtracts `control`'s listener counts from `arm`'s per event, keeping each event either holds.
+ *
+ * @param arm - The counts of the arm under test
+ * @param control - The counts of the control arm
+ * @returns The difference per event
+ */
+export function subtractServerListeners(
+	arm: Readonly<Record<string, number>>,
+	control: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> {
+	const names = [...new Set([...Object.keys(arm), ...Object.keys(control)])].toSorted()
+	return Object.fromEntries(names.map((name) => [name, (arm[name] ?? 0) - (control[name] ?? 0)]))
+}
+
+/**
+ * Captures the message, the response, and the live `node:http` server of each exchange a server
+ * starts, keyed by request target, through the `http.server.request.start` diagnostics channel.
+ */
+export class ServerExchanges {
+	readonly #pairs = new Map<string, readonly [IncomingMessage, http.ServerResponse]>()
+	readonly #servers = new Map<string, http.Server>()
+	readonly #subscriber: (message: unknown) => void
+
+	constructor() {
+		this.#subscriber = this.#record.bind(this)
+		diagnostics.subscribe('http.server.request.start', this.#subscriber)
+	}
+
+	/** Returns the message and the response of the exchange for `target`, or `undefined`. */
+	exchange(target: string): readonly [IncomingMessage, http.ServerResponse] | undefined {
+		return this.#pairs.get(target)
+	}
+
+	/** Returns the live `node:http` server that started the exchange for `target`, or `undefined`. */
+	server(target: string): http.Server | undefined {
+		return this.#servers.get(target)
+	}
+
+	/** Stops capturing. */
+	destroy(): void {
+		diagnostics.unsubscribe('http.server.request.start', this.#subscriber)
+	}
+
+	#record(message: unknown): void {
+		if (!isRecord(message)) return
+		const { request, response, server } = message
+		if (!(request instanceof http.IncomingMessage) || !(response instanceof http.ServerResponse))
+			return
+		if (request.url === undefined) return
+		this.#pairs.set(request.url, [request, response])
+		if (server instanceof http.Server) this.#servers.set(request.url, server)
+	}
+}
+
+/**
+ * Builds a dispatcher whose `GET /count/:arm` route reads the listeners on its exchange's message
+ * and response as the handler starts.
+ *
+ * @param exchanges - The capture that holds each exchange's message and response
+ * @param readings - The recorder each reading is recorded on, with its request target
+ * @returns The dispatcher
+ */
+export function createCountingDispatcher<TState>(
+	exchanges: ServerExchanges,
+	readings: RecorderInterface<[string, ServerListenerReading]>,
+): DispatcherInterface<TState> {
+	const dispatcher = createDispatcher<TState>()
+	dispatcher.add({
+		method: 'GET',
+		path: '/count/:arm',
+		handler: (request) => {
+			const target = new URL(request.url).pathname
+			const pair = exchanges.exchange(target)
+			if (pair !== undefined) {
+				readings.handler(target, {
+					message: countServerListeners(pair[0]),
+					response: countServerListeners(pair[1]),
+				})
+			}
+			return new Response('counted')
+		},
+	})
+	return dispatcher
+}
+
+/**
+ * Creates the router-only control of the listener row: a bare `node:http` server that builds the
+ * exchange's `Request` with `buildRequest` and writes the dispatcher's answer with `sendResponse`,
+ * the calls `Server` makes, and attaches nothing else.
+ *
+ * @param dispatcher - The dispatcher the control routes into
+ * @returns The unstarted control
+ */
+export function createRouterControl(dispatcher: DispatcherInterface<undefined>): http.Server {
+	return http.createServer(async (message, response) => {
+		const exchange = new AbortController()
+		const request = buildRequest(message, { response, signal: exchange.signal })
+		await sendResponse(await dispatcher.handle(request, undefined), response).catch(() => undefined)
+	})
+}
+
+/**
+ * Builds the dispatcher of the routed cells: `GET /items` answers `items` from a stream body
+ * whose cancellation is recorded, with `Content-Type` and `X-Items` headers.
+ *
+ * @param cancels - The recorder each cancellation of a body source is recorded on
+ * @returns The dispatcher
+ */
+export function createRoutedDispatcher<TState>(
+	cancels: RecorderInterface<[unknown]>,
+): DispatcherInterface<TState> {
+	const dispatcher = createDispatcher<TState>()
+	dispatcher.add({
+		method: 'GET',
+		path: '/items',
+		handler: () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					pull(controller) {
+						controller.enqueue(new TextEncoder().encode('items'))
+						controller.close()
+					},
+					cancel(reason) {
+						cancels.handler(reason)
+					},
+				}),
+				{ headers: { 'Content-Type': 'text/plain', 'X-Items': 'listed' } },
+			),
+	})
+	return dispatcher
+}
+
+/**
+ * Creates the bare `node:http` control of the routed cells: `GET /items` answers `items` with the
+ * routed headers, and `HEAD /items` answers the same headers with no body.
+ *
+ * @returns The unstarted control
+ */
+export function createRoutedControl(): http.Server {
+	return http.createServer((request, response) => {
+		response.writeHead(200, { 'Content-Type': 'text/plain', 'X-Items': 'listed' })
+		if (request.method === 'HEAD') response.end()
+		else {
+			response.write('items')
+			response.end()
+		}
+	})
+}
+
+/**
+ * Removes the fields that frame a message or vary per response from a header record: `date`,
+ * `transfer-encoding`, and `content-length`.
+ *
+ * @param headers - The response headers, keyed in lower case
+ * @returns The remaining headers
+ */
+export function filterServerHeaders(
+	headers: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+	return Object.fromEntries(
+		Object.entries(headers).filter(
+			([name]) => !['date', 'transfer-encoding', 'content-length'].includes(name),
+		),
+	)
 }

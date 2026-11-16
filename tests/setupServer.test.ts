@@ -8,6 +8,9 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createRecorder, readProperty, requireValue, waitForCondition } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
+	connectServerClient,
+	parseResponses,
+	subtractServerListeners,
 	trackLoopback,
 	createRawPeer,
 	createAnsweringPeer,
@@ -200,5 +203,89 @@ describe('setupServer — upgrade outcomes', () => {
 		server.on('upgrade', (_request, socket) => socket.destroy())
 		const loopback = trackLoopback(bound, await createLoopback(server))
 		expect(await upgradeRequest(loopback.url, '/ws')).toEqual({ claimed: false, status: 0 })
+	})
+})
+
+describe('parseResponses', () => {
+	it('frames a HEAD response and a 204 at the blank line whatever their framing headers say', () => {
+		const bytes = Buffer.from(
+			'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHTTP/1.1 204 No Content\r\nContent-Length: 3\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',
+		)
+		expect(parseResponses(bytes, false, ['HEAD', 'DELETE', 'GET'])).toEqual([
+			{ status: 200, headers: { 'content-length': '5' }, body: '', complete: true },
+			{ status: 204, headers: { 'content-length': '3' }, body: '', complete: true },
+			{ status: 200, headers: { 'content-length': '2' }, body: 'ok', complete: true },
+		])
+	})
+
+	it('frames an interim 100 as answering the same request as the response after it', () => {
+		const bytes = Buffer.from(
+			'HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\n\r\n',
+		)
+		expect(
+			parseResponses(bytes, false, ['POST', 'HEAD']).map((response) => [
+				response.status,
+				response.body,
+				response.complete,
+			]),
+		).toEqual([
+			[100, '', true],
+			[200, 'ok', true],
+			[200, '', true],
+		])
+	})
+
+	it('decodes a chunked body through its trailer section, and holds an unfinished one incomplete', () => {
+		const whole = Buffer.from(
+			'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nX-Sum: 5\r\n\r\n',
+		)
+		const cut = Buffer.from('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n')
+		expect(
+			parseResponses(whole, false, []).map((response) => [response.body, response.complete]),
+		).toEqual([['abcde', true]])
+		expect(
+			parseResponses(cut, false, []).map((response) => [response.body, response.complete]),
+		).toEqual([['abc', false]])
+	})
+
+	it('completes a close-delimited body only after the connection closed', () => {
+		const bytes = Buffer.from('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nrest')
+		expect(parseResponses(bytes, false, []).map((response) => response.complete)).toEqual([false])
+		expect(
+			parseResponses(bytes, true, []).map((response) => [response.body, response.complete]),
+		).toEqual([['rest', true]])
+	})
+
+	it('frames nothing from bytes that hold no complete header block', () => {
+		expect(parseResponses(Buffer.from('HTTP/1.1 200 OK\r\nContent-Le'), false, [])).toEqual([])
+	})
+})
+
+describe('ServerRawClient', () => {
+	it('reads the framing class and the close of what a real peer answered', async () => {
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(http.createServer((_request, response) => response.end('ok'))),
+		)
+		const client = await connectServerClient(loopback.port, ['GET'])
+		try {
+			client.write('GET / HTTP/1.1\r\nHost: x\r\nX-Folded: a\r\n b\r\n\r\n')
+			expect(await client.classify(1, 'the folded request')).toEqual({
+				statuses: [400],
+				closed: true,
+			})
+		} finally {
+			client.destroy()
+		}
+	})
+})
+
+describe('subtractServerListeners', () => {
+	it('keeps each event either side holds', () => {
+		expect(subtractServerListeners({ close: 3, end: 1 }, { close: 1, finish: 1 })).toEqual({
+			close: 2,
+			end: 1,
+			finish: -1,
+		})
 	})
 })
