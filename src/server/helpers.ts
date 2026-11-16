@@ -593,7 +593,7 @@ export function normalizeSecret(secret: TokenSecret): readonly [string, ...strin
 	if (entries === undefined)
 		throw new ServerError(
 			'SECRET',
-			'createSigner refuses a secret that is not a string or a list of strings: pass a non-blank string or a non-empty list of non-blank strings',
+			'the signing secret is not a string or a list of strings: pass a non-blank string or a non-empty list of non-blank strings',
 			{ received: typeof secret },
 		)
 	const blank = entries.flatMap((entry, index) =>
@@ -604,8 +604,8 @@ export function normalizeSecret(secret: TokenSecret): readonly [string, ...strin
 		throw new ServerError(
 			'SECRET',
 			entries.length === 0
-				? 'createSigner refuses an empty secret list: pass a non-blank string or a non-empty list of non-blank strings'
-				: `createSigner refuses a secret whose entries at ${blank.join(', ')} are blank or not strings: pass a non-blank string or a non-empty list of non-blank strings`,
+				? 'the signing secret is an empty list: pass a non-blank string or a non-empty list of non-blank strings'
+				: `the signing secret has blank or non-string entries at ${blank.join(', ')}: pass a non-blank string or a non-empty list of non-blank strings`,
 			{ entries: blank, count: entries.length },
 		)
 	return [current, ...older]

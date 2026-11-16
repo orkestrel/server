@@ -149,8 +149,9 @@ export function isContentTooLargeError(value: unknown): value is ContentTooLarge
  * the message hidden unless `expose` is set, and an `'EVENT'` refusal is raised
  * to the caller that serialized an SSE message, its `context.field` naming the
  * refused field, and a `'SECRET'` refusal is raised to the caller that built a
- * signer from a malformed secret, its `context` naming the refused positions
- * and holding no secret text. Throw an {@link HTTPError} for a
+ * signer from a malformed secret, its `context` naming the refused positions,
+ * or the received type for a value that is not a string or a list, and holding
+ * no secret text. Throw an {@link HTTPError} for a
  * client-facing fault instead. Narrow a caught value with
  * {@link isServerError}.
  *

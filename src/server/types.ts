@@ -176,8 +176,9 @@ export interface SignerInterface {
 	 * Answers `false` before reading a key when `signature` is not canonical
 	 * base64url or does not decode to the 32 bytes of an HMAC-SHA256. A valid
 	 * signature returns at its key's position, so its timing reveals that
-	 * position; an invalid one reads every key. Never rejects for a pair of
-	 * strings.
+	 * position; an invalid one reads every key. The `Signer` class never rejects
+	 * for a pair of strings; a consumer implementation whose `verify` rejects
+	 * makes `verifyToken` and `readSignedCookie` reject with its error.
 	 */
 	verify(message: string, signature: string): Promise<boolean>
 }
