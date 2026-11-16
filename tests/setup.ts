@@ -18,13 +18,16 @@ afterEach(() => {
 /**
  * Builds the per-request {@link MiddlewareContext} a middleware, negotiator, or
  * guide-fence proof drives — a fixed `GET http://localhost/` request with an
- * empty body and the caller's own state bag.
+ * empty body, a plaintext loopback connection, and the caller's own state bag.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  * @param state - The state bag the returned context carries, passed through by
  *   identity
- * @returns A context over `http://localhost/` whose `method` is `'GET'` and
- *   whose `body()` resolves `undefined`
+ * @param controller - The controller whose `abort` the context's `abort` calls;
+ *   Default: a fresh `AbortController`
+ * @returns A context over `http://localhost/` whose `method` is `'GET'`, whose
+ *   `connection` is `{ ip: '127.0.0.1', encrypted: false }`, and whose `body()`
+ *   resolves `undefined`
  *
  * @example
  * ```ts
@@ -33,11 +36,16 @@ afterEach(() => {
  * buildContext({ userId: 'me' }).state.userId // 'me'
  * ```
  */
-export function buildContext<TState>(state: TState): MiddlewareContext<TState> {
+export function buildContext<TState>(
+	state: TState,
+	controller: AbortController = new AbortController(),
+): MiddlewareContext<TState> {
 	return {
 		url: new URL('http://localhost/'),
 		method: 'GET',
 		state,
+		connection: { ip: '127.0.0.1', encrypted: false },
 		body: async () => undefined,
+		abort: controller.abort.bind(controller),
 	}
 }

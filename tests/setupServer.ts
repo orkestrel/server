@@ -8,6 +8,7 @@ import type { RecorderInterface } from '@orkestrel/test'
 import type { RandomFunction } from '@orkestrel/contract'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
+	Connection,
 	MiddlewareContext,
 	MiddlewareHandler,
 	NextFunction,
@@ -21,7 +22,8 @@ import { createDispatcher } from '@orkestrel/router'
 import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
-import { resolveRoot } from '@orkestrel/test'
+import { queryObjects } from 'node:v8'
+import { resolveRoot, waitForAbort, waitForDelay } from '@orkestrel/test'
 
 /** Holds the mutable observation owned by one test invocation. */
 export class ServerObservation<T> {
@@ -629,14 +631,6 @@ export function createObservedRefusal(
 	}
 }
 
-export async function substituteServerRequest(
-	_request: Request,
-	_context: MiddlewareContext<Record<string, never>>,
-	next: NextFunction,
-): Promise<Response> {
-	return next(new Request('http://localhost/substituted'))
-}
-
 export function createResponseHeader(
 	name: string,
 	value: string,
@@ -649,12 +643,12 @@ export function createResponseHeader(
 }
 
 export async function stashServerUser(
-	request: Request,
+	_request: Request,
 	context: MiddlewareContext<ServerUserState>,
 	next: NextFunction,
 ): Promise<Response> {
 	context.state.userId = 'user-42'
-	return next(request)
+	return next()
 }
 
 export interface EchoState {
@@ -969,4 +963,353 @@ export function upgradeRequest(
 		})
 		request.end()
 	})
+}
+
+// ── The exchange seam oracle ─────────────────────────────────────────────────
+//
+// The tables and layers `tests/src/server/integration.test.ts` drives through a real `Server`. Every
+// expectation comes from the declared seam contract, never from the code: one `Request` per
+// exchange, one context per exchange that carries `connection` and `abort`, a `next` that takes no
+// argument, an in-flight registry of abort handles, and mutable response headers at every layer.
+
+/** Holds the JSON body the body-reading cells post: the request of fit finding F1. */
+export const SEAM_BODY = '{"item":"lamp"}'
+
+/** Represents one argument a layer passes to its `next`, which the seam refuses. */
+export interface SeamArgumentCase {
+	readonly label: string
+	readonly build: (request: Request) => unknown
+}
+
+/** Lists the arguments a layer can pass to its `next`; each call rejects with code `'NEXT'`. */
+export const SEAM_NEXT_ARGUMENTS: readonly SeamArgumentCase[] = Object.freeze([
+	{
+		label: 'a rewritten Request for another path, the fit finding F2 rewrite',
+		build: (request: Request): unknown =>
+			new Request(new URL('/b', request.url), { method: 'POST', body: 'rewritten body' }),
+	},
+	{
+		label: 'a copy carrying another signal, the request rebuild of fit finding F1',
+		build: (request: Request): unknown =>
+			new Request(request, { signal: AbortSignal.timeout(5_000) }),
+	},
+	{ label: 'the same Request', build: (request: Request): unknown => request },
+	{ label: 'undefined', build: (): unknown => undefined },
+])
+
+/** Represents one `state` factory the connection cells run under. */
+export interface SeamStateCase {
+	readonly label: string
+	readonly state: (connection: Connection) => object
+}
+
+/** Lists the `state` factories under which every layer reads the exchange's `connection`. */
+export const SEAM_STATE_FACTORIES: readonly SeamStateCase[] = Object.freeze([
+	{ label: 'a factory that ignores the connection, fit finding F4', state: (): object => ({}) },
+	{
+		label: 'a factory that keeps the connection',
+		state: (connection: Connection): object => ({ connection }),
+	},
+])
+
+/** Represents one route response whose headers a layer sets after `await next()`. */
+export interface SeamResponseCase {
+	readonly label: string
+	readonly status: number
+	readonly location: string | undefined
+	readonly body: string
+	readonly respond: (request: Request, origin: string) => Response | Promise<Response>
+}
+
+/**
+ * Lists the immutable-header responses a route returns behind header-setting layers: a
+ * `Response.redirect` result to `/next`, and a `fetch` result from an answering peer at `origin`,
+ * whose body is `parked`.
+ */
+export const SEAM_IMMUTABLE_RESPONSES: readonly SeamResponseCase[] = Object.freeze([
+	{
+		label: 'a Response.redirect result',
+		status: 302,
+		location: '/next',
+		body: '',
+		respond: (request: Request): Response => Response.redirect(new URL('/next', request.url), 302),
+	},
+	{
+		label: 'a fetch result',
+		status: 200,
+		location: undefined,
+		body: 'parked',
+		respond: (_request: Request, origin: string): Promise<Response> => fetch(`${origin}/peer`),
+	},
+])
+
+/** Reports one reply a {@link sendSeamRequest} call read. */
+export interface SeamReply {
+	readonly status: number
+	readonly body: string
+	readonly reused: boolean
+}
+
+/**
+ * Sends one `GET` through `agent` and reads its status, its body, and whether the request went
+ * out on a socket an earlier request used.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param path - The request path
+ * @param agent - The keep-alive agent that owns the connection
+ * @returns The reply
+ */
+export function sendSeamRequest(port: number, path: string, agent: http.Agent): Promise<SeamReply> {
+	return new Promise((resolve, reject) => {
+		const request = http.get({ host: '127.0.0.1', port, path, agent }, (response) => {
+			const chunks: Buffer[] = []
+			response.on('data', (chunk: Buffer) => chunks.push(chunk))
+			response.once('end', () =>
+				resolve({
+					status: response.statusCode ?? 0,
+					body: Buffer.concat(chunks).toString('utf8'),
+					reused: request.reusedSocket,
+				}),
+			)
+		})
+		request.once('error', reject)
+	})
+}
+
+/**
+ * Describes an abort reason as the text a seam route answers with: an error's message, or the
+ * reason's string form.
+ *
+ * @param reason - The reason a signal carries
+ * @returns The text that names it
+ */
+export function describeSeamReason(reason: unknown): string {
+	return reason instanceof Error ? reason.message : String(reason)
+}
+
+/**
+ * Builds the dispatcher the seam cells route into, recording every request it receives.
+ *
+ * @remarks
+ * - `GET /plain` answers `plain`.
+ * - `GET /state` answers `aborted` or `open` for its signal as the handler starts.
+ * - `GET /hold` parks until its request signal aborts, then answers the reason's text.
+ * - `GET /gate` parks until `gate` settles, then answers `aborted` or `open` for its signal.
+ * - `POST /a` and `POST /b` answer their path and their body text.
+ *
+ * @param requests - The log each route appends its `Request` to, in arrival order
+ * @param gate - The promise `GET /gate` parks on
+ * @returns The dispatcher
+ */
+export function createSeamDispatcher<TState>(
+	requests: Request[],
+	gate: Promise<void>,
+): DispatcherInterface<TState> {
+	const dispatcher = createDispatcher<TState>()
+	dispatcher.add({
+		method: 'GET',
+		path: '/plain',
+		handler: (request) => {
+			requests.push(request)
+			return new Response('plain')
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/state',
+		handler: (request) => {
+			requests.push(request)
+			return new Response(request.signal.aborted ? 'aborted' : 'open')
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/hold',
+		handler: async (request) => {
+			requests.push(request)
+			await waitForAbort(request.signal)
+			return new Response(describeSeamReason(request.signal.reason))
+		},
+	})
+	dispatcher.add({
+		method: 'GET',
+		path: '/gate',
+		handler: async (request) => {
+			requests.push(request)
+			await gate
+			return new Response(request.signal.aborted ? 'aborted' : 'open')
+		},
+	})
+	for (const path of ['/a', '/b']) {
+		dispatcher.add({
+			method: 'POST',
+			path,
+			handler: async (request) => {
+				requests.push(request)
+				return new Response(`${path}:${await request.text()}`)
+			},
+		})
+	}
+	return dispatcher
+}
+
+/**
+ * Creates a layer that aborts its exchange with a `TimeoutError` after `ms`, the deadline that
+ * `createDeadline` in `@orkestrel/middleware` builds on `context.abort`.
+ *
+ * @param ms - The deadline in milliseconds
+ * @returns The layer
+ */
+export function createDeadlineLayer<TState>(ms: number): MiddlewareHandler<TState> {
+	return async (_request, context, next) => {
+		// Bound up front, so a context without `abort` refuses in the layer rather than in the timer.
+		const abort = context.abort.bind(context)
+		const timer = setTimeout(
+			() => abort(new DOMException(`deadline of ${ms} ms passed`, 'TimeoutError')),
+			ms,
+		)
+		try {
+			return await next()
+		} finally {
+			clearTimeout(timer)
+		}
+	}
+}
+
+/**
+ * Creates a layer that answers with the decoded request body and never calls `next`.
+ *
+ * @returns The layer, answering `{ body }` as JSON
+ */
+export function createBodyLayer<TState>(): MiddlewareHandler<TState> {
+	return async (_request, context) => Response.json({ body: await context.body() })
+}
+
+/**
+ * Creates a layer that records the request and the context it receives, then continues.
+ *
+ * @param seen - The log the layer appends its `[request, context]` pair to
+ * @returns The layer
+ */
+export function createSeenLayer<TState>(
+	seen: Array<readonly [Request, MiddlewareContext<TState>]>,
+): MiddlewareHandler<TState> {
+	return async (request, context, next) => {
+		seen.push([request, context])
+		return next()
+	}
+}
+
+/**
+ * Creates a layer that records the response its `next` resolves, then sets `name` on it.
+ *
+ * @param seen - The log the layer appends each downstream response to
+ * @param name - The header the layer sets to `set`
+ * @returns The layer
+ */
+export function createResponseLayer<TState>(
+	seen: Response[],
+	name: string,
+): MiddlewareHandler<TState> {
+	return async (_request, _context, next) => {
+		const response = await next()
+		seen.push(response)
+		response.headers.set(name, 'set')
+		return response
+	}
+}
+
+/**
+ * Creates a layer that calls its `next` with the argument `build` returns, records the
+ * rejection, and rethrows it.
+ *
+ * @param build - Builds the argument from the layer's request
+ * @param refusal - The observation the rejection is recorded in
+ * @returns The layer
+ */
+export function createArgumentLayer<TState>(
+	build: (request: Request) => unknown,
+	refusal: ServerObservation<unknown>,
+): MiddlewareHandler<TState> {
+	return async (request, _context, next) => {
+		// A layer written against the 0.0.28 seam passes its `next` an argument; the type admits it.
+		const forward: (argument: unknown) => Promise<Response> = next
+		try {
+			return await forward(build(request))
+		} catch (error) {
+			refusal.value = error
+			throw error
+		}
+	}
+}
+
+/**
+ * Creates a layer that aborts its exchange with each reason in order when the request path is
+ * `path`, then continues.
+ *
+ * @param path - The pathname the layer aborts on
+ * @param reasons - The reasons passed to `context.abort`, in call order
+ * @returns The layer
+ */
+export function createAbortLayer<TState>(
+	path: string,
+	reasons: readonly unknown[],
+): MiddlewareHandler<TState> {
+	return async (_request, context, next) => {
+		if (context.url.pathname === path) for (const reason of reasons) context.abort(reason)
+		return next()
+	}
+}
+
+/**
+ * Counts the live objects in this process's heap after three full collections, each followed by a
+ * yield so the cleanup callbacks it queued run before the next.
+ *
+ * @remarks
+ * `queryObjects` runs a full garbage collection before it counts. A `FinalizationRegistry`
+ * callback runs as a later task, and freeing what one callback releases can queue another: fetch
+ * unregisters a `Request`'s abort listener from its signal, and only then can Node collect a
+ * signal `AbortSignal.any` composed and prune its bookkeeping. Three rounds let that chain settle.
+ *
+ * @returns The number of live objects whose prototype chain holds `Object.prototype`
+ */
+export async function countLiveObjects(): Promise<number> {
+	queryObjects(Object, { format: 'count' })
+	await waitForDelay(10)
+	queryObjects(Object, { format: 'count' })
+	await waitForDelay(10)
+	return queryObjects(Object, { format: 'count' })
+}
+
+/**
+ * Sends `count` sequential `GET` requests for `path` on each of the agent's sockets in turn, and
+ * reads every reply whole.
+ *
+ * @param port - The server's bound port on `127.0.0.1`
+ * @param path - The request path
+ * @param count - The number of requests
+ * @param agent - The keep-alive agent that owns the connections
+ * @returns The number of replies whose status was not 200
+ */
+export async function driveSeamRequests(
+	port: number,
+	path: string,
+	count: number,
+	agent: http.Agent,
+): Promise<number> {
+	const lanes = agent.maxSockets
+	const shares = Array.from(
+		{ length: lanes },
+		(_, lane) => Math.floor(count / lanes) + (lane < count % lanes ? 1 : 0),
+	)
+	const failures = await Promise.all(
+		shares.map((share) =>
+			Array.from({ length: share }).reduce<Promise<number>>(async (previous) => {
+				const failed = await previous
+				const reply = await sendSeamRequest(port, path, agent)
+				return failed + (reply.status === 200 ? 0 : 1)
+			}, Promise.resolve(0)),
+		),
+	)
+	return failures.reduce((sum, failed) => sum + failed, 0)
 }

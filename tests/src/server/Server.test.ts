@@ -625,15 +625,15 @@ describe('Server — context.body() caching', () => {
 				dispatcher,
 				state: () => undefined,
 				middleware: [
-					async (request, context, next) => {
+					async (_request, context, next) => {
 						firstRead.value = await context.body()
-						return next(request)
+						return next()
 					},
-					async (request, context, next) => {
+					async (_request, context, next) => {
 						// A second middleware reads it too — the same cached value, the
 						// underlying stream is never read twice.
 						secondRead.value = await context.body()
-						return next(request)
+						return next()
 					},
 				],
 			}),
@@ -2303,9 +2303,9 @@ describe('Server — capstone', () => {
 				dispatcher,
 				state: () => ({}),
 				middleware: [
-					async (request, context, next) => {
+					async (_request, context, next) => {
 						context.state.userId = 'capstone-user'
-						const response = await next(request)
+						const response = await next()
 						response.headers.set('x-capstone', 'yes')
 						return response
 					},
@@ -2333,7 +2333,7 @@ describe('Server — capstone', () => {
 			createServer<AppState>({
 				dispatcher,
 				state: () => ({}),
-				middleware: [async (request, _context, next) => next(request)],
+				middleware: [async (_request, _context, next) => next()],
 			}),
 		)
 		const port = await server.start()

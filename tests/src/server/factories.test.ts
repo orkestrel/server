@@ -9,6 +9,7 @@ import {
 	Server,
 	Stream,
 } from '@src/server'
+import { buildContext } from '../../setup.js'
 
 // Mirror of `src/server/factories.ts` — each factory's round-trip (the instance
 // it returns satisfies the interface it declares) plus its return-type
@@ -30,12 +31,7 @@ describe('createNegotiator — round-trip', () => {
 		expect(negotiator.language('en', ['en'])).toBe('en')
 		const response = await negotiator.format(
 			new Request('http://localhost/', { headers: { accept: 'text/plain' } }),
-			{
-				url: new URL('http://localhost/'),
-				method: 'GET',
-				state: undefined,
-				body: async () => undefined,
-			},
+			buildContext(undefined),
 			{ 'text/plain': () => new Response('ok') },
 		)
 		await expect(response.text()).resolves.toBe('ok')
