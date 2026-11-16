@@ -697,18 +697,25 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   (`headersTimeout`, the time to receive the request headers), `request`
  *   (`requestTimeout`, the time to receive the whole request; no server
  *   timeout bounds the response), and `keepalive` (`keepAliveTimeout`, the
- *   idle time a kept-alive connection waits for its next request). `0`
- *   disables each of those three. An omitted one keeps Node's default:
- *   `request` is `DEFAULT_REQUEST_TIMEOUT_MS`, `headers` the lesser of
+ *   idle time a kept-alive connection waits for its next request; Node adds
+ *   its `keepAliveTimeoutBuffer`, 1_000 ms by default, so a `keepalive` of
+ *   400 closes an idle connection after about 1_400 ms). `0` disables each
+ *   of those three. An omitted one keeps Node's default: `request` is
+ *   `DEFAULT_REQUEST_TIMEOUT_MS`, `headers` the lesser of
  *   `DEFAULT_HEADERS_TIMEOUT_MS` and `request`, and `keepalive` Node's
- *   `keepAliveTimeout` default. Node answers a request whose headers or body
- *   outlast their timeout with `408` and closes the connection. The server
- *   sets Node's `connectionsCheckingInterval` to half the smaller positive
- *   of `headers` and `request`, so each expires within one and a half times
- *   its value. Every present value must be an integer from 0 through
- *   2_147_483_647, and `headers` must not exceed `request` while `request`
- *   is positive, Node's own relation; construction throws a `TypeError`
- *   otherwise. A response deadline belongs to a middleware, such as
+ *   `keepAliveTimeout` default. When `headers` or `request` passes before
+ *   any response has started, Node answers `408` and closes the connection;
+ *   after a response has started, Node closes the connection, which cuts
+ *   that response short. The server sets Node's
+ *   `connectionsCheckingInterval` to `Math.ceil(m / 2)` milliseconds, where
+ *   `m` is the smaller positive of `headers` and `request` as Node applies
+ *   them, so each expires at most one such interval after it passes; with
+ *   neither positive, Node keeps its own interval. `start`, `headers`, and
+ *   `request` must be integers from 0 through 2_147_483_647, and
+ *   `keepalive` an integer from 0 through 2_147_482_647, so that Node's
+ *   timer of `keepalive` plus its buffer stays within that limit; `headers`
+ *   must not exceed `request` while `request` is positive, Node's own
+ *   relation. Construction throws a `TypeError` otherwise. A response deadline belongs to a middleware, such as
  *   `@orkestrel/middleware`'s `createDeadline`, which aborts the exchange
  *   through `context.abort`. A startup expiry rejects with a `DOMException`
  *   named `TimeoutError`; caller cancellation rejects with the caller
@@ -851,9 +858,10 @@ export interface ServerInterface<TState> {
 	 * counted work. A connection that still carries an open exchange, including
 	 * one whose handler answered while its body still uploads, ends when its
 	 * last exchange completes, and the `stop()` call resolves after that
-	 * connection closes. Each body byte restarts Node's keep-alive socket
-	 * timer, so no Node timeout bounds an upload that keeps sending. The
-	 * deadline that bounds the drain therefore stays armed through this wait:
+	 * connection closes. Node's `request` timeout bounds an upload that keeps
+	 * sending after its response, unless `timeouts.request` is `0`, when no
+	 * Node timeout bounds it. The deadline that bounds the drain therefore
+	 * stays armed through this wait:
 	 * when it expires before the server's `close` event, the server destroys
 	 * every socket still open, as an expired drain does, so no connection
 	 * holds the `stop()` call past the `drain` deadline. A request Node

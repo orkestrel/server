@@ -1804,14 +1804,91 @@ export const SERVER_TIMEOUT_RELATIONS: readonly ServerTimeoutRelation[] = Object
 export interface ServerTimeoutRefusal {
 	readonly key: 'headers' | 'request' | 'keepalive'
 	readonly value: number
+	readonly limit: string
 }
 
-/** Lists the values each `node:http` timeout key refuses: off-integer, negative, `NaN`, and past the timer limit. */
-export const SERVER_TIMEOUT_REFUSALS: readonly ServerTimeoutRefusal[] = Object.freeze(
-	(['headers', 'request', 'keepalive'] as const).flatMap((key) =>
-		[1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648].map((value) => ({ key, value })),
+/**
+ * Lists the values each `node:http` timeout key refuses: off-integer, negative, `NaN`, infinite,
+ * and one past its limit. `headers` and `request` stop at the 2_147_483_647 timer limit;
+ * `keepalive` stops 1_000 below it, because Node arms it plus its default 1_000 ms
+ * `keepAliveTimeoutBuffer` as one timer.
+ */
+export const SERVER_TIMEOUT_REFUSALS: readonly ServerTimeoutRefusal[] = Object.freeze([
+	...(['headers', 'request'] as const).flatMap((key) =>
+		[1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648].map((value) => ({
+			key,
+			value,
+			limit: '2_147_483_647',
+		})),
 	),
-)
+	...[1.5, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_482_648, 2_147_483_647].map((value) => ({
+		key: 'keepalive' as const,
+		value,
+		limit: '2_147_482_647',
+	})),
+])
+
+/** Represents one `timeouts` value and the `connectionsCheckingInterval` Node must read under it. */
+export interface ServerIntervalCase {
+	readonly label: string
+	readonly target: string
+	readonly timeouts: {
+		readonly headers?: number
+		readonly request?: number
+	}
+	readonly interval: number
+}
+
+/**
+ * Lists the checking intervals `Server` must hand Node: half the smaller positive of `headers`
+ * and `request` as Node applies them, rounded up, and Node's own 30_000 when neither is positive.
+ * Node's `request` defaults to 300_000 and its `headers` to the lesser of 60_000 and `request`.
+ * Each `target` is the request target the case's capture is keyed by.
+ */
+export const SERVER_INTERVAL_CASES: readonly ServerIntervalCase[] = Object.freeze([
+	{
+		label: 'the matrix timeouts, headers 400 and request 800',
+		target: '/a?interval=matrix',
+		timeouts: { headers: 400, request: 800 },
+		interval: 200,
+	},
+	{
+		label: 'an odd headers of 401 below request 800',
+		target: '/a?interval=odd',
+		timeouts: { headers: 401, request: 800 },
+		interval: 201,
+	},
+	{
+		label: 'headers 0 beside request 803',
+		target: '/a?interval=request',
+		timeouts: { headers: 0, request: 803 },
+		interval: 402,
+	},
+	{
+		label: 'request 1_000 alone, which caps the header default',
+		target: '/a?interval=capped',
+		timeouts: { request: 1_000 },
+		interval: 500,
+	},
+	{
+		label: 'headers 120_000 alone, below the request default',
+		target: '/a?interval=headers',
+		timeouts: { headers: 120_000 },
+		interval: 60_000,
+	},
+	{
+		label: 'no timeouts, Node defaults',
+		target: '/a?interval=none',
+		timeouts: {},
+		interval: 30_000,
+	},
+	{
+		label: 'request 0 alone, which disables both',
+		target: '/a?interval=disabled',
+		timeouts: { request: 0 },
+		interval: 30_000,
+	},
+])
 
 /** Represents one input of the framing differential. */
 export interface ServerFramingInput {
@@ -1952,11 +2029,12 @@ export function subtractServerListeners(
 }
 
 /**
- * Captures the message and the response of each exchange a `node:http` server starts, keyed by
- * request target, through the `http.server.request.start` diagnostics channel.
+ * Captures the message, the response, and the live `node:http` server of each exchange a server
+ * starts, keyed by request target, through the `http.server.request.start` diagnostics channel.
  */
 export class ServerExchanges {
 	readonly #pairs = new Map<string, readonly [IncomingMessage, http.ServerResponse]>()
+	readonly #servers = new Map<string, http.Server>()
 	readonly #subscriber: (message: unknown) => void
 
 	constructor() {
@@ -1969,6 +2047,11 @@ export class ServerExchanges {
 		return this.#pairs.get(target)
 	}
 
+	/** Returns the live `node:http` server that started the exchange for `target`, or `undefined`. */
+	server(target: string): http.Server | undefined {
+		return this.#servers.get(target)
+	}
+
 	/** Stops capturing. */
 	destroy(): void {
 		diagnostics.unsubscribe('http.server.request.start', this.#subscriber)
@@ -1976,10 +2059,12 @@ export class ServerExchanges {
 
 	#record(message: unknown): void {
 		if (!isRecord(message)) return
-		const { request, response } = message
+		const { request, response, server } = message
 		if (!(request instanceof http.IncomingMessage) || !(response instanceof http.ServerResponse))
 			return
-		if (request.url !== undefined) this.#pairs.set(request.url, [request, response])
+		if (request.url === undefined) return
+		this.#pairs.set(request.url, [request, response])
+		if (server instanceof http.Server) this.#servers.set(request.url, server)
 	}
 }
 

@@ -343,9 +343,10 @@ These invariants hold across `src/server` ↔ `server.md`.
    while its body still uploads: destroying it can reset the connection and
    lose that response. The server ends that connection when its last
    exchange completes, and the `stop()` call resolves after that connection
-   closes. Each body byte restarts Node's keep-alive socket timer, so no Node
-   timeout bounds an upload that keeps sending. The deadline that bounds the
-   drain therefore stays armed through the clean close's wait: when it
+   closes. Node's `request` timeout bounds an upload that keeps sending after
+   its response, unless `timeouts.request` is `0`, when no Node timeout bounds
+   it. The deadline that bounds the drain therefore stays armed through the
+   clean close's wait: when it
    expires before the server's `close` event, the server destroys every
    socket still open, as an expired drain does, so no connection holds the
    `stop()` call past the `drain` deadline. The `drain` event has already
@@ -510,16 +511,23 @@ These invariants hold across `src/server` ↔ `server.md`.
     and `keepAliveTimeout` options. `headers` bounds the receipt of the
     request headers, `request` the receipt of the whole request, and
     `keepalive` the idle wait of a kept-alive connection for its next
-    request; `0` disables each. An omitted one keeps Node's default:
+    request, to which Node adds its `keepAliveTimeoutBuffer`, 1_000 ms by
+    default: a `keepalive` of 400 closes an idle connection after about
+    1_400 ms. `0` disables each. An omitted one keeps Node's default:
     `DEFAULT_REQUEST_TIMEOUT_MS` for `request`, the lesser of
     `DEFAULT_HEADERS_TIMEOUT_MS` and `request` for `headers`, and Node's
-    `keepAliveTimeout` default for `keepalive`. Node answers a request whose
-    headers or body outlast their timeout with `408` and closes the
-    connection, before or under the handler. The server sets Node's
-    `connectionsCheckingInterval` to half the smaller positive of `headers`
-    and `request`, so each expires within one and a half times its value.
-    Construction refuses, with a `TypeError` that names the key, a value
-    that is not an integer from 0 through 2_147_483_647, and refuses, with a
+    `keepAliveTimeout` default for `keepalive`. When `headers` or `request`
+    passes before any response has started, Node answers `408` and closes
+    the connection; after a response has started, Node closes the
+    connection, which cuts that response short. The server sets Node's
+    `connectionsCheckingInterval` to `Math.ceil(m / 2)` milliseconds, where
+    `m` is the smaller positive of `headers` and `request` as Node applies
+    them, so each expires at most one such interval after it passes; with
+    neither positive, Node keeps its own interval. Construction refuses,
+    with a `TypeError` that names the key and its limit, a `headers` or
+    `request` that is not an integer from 0 through 2_147_483_647 and a
+    `keepalive` that is not an integer from 0 through 2_147_482_647, because
+    Node arms `keepalive` plus its buffer as one timer; and it refuses, with a
     `TypeError` that names both keys, a `headers` above `request` while
     `request` is positive: Node's own `headersTimeout ≤ requestTimeout`
     relation. No server timeout bounds the response; a response deadline is
@@ -854,9 +862,13 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   live-object count after thousands of requests, and response normalization of a
   redirect and a `fetch` result. Its server matrix feeds a real `Server` and a bare
   `node:http` control the same bytes over raw sockets and frames each answer with the
-  raw client's own parse: a header drip and a body drip that outlast their timeouts
-  and an idle keep-alive connection, each answered as the control answers inside the
-  documented window; the routed `405`, automatic `HEAD`, and automatic `OPTIONS`; the
+  raw client's own parse: the `connectionsCheckingInterval` the live `node:http` server
+  reads under each timeout shape; a header drip and a body drip that outlast their
+  timeouts, each answered in the control's class no sooner than its timeout and within
+  one and a half times it plus a scheduling slack; an idle keep-alive connection, closed
+  in the control's class no sooner than `keepalive` and within `keepalive` plus Node's
+  buffer and the slack;
+  the routed `405`, automatic `HEAD`, and automatic `OPTIONS`; the
   framing class of a pipelined pair, conflicting or duplicate framing headers, an
   obsolete line fold, a bare LF, an oversized header block, and `100-continue` and
   unknown `Expect` values, with no `request` or `response` event where Node answers
@@ -903,8 +915,9 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   the status matrix, restart-fresh-abort, caller-cancelled / timed-out / clean
   bounded startup, the edges of the `headers ≤ request` relation against
   `node:http`'s own refusal, the former `headers ≤ keepalive` refusals that
-  construct and serve, the timeout values construction refuses and the `0` and
-  timer-limit values it accepts, `EADDRINUSE` honesty, host/port binds, ephemeral default,
+  construct and serve, the timeout values construction refuses with each key's limit,
+  the `0` and limit values it accepts, and the `keepalive` edge one below Node's
+  buffered-timer overflow, `EADDRINUSE` honesty, host/port binds, ephemeral default,
   connection / header / per-socket request caps, graceful-vs-forced drain,
   the clean stop that ends a never-used connection inside the deadline after
   the request in flight beside it finishes, the clean stop that counts and

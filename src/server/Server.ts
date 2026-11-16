@@ -142,9 +142,14 @@ export class Server<TState> implements ServerInterface<TState> {
 			throw new TypeError('ServerOptions.limit must be a non-negative finite number')
 		const timeouts = options.timeouts ?? {}
 		for (const [name, value] of Object.entries(timeouts)) {
-			if (value !== undefined && !isTimeoutDuration(value)) {
+			// Node arms `keepalive` plus its default 1_000 ms `keepAliveTimeoutBuffer` as one timer.
+			const keepalive = name === 'keepalive'
+			if (
+				value !== undefined &&
+				!(isTimeoutDuration(value) && (!keepalive || isTimeoutDuration(value + 1_000)))
+			) {
 				throw new TypeError(
-					`ServerOptions.timeouts.${name} must be an integer from 0 through 2_147_483_647`,
+					`ServerOptions.timeouts.${name} must be an integer from 0 through ${keepalive ? '2_147_482_647' : '2_147_483_647'}`,
 				)
 			}
 		}
@@ -553,9 +558,9 @@ export class Server<TState> implements ServerInterface<TState> {
 	// client holds several at once. Each closes after it ends or is destroyed,
 	// so one `close` listener apiece covers both paths and leaves when it fires.
 	// While a clean close waits, the connection ends as its count returns to
-	// zero. Each body byte restarts Node's keep-alive socket timer, so no Node
-	// timeout bounds an upload that keeps sending after its response; the
-	// stop's deadline does.
+	// zero. Node's `requestTimeout` bounds an upload that keeps sending after
+	// its response unless `timeouts.request` is 0; then only the stop's
+	// deadline does.
 	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)

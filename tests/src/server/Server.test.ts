@@ -176,8 +176,8 @@ describe('Server — the node:http timeout relation', () => {
 	})
 
 	it.each(SERVER_TIMEOUT_REFUSALS)(
-		'refuses timeouts.$key of $value with a refusal that names the key',
-		({ key, value }) => {
+		'refuses timeouts.$key of $value with a refusal that names the key and its limit',
+		({ key, value, limit }) => {
 			expect(() =>
 				createServer({
 					dispatcher: createPingDispatcher(),
@@ -185,26 +185,32 @@ describe('Server — the node:http timeout relation', () => {
 					timeouts: { [key]: value },
 				}),
 			).toThrow(
-				new TypeError(
-					`ServerOptions.timeouts.${key} must be an integer from 0 through 2_147_483_647`,
-				),
+				new TypeError(`ServerOptions.timeouts.${key} must be an integer from 0 through ${limit}`),
 			)
 		},
 	)
 
-	it('accepts 0, which disables each node:http timeout, and the 2_147_483_647 timer limit', () => {
+	it('accepts 0 for each node:http timeout, 2_147_483_647 for headers and request, and keepalive up to 2_147_482_647 but not one past it', () => {
 		const accepted = [
 			{ headers: 0 },
 			{ request: 0 },
 			{ keepalive: 0 },
 			{ headers: 2_147_483_647, request: 2_147_483_647 },
-			{ keepalive: 2_147_483_647 },
+			{ keepalive: 2_147_482_647 },
 		].map(
 			(timeouts) =>
 				createServer({ dispatcher: createPingDispatcher(), state: () => undefined, timeouts })
 					.status,
 		)
 		expect(accepted).toEqual(['idle', 'idle', 'idle', 'idle', 'idle'])
+		// Node arms keepalive plus its 1_000 ms buffer as one timer, which overflows one past this edge.
+		expect(() =>
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				timeouts: { keepalive: 2_147_482_648 },
+			}),
+		).toThrow(TypeError)
 	})
 })
 

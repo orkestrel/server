@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { isInteger } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, isServerError } from '@src/server'
-import { createRecorder, waitForCondition } from '@orkestrel/test'
+import { createRecorder, readProperty, waitForCondition } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
 	SEAM_BODY,
@@ -15,6 +15,7 @@ import {
 	SEAM_STATE_FACTORIES,
 	SERVER_CONTROL_INTERVAL,
 	SERVER_FRAMING_INPUTS,
+	SERVER_INTERVAL_CASES,
 	SERVER_MATRIX_TIMEOUTS,
 	SERVER_TIMEOUT_SLACK,
 	ServerExchanges,
@@ -494,6 +495,31 @@ describe('the exchange seam — response normalization', () => {
 describe('the server matrix — timeouts delegated to node:http', () => {
 	const { headers, request, keepalive } = SERVER_MATRIX_TIMEOUTS
 
+	it.each(SERVER_INTERVAL_CASES)(
+		'hands node:http a checking interval of $interval ms under $label',
+		async ({ target, timeouts, interval }) => {
+			const exchanges = new ServerExchanges()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createMatrixDispatcher<object>(),
+					state: () => ({}),
+					host: '127.0.0.1',
+					timeouts,
+				}),
+			)
+			try {
+				const port = await server.start()
+				await (await fetch(`http://127.0.0.1:${port}${target}`)).text()
+				// `@types/node` declares the interval as an option only; Node keeps it on the instance.
+				const live = readProperty<unknown>(exchanges.server(target), 'connectionsCheckingInterval')
+				expect(live).toBe(interval)
+			} finally {
+				exchanges.destroy()
+			}
+		},
+	)
+
 	it('answers a header drip slower than timeouts.headers as the control does, within its window', async () => {
 		const control = await createLoopback(
 			createMatrixControl(
@@ -512,7 +538,7 @@ describe('the server matrix — timeouts delegated to node:http', () => {
 		)
 		try {
 			const port = await server.start()
-			// The documented bound: a timeout fires within one and a half times its value.
+			// Node fires a timeout at most one checking interval, half of it here, after it passes.
 			const window = headers * 1.5 + SERVER_TIMEOUT_SLACK
 			const [expected, actual] = await Promise.all(
 				[control.port, port].map((target) =>
