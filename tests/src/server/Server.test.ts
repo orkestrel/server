@@ -13,12 +13,16 @@ import http from 'node:http'
 import net from 'node:net'
 import { finished as streamFinished } from 'node:stream/promises'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
+import { attempt } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, createStream, HTTPError, isServerError } from '@src/server'
 import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { waitForSocketClose } from '@orkestrel/test/server'
 import {
+	SERVER_TIMEOUT_REFUSALS,
+	SERVER_TIMEOUT_RELATIONS,
 	ServerObservation,
+	buildControlOptions,
 	claimUpgrades,
 	createEchoDispatcher,
 	createPingDispatcher,
@@ -136,17 +140,75 @@ describe('Server — lifecycle', () => {
 	})
 })
 
-describe('Server — construction guards', () => {
-	it('throws when timeouts.headers exceeds timeouts.keepalive (the Slowloris guard)', () => {
-		expect(() =>
+describe('Server — the node:http timeout relation', () => {
+	it.each(SERVER_TIMEOUT_RELATIONS)(
+		'$label: refuses at construction exactly when node:http refuses',
+		({ timeouts, refused }) => {
+			const node = attempt(() => http.createServer(buildControlOptions(timeouts)))
+			const built = attempt(() =>
+				createServer({ dispatcher: createPingDispatcher(), state: () => undefined, timeouts }),
+			)
+			expect(node.success).toBe(!refused)
+			expect(built.success).toBe(!refused)
+			expect(built.success ? undefined : built.error).toEqual(
+				refused
+					? new TypeError(
+							'ServerOptions.timeouts.headers must not exceed ServerOptions.timeouts.request (300_000 when omitted) while timeouts.request is positive',
+						)
+					: undefined,
+			)
+		},
+	)
+
+	it('starts and serves under timeouts the former headers ≤ keepalive check refused', async () => {
+		const server = trackServer(
+			running,
 			createServer({
 				dispatcher: createPingDispatcher(),
 				state: () => undefined,
+				host: '127.0.0.1',
 				timeouts: { headers: 5_000, keepalive: 1_000 },
 			}),
-		).toThrow(TypeError)
+		)
+		const port = await server.start()
+		const response = await fetch(`http://127.0.0.1:${port}/ping`)
+		await expect(response.text()).resolves.toBe('pong')
 	})
 
+	it.each(SERVER_TIMEOUT_REFUSALS)(
+		'refuses timeouts.$key of $value with a refusal that names the key',
+		({ key, value }) => {
+			expect(() =>
+				createServer({
+					dispatcher: createPingDispatcher(),
+					state: () => undefined,
+					timeouts: { [key]: value },
+				}),
+			).toThrow(
+				new TypeError(
+					`ServerOptions.timeouts.${key} must be an integer from 0 through 2_147_483_647`,
+				),
+			)
+		},
+	)
+
+	it('accepts 0, which disables each node:http timeout, and the 2_147_483_647 timer limit', () => {
+		const accepted = [
+			{ headers: 0 },
+			{ request: 0 },
+			{ keepalive: 0 },
+			{ headers: 2_147_483_647, request: 2_147_483_647 },
+			{ keepalive: 2_147_483_647 },
+		].map(
+			(timeouts) =>
+				createServer({ dispatcher: createPingDispatcher(), state: () => undefined, timeouts })
+					.status,
+		)
+		expect(accepted).toEqual(['idle', 'idle', 'idle', 'idle', 'idle'])
+	})
+})
+
+describe('Server — construction guards', () => {
 	it('throws when drain / limit are not non-negative finite numbers', () => {
 		expect(() =>
 			createServer({

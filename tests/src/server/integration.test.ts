@@ -1,7 +1,9 @@
-import type { Connection, MiddlewareContext } from '@src/server'
+import type { Connection, MiddlewareContext, ResponseRecord } from '@src/server'
+import type { ServerListenerReading } from '../../setupServer.js'
 import http from 'node:http'
 import net from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
+import { isInteger } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, isServerError } from '@src/server'
 import { createRecorder, waitForCondition } from '@orkestrel/test'
@@ -11,19 +13,38 @@ import {
 	SEAM_IMMUTABLE_RESPONSES,
 	SEAM_NEXT_ARGUMENTS,
 	SEAM_STATE_FACTORIES,
+	SERVER_CONTROL_INTERVAL,
+	SERVER_FRAMING_INPUTS,
+	SERVER_MATRIX_TIMEOUTS,
+	SERVER_TIMEOUT_SLACK,
+	ServerExchanges,
 	ServerObservation,
+	buildControlOptions,
+	connectServerClient,
+	countServerListeners,
 	createAbortLayer,
 	createAnsweringPeer,
 	createArgumentLayer,
 	createBodyLayer,
 	countLiveObjects,
+	createCountingDispatcher,
 	createDeadlineLayer,
+	createMatrixControl,
+	createMatrixDispatcher,
 	createPingDispatcher,
 	createResponseLayer,
+	createRoutedControl,
+	createRoutedDispatcher,
+	createRouterControl,
 	createSeamDispatcher,
 	createSeenLayer,
 	driveSeamRequests,
+	driveServerDrip,
+	driveServerIdle,
+	filterServerHeaders,
+	frameServerInput,
 	sendSeamRequest,
+	subtractServerListeners,
 	trackServer,
 } from '../../setupServer.js'
 
@@ -463,5 +484,339 @@ describe('the exchange seam — response normalization', () => {
 		await expect(response.text()).resolves.toBe('mutable')
 		expect(seen).toHaveLength(2)
 		expect(seen.every((layer) => layer === returned[0])).toBe(true)
+	})
+})
+
+// The server matrix: a real `Server` and a bare `node:http` control fed the same bytes over raw
+// sockets. Each expectation is the control's framing class, the raw client's own framing parse,
+// or the client's knowledge that the server closed the connection.
+
+describe('the server matrix — timeouts delegated to node:http', () => {
+	const { headers, request, keepalive } = SERVER_MATRIX_TIMEOUTS
+
+	it('answers a header drip slower than timeouts.headers as the control does, within its window', async () => {
+		const control = await createLoopback(
+			createMatrixControl(
+				buildControlOptions(SERVER_MATRIX_TIMEOUTS, SERVER_CONTROL_INTERVAL),
+				createRecorder(),
+			),
+		)
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createMatrixDispatcher<object>(),
+				state: () => ({}),
+				host: '127.0.0.1',
+				timeouts: SERVER_MATRIX_TIMEOUTS,
+			}),
+		)
+		try {
+			const port = await server.start()
+			// The documented bound: a timeout fires within one and a half times its value.
+			const window = headers * 1.5 + SERVER_TIMEOUT_SLACK
+			const [expected, actual] = await Promise.all(
+				[control.port, port].map((target) =>
+					driveServerDrip(target, 'GET /a HTTP/1.1\r\nHost: x\r\n', 'X-Drip: on\r\n', window),
+				),
+			)
+			expect(expected?.framing).toEqual({ statuses: [408], closed: true })
+			expect(actual?.framing).toEqual(expected?.framing)
+			expect(expected?.elapsed).toBeGreaterThanOrEqual(headers)
+			expect(actual?.elapsed).toBeGreaterThanOrEqual(headers)
+			expect(actual?.elapsed).toBeLessThanOrEqual(window)
+		} finally {
+			await control.destroy()
+		}
+	})
+
+	it('answers a body drip slower than timeouts.request as the control does, within its window', async () => {
+		const control = await createLoopback(
+			createMatrixControl(
+				buildControlOptions(SERVER_MATRIX_TIMEOUTS, SERVER_CONTROL_INTERVAL),
+				createRecorder(),
+			),
+		)
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createMatrixDispatcher<object>(),
+				state: () => ({}),
+				host: '127.0.0.1',
+				timeouts: SERVER_MATRIX_TIMEOUTS,
+			}),
+		)
+		try {
+			const port = await server.start()
+			const window = request * 1.5 + SERVER_TIMEOUT_SLACK
+			const head = 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n'
+			const [expected, actual] = await Promise.all(
+				[control.port, port].map((target) => driveServerDrip(target, head, 'a', window)),
+			)
+			expect(expected?.framing).toEqual({ statuses: [408], closed: true })
+			expect(actual?.framing).toEqual(expected?.framing)
+			expect(expected?.elapsed).toBeGreaterThanOrEqual(request)
+			expect(actual?.elapsed).toBeGreaterThanOrEqual(request)
+			expect(actual?.elapsed).toBeLessThanOrEqual(window)
+		} finally {
+			await control.destroy()
+		}
+	})
+
+	it('closes an idle keep-alive connection after timeouts.keepalive as the control does', async () => {
+		const node = createMatrixControl(
+			buildControlOptions(SERVER_MATRIX_TIMEOUTS, SERVER_CONTROL_INTERVAL),
+			createRecorder(),
+		)
+		const control = await createLoopback(node)
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createMatrixDispatcher<object>(),
+				state: () => ({}),
+				host: '127.0.0.1',
+				timeouts: SERVER_MATRIX_TIMEOUTS,
+			}),
+		)
+		try {
+			const port = await server.start()
+			// Node adds `keepAliveTimeoutBuffer` to the idle socket timeout from v22.19.0 on.
+			const buffer: unknown = node.keepAliveTimeoutBuffer
+			const window = keepalive + (isInteger(buffer) ? buffer : 0) + SERVER_TIMEOUT_SLACK
+			const [expected, actual] = await Promise.all(
+				[control.port, port].map((target) => driveServerIdle(target, window)),
+			)
+			expect(expected?.framing).toEqual({ statuses: [200], closed: true })
+			expect(actual?.framing).toEqual(expected?.framing)
+			expect(actual?.elapsed).toBeGreaterThanOrEqual(keepalive)
+			expect(actual?.elapsed).toBeLessThanOrEqual(window)
+		} finally {
+			await control.destroy()
+		}
+	})
+})
+
+describe('the server matrix — the routed 405, HEAD, and OPTIONS', () => {
+	it('answers a 405 that carries Allow, framed by its Content-Length', async () => {
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createRoutedDispatcher<object>(createRecorder()),
+				state: () => ({}),
+				host: '127.0.0.1',
+			}),
+		)
+		const client = await connectServerClient(await server.start(), ['DELETE', 'GET'])
+		try {
+			client.write(
+				'DELETE /items HTTP/1.1\r\nHost: x\r\n\r\nGET /items HTTP/1.1\r\nHost: x\r\n\r\n',
+			)
+			await client.wait(2, 'the 405 and the GET after it')
+			const [refusal, next] = client.complete
+			expect(refusal?.status).toBe(405)
+			expect(refusal?.headers.allow?.split(', ')).toEqual(expect.arrayContaining(['GET', 'HEAD']))
+			expect(next?.status).toBe(200)
+		} finally {
+			client.destroy()
+		}
+	})
+
+	// The pinned router candidate omits OPTIONS from a 405's Allow; router's R1 carries the fix.
+	it.fails('answers a 405 whose Allow carries OPTIONS', async () => {
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createRoutedDispatcher<object>(createRecorder()),
+				state: () => ({}),
+				host: '127.0.0.1',
+			}),
+		)
+		const client = await connectServerClient(await server.start(), ['DELETE'])
+		try {
+			client.write('DELETE /items HTTP/1.1\r\nHost: x\r\n\r\n')
+			await client.wait(1, 'the 405')
+			expect(client.complete[0]?.headers.allow?.split(', ')).toContain('OPTIONS')
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('answers an automatic HEAD with no body and the GET headers, as the control does', async () => {
+		const control = await createLoopback(createRoutedControl())
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createRoutedDispatcher<object>(createRecorder()),
+				state: () => ({}),
+				host: '127.0.0.1',
+			}),
+		)
+		const port = await server.start()
+		const raw =
+			'GET /items HTTP/1.1\r\nHost: x\r\n\r\nHEAD /items HTTP/1.1\r\nHost: x\r\n\r\nGET /items HTTP/1.1\r\nHost: x\r\n\r\n'
+		const clients = await Promise.all(
+			[control.port, port].map((target) => connectServerClient(target, ['GET', 'HEAD', 'GET'])),
+		)
+		try {
+			for (const client of clients) client.write(raw)
+			await Promise.all(clients.map((client) => client.wait(3, 'GET, HEAD, and GET')))
+			const [expected, actual] = clients.map((client) => client.complete)
+			expect(actual?.map((response) => [response.status, response.body])).toEqual([
+				[200, 'items'],
+				[200, ''],
+				[200, 'items'],
+			])
+			expect(actual?.map((response) => response.status)).toEqual(
+				expected?.map((response) => response.status),
+			)
+			const head = filterServerHeaders(actual?.[1]?.headers ?? {})
+			expect(head).toEqual(filterServerHeaders(expected?.[1]?.headers ?? {}))
+			expect(head).toEqual(filterServerHeaders(actual?.[0]?.headers ?? {}))
+			expect(head['x-items']).toBe('listed')
+		} finally {
+			for (const client of clients) client.destroy()
+			await control.destroy()
+		}
+	})
+
+	// The pinned router candidate drops the GET body of an automatic HEAD uncancelled; router's R1
+	// carries the fix.
+	it.fails('cancels the GET body source of an automatic HEAD', async () => {
+		const cancels = createRecorder<[unknown]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createRoutedDispatcher<object>(cancels),
+				state: () => ({}),
+				host: '127.0.0.1',
+			}),
+		)
+		const client = await connectServerClient(await server.start(), ['HEAD'])
+		try {
+			client.write('HEAD /items HTTP/1.1\r\nHost: x\r\n\r\n')
+			await client.wait(1, 'the HEAD')
+			await waitForCondition('the GET body source is cancelled', () => cancels.calls.length === 1)
+			expect(cancels.calls).toHaveLength(1)
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('answers an automatic OPTIONS with 204 and an Allow, and no body', async () => {
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createRoutedDispatcher<object>(createRecorder()),
+				state: () => ({}),
+				host: '127.0.0.1',
+			}),
+		)
+		const client = await connectServerClient(await server.start(), ['OPTIONS', 'GET'])
+		try {
+			client.write(
+				'OPTIONS /items HTTP/1.1\r\nHost: x\r\n\r\nGET /items HTTP/1.1\r\nHost: x\r\n\r\n',
+			)
+			await client.wait(2, 'the OPTIONS and the GET after it')
+			const [options, next] = client.complete
+			expect(options?.status).toBe(204)
+			expect(options?.body).toBe('')
+			expect(options?.headers.allow?.split(', ')).toEqual(
+				expect.arrayContaining(['GET', 'HEAD', 'OPTIONS']),
+			)
+			expect(next?.status).toBe(200)
+		} finally {
+			client.destroy()
+		}
+	})
+})
+
+describe('the server matrix — the framing differential', () => {
+	it.each(SERVER_FRAMING_INPUTS)('frames $label as the bare control does', async (input) => {
+		const calls = createRecorder<[string | undefined]>()
+		const control = await createLoopback(createMatrixControl({}, calls))
+		const requests = createRecorder<[string, string]>()
+		const responses = createRecorder<[ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createMatrixDispatcher<object>(),
+				state: () => ({}),
+				host: '127.0.0.1',
+				on: { request: requests.handler, response: responses.handler },
+			}),
+		)
+		try {
+			const port = await server.start()
+			const expected = await frameServerInput(control.port, input)
+			const actual = await frameServerInput(port, input)
+			expect(expected.statuses.length).toBeGreaterThan(0)
+			expect(actual).toEqual(expected)
+			// Where Node answers before the handler, the server reports no exchange.
+			const answered = calls.calls.length === 0
+			expect(answered ? [...requests.calls, ...responses.calls] : []).toEqual([])
+		} finally {
+			await control.destroy()
+		}
+	})
+})
+
+describe('the server matrix — listeners per exchange', () => {
+	it('attaches at most two listeners per event to each message and response, and removes them when the exchange ends', async () => {
+		const exchanges = new ServerExchanges()
+		const readings = createRecorder<[string, ServerListenerReading]>()
+		const dispatcher = createCountingDispatcher<undefined>(exchanges, readings)
+		const control = await createLoopback(createRouterControl(dispatcher))
+		const server = trackServer(
+			running,
+			createServer({ dispatcher, state: () => undefined, host: '127.0.0.1' }),
+		)
+		try {
+			const port = await server.start()
+			const arms = [[control.port, '/count/control'] as const, [port, '/count/server'] as const]
+			const ended = await Promise.all(
+				arms.map(async ([target, path]) => {
+					await (await fetch(`http://127.0.0.1:${target}${path}`)).text()
+					const [message, response] = exchanges.exchange(path) ?? []
+					await waitForCondition(`the ${path} exchange ends`, () =>
+						Boolean(message?.closed && response?.closed),
+					)
+					return {
+						message: message === undefined ? {} : countServerListeners(message),
+						response: response === undefined ? {} : countServerListeners(response),
+					}
+				}),
+			)
+			const entry = ['/count/control', '/count/server'].map(
+				(path) => readings.calls.find(([target]) => target === path)?.[1],
+			)
+			const [controlEntry, serverEntry] = entry
+			const [controlEnded, serverEnded] = ended
+			expect(controlEntry).toBeDefined()
+			expect(serverEntry).toBeDefined()
+			const own = [
+				subtractServerListeners(serverEntry?.message ?? {}, controlEntry?.message ?? {}),
+				subtractServerListeners(serverEntry?.response ?? {}, controlEntry?.response ?? {}),
+			]
+			const left = [
+				subtractServerListeners(serverEnded?.message ?? {}, controlEnded?.message ?? {}),
+				subtractServerListeners(serverEnded?.response ?? {}, controlEnded?.response ?? {}),
+			]
+			for (const [event, count] of own.flatMap((counts) => Object.entries(counts))) {
+				expect(
+					count,
+					`the server's own ${event} listeners at the handler's entry`,
+				).toBeGreaterThanOrEqual(0)
+				expect(
+					count,
+					`the server's own ${event} listeners at the handler's entry`,
+				).toBeLessThanOrEqual(2)
+			}
+			expect(own.some((counts) => Object.values(counts).some((count) => count > 0))).toBe(true)
+			for (const [event, count] of left.flatMap((counts) => Object.entries(counts))) {
+				expect(count, `the server's own ${event} listeners after the exchange ends`).toBe(0)
+			}
+		} finally {
+			exchanges.destroy()
+			await control.destroy()
+		}
 	})
 })

@@ -15,6 +15,19 @@ import type { Encoding } from './types.js'
 export const DEFAULT_DRAIN_MS = 10_000
 
 /**
+ * Names the `node:http` default `requestTimeout`, `300_000` ms, which applies when
+ * `timeouts.request` is omitted.
+ */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 300_000
+
+/**
+ * Names the cap of the `node:http` default `headersTimeout`, `60_000` ms: when
+ * `timeouts.headers` is omitted, the header timeout is the lesser of this cap and the
+ * request timeout.
+ */
+export const DEFAULT_HEADERS_TIMEOUT_MS = 60_000
+
+/**
  * Names the `Symbol.for`-interned brand `HTTPError` carries,
  * `@orkestrel/server.HTTPError`, so `isHTTPError` recognizes an instance across
  * package copies. A consumer never sets it by hand.

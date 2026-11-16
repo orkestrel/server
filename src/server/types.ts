@@ -691,17 +691,28 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   request's method + parsed `url` when one is available (absent on an
  *   upgrade-path fault); its own throw is swallowed so reporting can never
  *   crash the response.
- * @param timeouts - Lifecycle and `node:http` tuning knobs: `start` (maximum
- *   time to bind the listener; `0` permits no startup window), `request` (max
- *   time to fully receive + respond, `requestTimeout`), `headers` (max time
- *   to receive the request headers, `headersTimeout`), and `keepalive` (idle
- *   keep-alive socket timeout, `keepAliveTimeout`). `headers` must not exceed
- *   `keepalive` (the Slowloris footgun) — construction throws a `TypeError`
- *   otherwise. A present `start` must be an integer from 0 through
- *   2_147_483_647, and every other present value a non-negative finite
- *   number; construction throws a `TypeError` otherwise. A startup expiry
- *   rejects with a `DOMException` named `TimeoutError`; caller
- *   cancellation rejects with the caller signal's `reason`.
+ * @param timeouts - Timeouts in milliseconds: `start` (the maximum time to
+ *   bind the listener; `0` permits no startup window), and three that
+ *   `start()` passes to `node:http`'s `createServer` as options: `headers`
+ *   (`headersTimeout`, the time to receive the request headers), `request`
+ *   (`requestTimeout`, the time to receive the whole request; no server
+ *   timeout bounds the response), and `keepalive` (`keepAliveTimeout`, the
+ *   idle time a kept-alive connection waits for its next request). `0`
+ *   disables each of those three. An omitted one keeps Node's default:
+ *   `request` is `DEFAULT_REQUEST_TIMEOUT_MS`, `headers` the lesser of
+ *   `DEFAULT_HEADERS_TIMEOUT_MS` and `request`, and `keepalive` Node's
+ *   `keepAliveTimeout` default. Node answers a request whose headers or body
+ *   outlast their timeout with `408` and closes the connection. The server
+ *   sets Node's `connectionsCheckingInterval` to half the smaller positive
+ *   of `headers` and `request`, so each expires within one and a half times
+ *   its value. Every present value must be an integer from 0 through
+ *   2_147_483_647, and `headers` must not exceed `request` while `request`
+ *   is positive, Node's own relation; construction throws a `TypeError`
+ *   otherwise. A response deadline belongs to a middleware, such as
+ *   `@orkestrel/middleware`'s `createDeadline`, which aborts the exchange
+ *   through `context.abort`. A startup expiry rejects with a `DOMException`
+ *   named `TimeoutError`; caller cancellation rejects with the caller
+ *   signal's `reason`.
  * @param sockets - `node:http` socket caps: `connections` maps to
  *   `maxConnections` (`0` rejects every incoming connection), `headers` maps
  *   to `maxHeadersCount` (`0` disables the limit), and `requests` maps to
@@ -831,10 +842,9 @@ export interface ServerInterface<TState> {
 	 * request or an upgrade that a connection sends after the listener closes
 	 * is refused: the server destroys that connection before the request is
 	 * counted or a handler sees it. An exchange opens when a request reaches
-	 * the handler and stays open until its request message has ended or closed
-	 * and its response has finished or closed. The `error` listeners that this
-	 * tracking attaches to the message and the response stay attached, so a
-	 * later error on either raises no uncaught exception. After a clean drain
+	 * the handler and stays open until its request message and its response
+	 * have closed. The `close` listeners that this tracking attaches leave when
+	 * they fire, so none outlives the exchange. After a clean drain
 	 * the close destroys every connection with no open exchange: an idle
 	 * keep-alive one, one that never sent a request, and one partway through
 	 * any header block, because a request whose headers never completed is not
