@@ -703,10 +703,11 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   of those three. An omitted one keeps Node's default: `request` is
  *   `DEFAULT_REQUEST_TIMEOUT_MS`, `headers` the lesser of
  *   `DEFAULT_HEADERS_TIMEOUT_MS` and `request`, and `keepalive` Node's
- *   `keepAliveTimeout` default. When `headers` or `request` passes before
- *   any response has started, Node answers `408` and closes the connection;
- *   after a response has started, Node closes the connection, which cuts
- *   that response short. The server sets Node's
+ *   `keepAliveTimeout` default. When `headers` or `request` passes while a
+ *   response is being sent, Node closes the connection, which cuts that
+ *   response short; otherwise, including after a response has finished
+ *   while its upload continues, Node answers `408` and closes the
+ *   connection. The server sets Node's
  *   `connectionsCheckingInterval` to `Math.ceil(m / 2)` milliseconds, where
  *   `m` is the smaller positive of `headers` and `request` as Node applies
  *   them, so each expires at most one such interval after it passes; with
