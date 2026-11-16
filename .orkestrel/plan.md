@@ -155,7 +155,24 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
      - no constraint across members (3);
      - a synchronous-only `attempt` (3).
 
-     The user reopened contract `ROADMAP.md` items 3 and 4: every builder refuses an option key it does not read, and contract adds an admission that reads each member of a caller's bag once, keeps functions and instances by identity, and reports every fault in one refusal. A design consultation rules every row, the units, and each consumer's adoption, and contract 0.0.25 carries every built row.
+     The user reopened contract `ROADMAP.md` items 3 and 4: every builder refuses an option key it does not read, and contract adds an admission that reads each member of a caller's bag once, keeps functions and instances by identity, and reports every fault in one refusal. The design consultation (2026-11-16) ruled the release:
+     - **Build:**
+       - `interfaceShape`, which admits an implementation by its declared members;
+       - `undefinedShape`;
+       - `over` and `under` exclusive bounds;
+       - `settle`, the asynchronous `attempt`;
+       - `isCodedError` and `isSafeInteger`;
+       - `faults` on `ContractErrorContext`, with `refusalToError`;
+       - `refuseValue`;
+       - `contract.own`, which reads a caller's value once into a snapshot, holds implementations and functions by identity, and then admits the snapshot as `admitValue` does;
+       - a linear `preview`;
+       - builders and the four option functions that refuse an unread key;
+       - the `isRecord` remark and a prose sweep.
+     - **Refuse:** a predicate node and a stricter `rawShape`.
+     - **Defer:** `parseEnum` memoization, prototype-key dropping in JSON reads, a time-zone shape, and construction-cost tuning, each with its trigger.
+     - **Unchanged:** `admitValue`, `optionalShape`, `integerShape`, and `isInteger` keep their answers. A class-instance options bag refuses at an `objectShape` position.
+     - **Units:** C-T (types) opens; lane H (C-H1 `preview`, C-H2 helpers) and lane D (C-D1 option refusal and bounds, C-D2 `undefined`, C-D3 interface, C-D4 `own`) follow; then C-X, a seeded differential against 0.0.24; then C-G1 (guide) and C-G2 (prose); then C-A, abort's adoption proof.
+     - **The consumer census over 13 source trees:** no hand-built `ContractInterface` and no builder options passed as a non-literal. Database's `switch (shape.category)` at `src/core/helpers.ts:1326` stops compiling until its cascade visit adds the two categories.
 
    - Any other `@orkestrel` package a unit finds lacking joins this item.
 6. The mcp, browser, toolbox, and scaffold visits; the integrated `orkestrel-falsify` round; a tree-wide `verifier` run; the consumer run; the releases in layer order.
