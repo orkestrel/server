@@ -1,7 +1,7 @@
 import type * as ServerErrors from '../src/server/errors.js'
 import { once } from 'node:events'
 import { readFileSync } from 'node:fs'
-import { stripTypeScriptTypes } from 'node:module'
+import { stripTypeScriptTypes, syncBuiltinESMExports } from 'node:module'
 import type { Duplex } from 'node:stream'
 import type { LoopbackInterface } from '@orkestrel/test/server'
 import type { RecorderInterface } from '@orkestrel/test'
@@ -14,16 +14,20 @@ import type {
 	NextFunction,
 	RangeSpec,
 	ServerInterface,
+	SignerInterface,
 	SSEMessage,
+	TokenSecret,
 } from '@src/server'
 import type { IncomingMessage } from 'node:http'
+import { encodeBase64URL } from '@orkestrel/codec'
 import { seededRandom } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
+import crypto from 'node:crypto'
 import http from 'node:http'
 import net from 'node:net'
 import { fileURLToPath } from 'node:url'
 import { queryObjects } from 'node:v8'
-import { resolveRoot, waitForAbort, waitForDelay } from '@orkestrel/test'
+import { createRecorder, resolveRoot, waitForAbort, waitForDelay } from '@orkestrel/test'
 
 /** Holds the mutable observation owned by one test invocation. */
 export class ServerObservation<T> {
@@ -1373,4 +1377,262 @@ export async function driveSeamRequests(
 		),
 	)
 	return failures.reduce((sum, failed) => sum + failed, 0)
+}
+
+/** Lists the signer fixture's secrets in `[current, ...older]` order. */
+export const SIGNER_SECRETS: readonly string[] = Object.freeze([
+	'current-signing-secret-2026-11',
+	'previous-signing-secret-2026-10',
+	'oldest-signing-secret-2026-09',
+])
+
+/** Holds a secret that no signer fixture lists. */
+export const SIGNER_UNLISTED_SECRET = 'unlisted-signing-secret-2026-08'
+
+/** Represents one token the base build (`a2632ed`) minted without a `ttl`. */
+export interface ServerBaseToken {
+	readonly label: string
+	readonly value: string
+	readonly secret: TokenSecret
+	readonly token: string
+}
+
+/**
+ * Lists tokens the base build (`a2632ed`) minted through `signToken(value, { secret })`, at the
+ * current fixture secret and at the whole rotation list, which signs with the same current secret.
+ */
+export const SERVER_BASE_TOKENS: readonly ServerBaseToken[] = Object.freeze([
+	{
+		label: 'a session id, one secret',
+		value: '6f1c2a8e-4b7d-4e90-9a35-0d2f8b61c7e4',
+		secret: 'current-signing-secret-2026-11',
+		token:
+			'eyJ2YWx1ZSI6IjZmMWMyYThlLTRiN2QtNGU5MC05YTM1LTBkMmY4YjYxYzdlNCJ9.RRU6plw_YrH87aYkppXcu-2M3fYpeDutAaXvLTMpJu0',
+	},
+	{
+		label: 'a session id, a rotation list',
+		value: '6f1c2a8e-4b7d-4e90-9a35-0d2f8b61c7e4',
+		secret: SIGNER_SECRETS,
+		token:
+			'eyJ2YWx1ZSI6IjZmMWMyYThlLTRiN2QtNGU5MC05YTM1LTBkMmY4YjYxYzdlNCJ9.RRU6plw_YrH87aYkppXcu-2M3fYpeDutAaXvLTMpJu0',
+	},
+	{
+		label: 'a value with dots, one secret',
+		value: 'a.b.c',
+		secret: 'current-signing-secret-2026-11',
+		token: 'eyJ2YWx1ZSI6ImEuYi5jIn0.VMe9ZcVYM-_R2OqWO9Ff-E1a1tCmruuhUjRZMkQbenU',
+	},
+	{
+		label: 'a value with dots, a rotation list',
+		value: 'a.b.c',
+		secret: SIGNER_SECRETS,
+		token: 'eyJ2YWx1ZSI6ImEuYi5jIn0.VMe9ZcVYM-_R2OqWO9Ff-E1a1tCmruuhUjRZMkQbenU',
+	},
+	{
+		label: 'an empty value, one secret',
+		value: '',
+		secret: 'current-signing-secret-2026-11',
+		token: 'eyJ2YWx1ZSI6IiJ9.dZkkYP_UBJzKCNywUKdN-SxXfZToEchVNcX0T0i19Zc',
+	},
+	{
+		label: 'an empty value, a rotation list',
+		value: '',
+		secret: SIGNER_SECRETS,
+		token: 'eyJ2YWx1ZSI6IiJ9.dZkkYP_UBJzKCNywUKdN-SxXfZToEchVNcX0T0i19Zc',
+	},
+	{
+		label: 'non-ASCII text, one secret',
+		value: 'café ☕',
+		secret: 'current-signing-secret-2026-11',
+		token: 'eyJ2YWx1ZSI6ImNhZsOpIOKYlSJ9.K2oYtguiIalwmZpTzsHXZ33C4-fQMbujw4WpfhUAGEY',
+	},
+	{
+		label: 'non-ASCII text, a rotation list',
+		value: 'café ☕',
+		secret: SIGNER_SECRETS,
+		token: 'eyJ2YWx1ZSI6ImNhZsOpIOKYlSJ9.K2oYtguiIalwmZpTzsHXZ33C4-fQMbujw4WpfhUAGEY',
+	},
+	{
+		label: 'a lone surrogate, one secret',
+		value: '\ud800',
+		secret: 'current-signing-secret-2026-11',
+		token: 'eyJ2YWx1ZSI6Ilx1ZDgwMCJ9.GSHkkDDDIYCfEW6Y-OvBVmv5i90aSpp9t3xLAHsoo1Y',
+	},
+	{
+		label: 'a lone surrogate, a rotation list',
+		value: '\ud800',
+		secret: SIGNER_SECRETS,
+		token: 'eyJ2YWx1ZSI6Ilx1ZDgwMCJ9.GSHkkDDDIYCfEW6Y-OvBVmv5i90aSpp9t3xLAHsoo1Y',
+	},
+])
+
+/** Represents one secret `createSigner` refuses with code `'SECRET'`. */
+export interface SignerRefusalCase {
+	readonly label: string
+	readonly secret: unknown
+}
+
+/** Lists the secrets `createSigner` refuses: off-type, empty, or holding a blank entry. */
+export const SIGNER_REFUSED_SECRETS: readonly SignerRefusalCase[] = Object.freeze([
+	{ label: 'an empty string', secret: '' },
+	{ label: 'a whitespace-only string', secret: ' \t\n' },
+	{ label: 'a no-break space', secret: SERVER_NBSP },
+	{ label: 'an empty list', secret: [] },
+	{ label: 'a list of only blank entries', secret: ['', '   '] },
+	{
+		label: 'a list with one blank entry',
+		secret: ['current-signing-secret-2026-11', ' ', 'oldest-signing-secret-2026-09'],
+	},
+	{ label: 'a list with a blank current entry', secret: ['', 'previous-signing-secret-2026-10'] },
+	{ label: 'a list with a number entry', secret: ['current-signing-secret-2026-11', 7] },
+	{ label: 'a number', secret: 42 },
+	{ label: 'a boolean', secret: true },
+	{ label: 'undefined', secret: undefined },
+	{ label: 'null', secret: null },
+	{ label: 'a record', secret: { secret: 'current-signing-secret-2026-11' } },
+	{ label: 'bytes', secret: new TextEncoder().encode('current-signing-secret-2026-11') },
+	{ label: 'a String object', secret: Object('current-signing-secret-2026-11') },
+])
+
+/** Represents one signature `verify` refuses before it reads a key. */
+export interface SignerMalformedCase {
+	readonly label: string
+	readonly signature: string
+}
+
+/** Holds Node's default `http.maxHeaderSize`, the longest header a request can carry, in bytes. */
+export const SIGNER_HEADER_LIMIT = 16_384
+
+/**
+ * Builds the signatures that are not canonical base64url or do not decode to the 32 bytes of an
+ * HMAC-SHA256, each derived from a valid signature.
+ *
+ * @param valid - A canonical base64url HMAC-SHA256 signature
+ * @returns The malformed class table
+ */
+export function buildMalformedSignatures(valid: string): readonly SignerMalformedCase[] {
+	return Object.freeze([
+		{ label: 'an empty signature', signature: '' },
+		{ label: 'one character', signature: valid.slice(0, 1) },
+		{ label: 'the last character dropped', signature: valid.slice(0, -1) },
+		{ label: 'a character appended', signature: `${valid}A` },
+		{ label: 'a padding character appended', signature: `${valid}=` },
+		{
+			label: 'the standard alphabet',
+			signature: `+/${valid.slice(2)}`,
+		},
+		{ label: 'a leading space', signature: ` ${valid}` },
+		{ label: 'a trailing space', signature: `${valid} ` },
+		{ label: 'a lone high surrogate', signature: `${valid.slice(0, 20)}\ud800${valid.slice(21)}` },
+		{ label: 'a lone low surrogate appended', signature: `${valid}\udc00` },
+		// `B` sets a trailing bit that a canonical final character of a 32-byte value leaves clear.
+		{ label: 'non-canonical trailing bits', signature: `${valid.slice(0, -1)}B` },
+		{ label: '31 bytes', signature: encodeBase64URL(new Uint8Array(31).fill(7)) },
+		{ label: '33 bytes', signature: encodeBase64URL(new Uint8Array(33).fill(7)) },
+		{ label: '64 bytes', signature: encodeBase64URL(new Uint8Array(64).fill(7)) },
+		{ label: 'characters outside the alphabet', signature: '*'.repeat(valid.length) },
+		{ label: 'a header-limit signature', signature: 'A'.repeat(SIGNER_HEADER_LIMIT) },
+	])
+}
+
+/** Represents one token `verifyToken` answers `undefined` for. */
+export interface SignerTokenCase {
+	readonly label: string
+	readonly token: string
+}
+
+/**
+ * Builds the malformed tokens derived from a valid one: a missing or misplaced separator, a
+ * tampered or non-UTF-16 payload, a header-limit payload, and every malformed signature.
+ *
+ * @param valid - A valid `<payload>.<signature>` token
+ * @returns The malformed class table for `verifyToken`
+ */
+export function buildMalformedTokens(valid: string): readonly SignerTokenCase[] {
+	const dot = valid.lastIndexOf('.')
+	const payload = valid.slice(0, dot)
+	const signature = valid.slice(dot + 1)
+	return Object.freeze([
+		{ label: 'an empty token', token: '' },
+		{ label: 'no separator', token: payload },
+		{ label: 'a lone separator', token: '.' },
+		{ label: 'an empty signature', token: `${payload}.` },
+		{ label: 'an empty payload', token: `.${signature}` },
+		{ label: 'a tampered payload', token: `${payload}x.${signature}` },
+		{ label: 'a trailing separator', token: `${valid}.` },
+		{ label: 'a lone surrogate payload', token: `\ud800.${signature}` },
+		{
+			label: 'a lone surrogate inside the payload',
+			token: `${payload.slice(0, 4)}\udc00${payload.slice(5)}.${signature}`,
+		},
+		{
+			label: 'a header-limit payload',
+			token: `${'A'.repeat(SIGNER_HEADER_LIMIT - signature.length - 1)}.${signature}`,
+		},
+		...buildMalformedSignatures(signature).map((entry) => ({
+			label: `a signature: ${entry.label}`,
+			token: `${payload}.${entry.signature}`,
+		})),
+	])
+}
+
+/**
+ * Represents a consumer's signer whose key service is down: `sign` resolves a fixed text and
+ * `verify` rejects with `reason`.
+ */
+export class SignerOutage implements SignerInterface {
+	readonly #reason: string
+
+	constructor(reason: string) {
+		this.#reason = reason
+	}
+
+	async sign(): Promise<string> {
+		return 'signature'
+	}
+
+	async verify(): Promise<boolean> {
+		throw new Error(this.#reason)
+	}
+}
+
+/** Names a `node:crypto` export the signer calls, which a recorder can wrap. */
+export type SignerCryptoCall = 'createSecretKey' | 'createHmac'
+
+/** Represents what a recorded run resolved and the calls the recorder saw meanwhile. */
+export interface SignerRecording<T> {
+	readonly value: T
+	readonly calls: ReadonlyArray<readonly unknown[]>
+}
+
+/**
+ * Runs `run` while a recorder wraps the `node:crypto` export `name`, and returns what the run
+ * resolved with the arguments of every call made to that export meanwhile.
+ *
+ * @remarks
+ * The recorder replaces the export on the module object and publishes it to every ES module binding
+ * through `syncBuiltinESMExports`, then restores the original the same way. The wrapped export still
+ * runs, so the code under test behaves as it does unwrapped.
+ *
+ * @param name - The export to record
+ * @param run - The work to record across
+ * @returns The run's value and each recorded call's arguments, oldest first
+ */
+export async function recordSignerCrypto<T>(
+	name: SignerCryptoCall,
+	run: () => Promise<T>,
+): Promise<SignerRecording<T>> {
+	const original = crypto[name]
+	const recorder = createRecorder<readonly unknown[]>()
+	Reflect.set(crypto, name, (...args: readonly unknown[]): unknown => {
+		recorder.handler(...args)
+		return Reflect.apply(original, crypto, args)
+	})
+	syncBuiltinESMExports()
+	try {
+		return { value: await run(), calls: [...recorder.calls] }
+	} finally {
+		Reflect.set(crypto, name, original)
+		syncBuiltinESMExports()
+	}
 }

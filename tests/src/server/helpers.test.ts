@@ -1,9 +1,15 @@
 import type { ServerAppState } from '../../setupServer.js'
 import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import type { Connection, MiddlewareContext, MiddlewareHandler, NextFunction } from '@src/server'
+import type {
+	Connection,
+	MiddlewareContext,
+	MiddlewareHandler,
+	NextFunction,
+	SignerInterface,
+} from '@src/server'
 import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
-import { attempt, isArray, isRecord } from '@orkestrel/contract'
+import { attempt, isArray, isNumber, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
 import {
@@ -16,6 +22,7 @@ import {
 	computeLanguageQuality,
 	compareDigits,
 	ContentTooLargeError,
+	createSigner,
 	decodeCookieValue,
 	decompressRequestBody,
 	DEFAULT_BODY_LIMIT,
@@ -57,6 +64,10 @@ import {
 } from '@src/server'
 import { buildContext } from '../../setup.js'
 import {
+	buildMalformedTokens,
+	SignerOutage,
+	SERVER_BASE_TOKENS,
+	SIGNER_SECRETS,
 	SERVER_EVENT_MESSAGES,
 	SERVER_EVENT_REFUSALS,
 	SERVER_BOM,
@@ -451,7 +462,7 @@ describe('clearCookie', () => {
 
 	it('accumulates onto a prior Set-Cookie rather than clobbering it', async () => {
 		const headers = new Headers()
-		await writeSignedCookie(headers, 'session', 'user-1', 'shh')
+		await writeSignedCookie(headers, 'session', 'user-1', createSigner('shh'))
 		clearCookie(headers, 'legacy')
 		const value = headers.get('set-cookie') ?? ''
 		expect(value).toContain('session=')
@@ -462,48 +473,48 @@ describe('clearCookie', () => {
 describe('writeSignedCookie / readSignedCookie', () => {
 	it('round-trips a signed cookie value', async () => {
 		const headers = new Headers()
-		await writeSignedCookie(headers, 'session', 'user-1', 'shh')
+		await writeSignedCookie(headers, 'session', 'user-1', createSigner('shh'))
 		const cookieHeader = headers.get('set-cookie') ?? ''
 		const nameValue = cookieHeader.split(';')[0]
 		if (nameValue === undefined) throw new Error('expected a signed cookie header')
 		const request = new Request('http://localhost/', { headers: { cookie: nameValue } })
-		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBe('user-1')
+		await expect(readSignedCookie(request, 'session', createSigner('shh'))).resolves.toBe('user-1')
 	})
 
 	it('rejects a tampered signed cookie', async () => {
 		const headers = new Headers()
-		await writeSignedCookie(headers, 'session', 'user-1', 'shh')
+		await writeSignedCookie(headers, 'session', 'user-1', createSigner('shh'))
 		const cookieHeader = headers.get('set-cookie') ?? ''
 		const [name, encoded] = (cookieHeader.split(';')[0] ?? '').split('=')
 		const tampered = `${name}=${encoded}tampered`
 		const request = new Request('http://localhost/', { headers: { cookie: tampered } })
-		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBeUndefined()
+		await expect(readSignedCookie(request, 'session', createSigner('shh'))).resolves.toBeUndefined()
 	})
 
 	it('an absent cookie reads as undefined', async () => {
 		const request = new Request('http://localhost/')
-		await expect(readSignedCookie(request, 'session', 'shh')).resolves.toBeUndefined()
+		await expect(readSignedCookie(request, 'session', createSigner('shh'))).resolves.toBeUndefined()
 	})
 
 	it.each(SERVER_PROTOTYPE_NAMES)(
 		'resolves an absent cookie named %s to undefined without throwing',
 		async (name) => {
 			const request = new Request('http://localhost/', { headers: { cookie: 'session=abc' } })
-			await expect(readSignedCookie(request, name, 'shh')).resolves.toBeUndefined()
+			await expect(readSignedCookie(request, name, createSigner('shh'))).resolves.toBeUndefined()
 		},
 	)
 
 	it.each(SERVER_PROTOTYPE_NAMES)('round-trips a signed cookie named %s', async (name) => {
 		const headers = new Headers()
-		await writeSignedCookie(headers, name, 'user-1', 'shh')
+		await writeSignedCookie(headers, name, 'user-1', createSigner('shh'))
 		const nameValue = (headers.get('set-cookie') ?? '').split(';')[0] ?? ''
 		const request = new Request('http://localhost/', { headers: { cookie: nameValue } })
-		await expect(readSignedCookie(request, name, 'shh')).resolves.toBe('user-1')
+		await expect(readSignedCookie(request, name, createSigner('shh'))).resolves.toBe('user-1')
 	})
 
 	it('emits the requested attributes onto the Set-Cookie header, not just the value round-trip', async () => {
 		const headers = new Headers()
-		await writeSignedCookie(headers, 'session', 'user-1', 'shh', {
+		await writeSignedCookie(headers, 'session', 'user-1', createSigner('shh'), {
 			path: '/account',
 			httpOnly: true,
 			sameSite: 'Strict',
@@ -518,55 +529,111 @@ describe('writeSignedCookie / readSignedCookie', () => {
 // ── Tokens (WebCrypto async) ──────────────────────────────────────────────────
 
 describe('signToken / verifyToken', () => {
+	const signer = createSigner('shh')
+
 	it('round-trips a value', async () => {
-		const token = await signToken('client', { secret: 'shh' })
-		await expect(verifyToken(token, 'shh')).resolves.toBe('client')
+		const token = await signToken('client', { signer })
+		await expect(verifyToken(token, signer)).resolves.toBe('client')
 	})
 
 	it('is total: a malformed token yields undefined, never throws', async () => {
-		await expect(verifyToken('not-a-token', 'shh')).resolves.toBeUndefined()
-		await expect(verifyToken('', 'shh')).resolves.toBeUndefined()
-		await expect(verifyToken('a.b.c', 'shh')).resolves.toBeUndefined()
+		await expect(verifyToken('not-a-token', signer)).resolves.toBeUndefined()
+		await expect(verifyToken('', signer)).resolves.toBeUndefined()
+		await expect(verifyToken('a.b.c', signer)).resolves.toBeUndefined()
 	})
 
 	it('rejects a tampered payload', async () => {
-		const token = await signToken('client', { secret: 'shh' })
+		const token = await signToken('client', { signer })
 		const [payload, signature] = token.split('.')
 		const tampered = `${payload}x.${signature}`
-		await expect(verifyToken(tampered, 'shh')).resolves.toBeUndefined()
+		await expect(verifyToken(tampered, signer)).resolves.toBeUndefined()
 	})
 
-	it('rejects a wrong secret', async () => {
-		const token = await signToken('client', { secret: 'shh' })
-		await expect(verifyToken(token, 'other')).resolves.toBeUndefined()
+	it('rejects a token another key signed', async () => {
+		const token = await signToken('client', { signer })
+		await expect(verifyToken(token, createSigner('other'))).resolves.toBeUndefined()
 	})
 
 	it('honors a ttl, rejecting an expired token', async () => {
-		const token = await signToken('client', { secret: 'shh', ttl: -1 })
-		await expect(verifyToken(token, 'shh')).resolves.toBeUndefined()
+		const token = await signToken('client', { signer, ttl: -1 })
+		await expect(verifyToken(token, signer)).resolves.toBeUndefined()
 	})
 
-	it('accepts a token signed under any secret in a rotation list', async () => {
-		const token = await signToken('client', { secret: 'old' })
-		await expect(verifyToken(token, ['new', 'old'])).resolves.toBe('client')
+	it('accepts a token signed under any key of a rotation list', async () => {
+		const token = await signToken('client', { signer: createSigner('old') })
+		await expect(verifyToken(token, createSigner(['new', 'old']))).resolves.toBe('client')
 	})
 
-	it('signs with the FIRST secret of a rotation list', async () => {
-		const token = await signToken('client', { secret: ['current', 'previous'] })
-		await expect(verifyToken(token, 'current')).resolves.toBe('client')
-		await expect(verifyToken(token, 'previous')).resolves.toBeUndefined()
+	it('signs with the FIRST key of a rotation list', async () => {
+		const token = await signToken('client', { signer: createSigner(['current', 'previous']) })
+		await expect(verifyToken(token, createSigner('current'))).resolves.toBe('client')
+		await expect(verifyToken(token, createSigner('previous'))).resolves.toBeUndefined()
 	})
 
-	it('signToken throws on an empty secret (fail-closed)', async () => {
-		await expect(signToken('client', { secret: '' })).rejects.toThrow(HTTPError)
+	it.each(SERVER_BASE_TOKENS)('mints the base build token for $label', async (row) => {
+		await expect(signToken(row.value, { signer: createSigner(row.secret) })).resolves.toBe(
+			row.token,
+		)
+		await expect(verifyToken(row.token, createSigner(SIGNER_SECRETS))).resolves.toBe(row.value)
 	})
 
-	it('verifyToken returns undefined on an empty rotation list', async () => {
-		await expect(verifyToken('x.y', [])).resolves.toBeUndefined()
+	it('binds exp inside the call clock bracket, under a signature WebCrypto verifies', async () => {
+		const before = Date.now()
+		const token = await signToken('client', { signer: createSigner(SIGNER_SECRETS), ttl: 60_000 })
+		const after = Date.now()
+		const [payload = '', signature = ''] = token.split('.')
+		const decoded: unknown = JSON.parse(new TextDecoder().decode(decodeBase64URL(payload)))
+		const exp = isRecord(decoded) ? decoded.exp : undefined
+		expect(isNumber(exp) && exp >= before + 60_000 && exp <= after + 60_000).toBe(true)
+		const key = await crypto.subtle.importKey(
+			'raw',
+			new TextEncoder().encode(SIGNER_SECRETS[0]),
+			{ name: 'HMAC', hash: 'SHA-256' },
+			false,
+			['verify'],
+		)
+		const bytes = decodeBase64URL(signature) ?? new Uint8Array()
+		await expect(
+			crypto.subtle.verify('HMAC', key, bytes, new TextEncoder().encode(payload)),
+		).resolves.toBe(true)
+	})
+
+	it('answers undefined for a signed payload that is not a well-formed token value', async () => {
+		const rotation = createSigner(SIGNER_SECRETS)
+		const payloads = [
+			encodeBase64URL(new TextEncoder().encode('not json')),
+			encodeBase64URL(new TextEncoder().encode('{"value":1}')),
+			encodeBase64URL(new TextEncoder().encode('{"value":"client","exp":"soon"}')),
+			encodeBase64URL(new TextEncoder().encode('{"value":"client","exp":0}')),
+			encodeBase64URL(new TextEncoder().encode('null')),
+			'abc=',
+		]
+		const answers = await Promise.all(
+			payloads.map(async (payload) =>
+				verifyToken(`${payload}.${await rotation.sign(payload)}`, rotation),
+			),
+		)
+		expect(answers).toEqual(payloads.map(() => undefined))
+	})
+
+	it.each(buildMalformedTokens(SERVER_BASE_TOKENS[0]?.token ?? ''))(
+		'answers undefined for $label',
+		async ({ token }) => {
+			await expect(verifyToken(token, createSigner(SIGNER_SECRETS))).resolves.toBeUndefined()
+		},
+	)
+
+	it('rejects when a consumer signer rejects, so an outage never reads as an invalid token', async () => {
+		const outage: SignerInterface = new SignerOutage('key service unavailable')
+		const request = new Request('http://localhost/', { headers: { cookie: 'session=a.b' } })
+		await expect(verifyToken('a.b', outage)).rejects.toThrow('key service unavailable')
+		await expect(readSignedCookie(request, 'session', outage)).rejects.toThrow(
+			'key service unavailable',
+		)
 	})
 
 	it('rejects a payload whose exp was tampered but re-signed with the ORIGINAL signature', async () => {
-		const token = await signToken('client', { secret: 'shh', ttl: 1000 })
+		const token = await signToken('client', { signer, ttl: 1000 })
 		const dot = token.lastIndexOf('.')
 		const encoded = token.slice(0, dot)
 		const signature = token.slice(dot + 1)
@@ -582,13 +649,25 @@ describe('signToken / verifyToken', () => {
 			new TextEncoder().encode(JSON.stringify(tamperedPayload)),
 		)
 		const tamperedToken = `${tamperedEncoded}.${signature}`
-		await expect(verifyToken(tamperedToken, 'shh')).resolves.toBeUndefined()
+		await expect(verifyToken(tamperedToken, createSigner('shh'))).resolves.toBeUndefined()
 	})
 })
 
 describe('normalizeSecret', () => {
-	it('drops blank entries, keeps real ones in order', () => {
-		expect(normalizeSecret(['new', '', '  ', 'old'])).toEqual(['new', 'old'])
+	it('refuses a list holding blank entries with code SECRET, naming each blank position', () => {
+		const outcome = attempt(() => normalizeSecret(['new', '', '  ', 'old']))
+		const error = outcome.success ? undefined : outcome.error
+		expect(isServerError(error) ? [error.code, error.context] : error).toEqual([
+			'SECRET',
+			{ entries: [1, 2], count: 4 },
+		])
+	})
+
+	it('copies a rotation list verbatim, in order', () => {
+		const list = [' new ', 'old']
+		const normalized = normalizeSecret(list)
+		expect(normalized).toEqual([' new ', 'old'])
+		expect(normalized).not.toBe(list)
 	})
 
 	it('wraps a single string', () => {

@@ -7,6 +7,7 @@ import type {
 	MiddlewareContext,
 	MiddlewareHandler,
 	RangeSpec,
+	SignerInterface,
 	SSEMessage,
 	TokenOptions,
 	TokenSecret,
@@ -15,6 +16,7 @@ import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
 import {
+	attempt,
 	holds,
 	isArray,
 	isError,
@@ -389,62 +391,63 @@ export function resolveSecure(secure: boolean | undefined, encrypted: boolean): 
  * appends it as a `Set-Cookie` (the inverse of {@link readSignedCookie}).
  *
  * @remarks
- * The cookie value is `await signToken(value, { secret })`
+ * The cookie value is `await signToken(value, { signer })`
  * (`<payload>.<signature>`), so a signed cookie is a stateless token in a
- * cookie — the same secret rotation and tamper rejection, no second HMAC
+ * cookie — the same key rotation and tamper rejection, no second HMAC
  * scheme. Appends (never clobbers) through `Headers.append`, which accumulates
- * repeated headers. Async — WebCrypto signing is asynchronous.
+ * repeated headers.
  *
  * @param headers - The response `Headers` to write into
  * @param name - The cookie name
  * @param value - The opaque value to sign into the cookie
- * @param secret - The {@link TokenSecret} to sign with (the first secret signs)
+ * @param signer - The {@link SignerInterface} that signs (its first key signs)
  * @param options - The {@link CookieOptions} attributes for the `Set-Cookie`
  *
  * @example
  * ```ts
  * const headers = new Headers()
- * await writeSignedCookie(headers, 'session', 'user-1', 'secret')
+ * await writeSignedCookie(headers, 'session', 'user-1', createSigner('secret'))
  * ```
  */
 export async function writeSignedCookie(
 	headers: Headers,
 	name: string,
 	value: string,
-	secret: TokenSecret,
+	signer: SignerInterface,
 	options?: CookieOptions,
 ): Promise<void> {
-	headers.append('set-cookie', serializeCookie(name, await signToken(value, { secret }), options))
+	headers.append('set-cookie', serializeCookie(name, await signToken(value, { signer }), options))
 }
 
 /**
- * Reads and verifies a signed cookie off a request — total, returning the
- * embedded value or `undefined` (the inverse of {@link writeSignedCookie}).
+ * Reads and verifies a signed cookie off a request, returning the embedded value
+ * or `undefined` (the inverse of {@link writeSignedCookie}).
  *
  * @remarks
  * Parses the `Cookie` header ({@link parseCookies}), takes the named cookie,
- * and verifies it with {@link verifyToken} against `secret` (a rotation list
- * accepts a cookie signed by any of its secrets). Any failure — an absent
- * cookie, a tampered value, a wrong secret — yields `undefined`, never throws,
- * a name such as `constructor` included.
+ * and verifies it with {@link verifyToken} against `signer` (a signer over a
+ * rotation list accepts a cookie signed by any of its keys). An absent cookie,
+ * a tampered value, and a wrong key each yield `undefined`, a name such as
+ * `constructor` included. It rejects only when `signer.verify` rejects, which
+ * the signer `createSigner` returns never does.
  *
  * @param request - The `Request` to read the `Cookie` header from
  * @param name - The cookie name to read
- * @param secret - The {@link TokenSecret} (or rotation list) to verify against
+ * @param signer - The {@link SignerInterface} to verify against
  * @returns The embedded value when the cookie is present + valid, else `undefined`
  *
  * @example
  * ```ts
- * const value = await readSignedCookie(request, 'session', 'secret')
+ * const value = await readSignedCookie(request, 'session', createSigner('secret'))
  * ```
  */
 export async function readSignedCookie(
 	request: Request,
 	name: string,
-	secret: TokenSecret,
+	signer: SignerInterface,
 ): Promise<string | undefined> {
 	const cookie = parseCookies(request.headers.get('cookie') ?? undefined)[name]
-	return cookie === undefined ? undefined : verifyToken(cookie, secret)
+	return cookie === undefined ? undefined : verifyToken(cookie, signer)
 }
 
 /**
@@ -469,15 +472,9 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
 	headers.append('set-cookie', serializeCookie(name, '', { ...options, maxAge: 0 }))
 }
 
-// The stateless signed-token primitives over WebCrypto (module-scope
-// helpers). A token is `<payload>.<signature>`: the
-// payload a base64url JSON `{ value, exp? }`, the signature an HMAC-SHA256 of
-// the payload under the secret. Signing always uses the first secret (a
-// rotation list's current head); verifying accepts any secret in the list,
-// through `crypto.subtle.verify` — constant-time internally, so the old
-// `safeCompare` is retired, never ported. `verifyToken` is total (never
-// throws — adversarial input returns `undefined`); only
-// `signToken` throws, and only on a misconfigured (empty) secret.
+// The stateless signed-token primitives (module-scope helpers). A token is
+// `<payload>.<signature>`: the payload a base64url JSON `{ value, exp? }`, the
+// signature the signer's HMAC-SHA256 of the payload.
 
 /**
  * Signs a value into a stateless, HMAC-SHA256 token — `<payload>.<signature>`.
@@ -486,94 +483,58 @@ export function clearCookie(headers: Headers, name: string, options?: CookieOpti
  * The payload is a base64url-encoded JSON `{ value, exp }` (`exp` is the
  * absolute expiry instant `Date.now() + ttl` when `options.ttl` is set, so
  * the expiry is HMAC-COVERED — a client cannot extend it without invalidating
- * the signature), signed by using `crypto.subtle.sign('HMAC', …)` under the first
- * {@link TokenSecret} (the current secret, or the head of a rotation list).
- * Blank/whitespace-only secrets are ignored ({@link normalizeSecret}); a
- * misconfigured secret with no usable entry throws an {@link HTTPError}
- * (`500`) — fail-closed, a programmer error. Verify with
- * {@link verifyToken}. Omitting `ttl` mints a token that never expires.
+ * the signature), signed by `options.signer`, whose first key signs. Verify
+ * with {@link verifyToken}. Omitting `ttl` mints a token that never expires.
  *
  * @param value - The opaque value to embed (a session id, a deployment marker)
- * @param options - The signing `secret` and optional `ttl` (ms); see {@link TokenOptions}
+ * @param options - The `signer` and optional `ttl` (ms); see {@link TokenOptions}
  * @returns The signed `<payload>.<signature>` token string
- * @throws {HTTPError} When `options.secret` has no usable (non-blank) entry
  *
  * @example
  * ```ts
- * const token = await signToken('client', { secret: 'shh', ttl: 60_000 })
- * await verifyToken(token, 'shh') // 'client' (within 60s), else undefined
+ * const signer = createSigner('shh')
+ * const token = await signToken('client', { signer, ttl: 60_000 })
+ * await verifyToken(token, signer) // 'client' (within 60s), else undefined
  * ```
  */
 export async function signToken(value: string, options: TokenOptions): Promise<string> {
-	const secrets = normalizeSecret(options.secret)
-	const secret = secrets[0]
-	if (secret === undefined) throw new HTTPError(500, 'signToken requires at least one secret')
 	const exp = options.ttl !== undefined ? Date.now() + options.ttl : undefined
 	const encoded = encodeBase64URL(new TextEncoder().encode(JSON.stringify({ value, exp })))
-	const key = await crypto.subtle.importKey(
-		'raw',
-		new TextEncoder().encode(secret),
-		{ name: 'HMAC', hash: 'SHA-256' },
-		false,
-		['sign'],
-	)
-	const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(encoded))
-	return `${encoded}.${encodeBase64URL(new Uint8Array(signature))}`
+	return `${encoded}.${await options.signer.sign(encoded)}`
 }
 
 /**
- * Verifies a stateless token and returns its embedded value — total, never throws.
+ * Verifies a stateless token and returns its embedded value, or `undefined` for a
+ * malformed, tampered, or expired token.
  *
  * @remarks
  * The inverse of {@link signToken}: splits the token on its last `.` (so a
- * value containing dots survives), decodes the signature with
- * `@orkestrel/codec`'s `decodeBase64URL` — a signature that is not canonical
- * base64url is refused there, before any key import — and checks the payload's
- * HMAC-SHA256 signature against each {@link TokenSecret} candidate through
- * `crypto.subtle.verify` (constant-time internally — the old `safeCompare` is
- * retired), accepting the token on the first match (the
- * rotation path). It then decodes + narrows the payload (`isRecord` +
- * `typeof`, never `as`) and, when an expiry was bound in, rejects an expired
- * token. Any failure — a malformed token, a bad signature,
- * a hostile/non-JSON payload, an empty secret list, or an elapsed expiry —
- * yields `undefined` rather than throwing.
+ * value containing dots survives), checks the signature with `signer.verify`
+ * (a signer over a rotation list accepts any of its keys), then decodes and
+ * narrows the payload with {@link decodeTokenPayload}, which refuses an
+ * elapsed expiry. It rejects only when `signer.verify` rejects, which the
+ * signer `createSigner` returns never does, so a consumer signer's outage
+ * surfaces as an error rather than as an invalid token.
  *
  * @param token - The candidate token string (from a request header/cookie)
- * @param secret - The {@link TokenSecret} (or rotation list) to verify against
+ * @param signer - The {@link SignerInterface} to verify against
  * @returns The embedded value when the token is valid + unexpired, else `undefined`
  *
  * @example
  * ```ts
- * await verifyToken('bad.token', 'shh') // undefined — never throws
+ * await verifyToken('bad.token', createSigner('shh')) // undefined
  * ```
  */
-export async function verifyToken(token: string, secret: TokenSecret): Promise<string | undefined> {
-	const secrets = normalizeSecret(secret)
-	if (secrets.length === 0) return undefined
+export async function verifyToken(
+	token: string,
+	signer: SignerInterface,
+): Promise<string | undefined> {
 	const dot = token.lastIndexOf('.')
 	if (dot < 0) return undefined
 	const encoded = token.slice(0, dot)
-	const signature = decodeBase64URL(token.slice(dot + 1))
-	if (signature === undefined) return undefined
-	const data = new TextEncoder().encode(encoded)
-	try {
-		for (const candidate of secrets) {
-			const key = await crypto.subtle.importKey(
-				'raw',
-				new TextEncoder().encode(candidate),
-				{ name: 'HMAC', hash: 'SHA-256' },
-				false,
-				['verify'],
-			)
-			const matched = await crypto.subtle.verify('HMAC', key, signature, data)
-			if (matched) return decodeTokenPayload(encoded)
-		}
-		return undefined
-	} catch {
-		// WebCrypto is the only thrower left here — it rejects unusable key
-		// material. An unverifiable token is invalid, so stay total.
-		return undefined
-	}
+	return (await signer.verify(encoded, token.slice(dot + 1)))
+		? decodeTokenPayload(encoded)
+		: undefined
 }
 
 /**
@@ -603,26 +564,51 @@ export function decodeTokenPayload(encoded: string): string | undefined {
 }
 
 /**
- * Normalizes a {@link TokenSecret} to a concrete list of usable secrets — the list
- * behind both {@link signToken} and {@link verifyToken}.
+ * Normalizes a {@link TokenSecret} to its `[current, ...older]` list — the list a
+ * signer creates its keys from — refusing a malformed secret.
  *
  * @remarks
- * A single string becomes a one-element list; a rotation list is copied. Any
- * blank/whitespace-only entry is dropped (`.trim()` is used only for that
- * emptiness test; each kept secret is stored verbatim). The first kept
- * element is the signing secret; all kept are accepted on verify.
+ * A single string becomes a one-element list; a rotation list is copied once
+ * and its copy validated, each secret kept verbatim. A blank entry is refused,
+ * never dropped, because dropping a blank current secret would make an older
+ * key sign. The refusal names the blank or non-string positions in `context`
+ * and carries no secret text.
  *
  * @param secret - The {@link TokenSecret} (a single string, or a rotation list)
- * @returns The kept (non-blank) secrets, in order — empty when none is usable
+ * @returns The secrets, current first
+ * @throws {ServerError} `'SECRET'` when `secret` is not a string or a list of
+ *   strings, when the list is empty, or when any entry is blank
  *
  * @example
  * ```ts
- * normalizeSecret(['new', '', '  ', 'old']) // ['new', 'old']
+ * normalizeSecret(['new', 'old']) // ['new', 'old']
+ * normalizeSecret(['new', '  ']) // throws ServerError 'SECRET', context { entries: [1], count: 2 }
  * ```
  */
-export function normalizeSecret(secret: TokenSecret): readonly string[] {
-	const list = isString(secret) ? [secret] : [...secret]
-	return list.filter((entry) => entry.trim().length > 0)
+export function normalizeSecret(secret: TokenSecret): readonly [string, ...string[]] {
+	const copied = attempt((): readonly unknown[] | undefined =>
+		isString(secret) ? [secret] : isArray(secret) ? Array.from(secret) : undefined,
+	)
+	const entries = copied.success ? copied.value : undefined
+	if (entries === undefined)
+		throw new ServerError(
+			'SECRET',
+			'createSigner refuses a secret that is not a string or a list of strings: pass a non-blank string or a non-empty list of non-blank strings',
+			{ received: typeof secret },
+		)
+	const blank = entries.flatMap((entry, index) =>
+		isString(entry) && entry.trim().length > 0 ? [] : [index],
+	)
+	const [current, ...older] = entries
+	if (!isString(current) || blank.length > 0 || !older.every(isString))
+		throw new ServerError(
+			'SECRET',
+			entries.length === 0
+				? 'createSigner refuses an empty secret list: pass a non-blank string or a non-empty list of non-blank strings'
+				: `createSigner refuses a secret whose entries at ${blank.join(', ')} are blank or not strings: pass a non-blank string or a non-empty list of non-blank strings`,
+			{ entries: blank, count: entries.length },
+		)
+	return [current, ...older]
 }
 
 // The content-negotiation helpers (module-scope) — the one shared q-value
