@@ -15,5 +15,15 @@ describe('buildContext', () => {
 		expect(context.method).toBe('GET')
 		expect(context.state).toBe(state)
 		await expect(context.body()).resolves.toBeUndefined()
+		expect(context.connection).toEqual({ ip: '127.0.0.1', encrypted: false })
+	})
+
+	it('aborts the controller it was given with the first reason, and a second call changes nothing', () => {
+		const controller = new AbortController()
+		const context = buildContext({}, controller)
+		context.abort('first')
+		context.abort('second')
+		expect(controller.signal.aborted).toBe(true)
+		expect(controller.signal.reason).toBe('first')
 	})
 })

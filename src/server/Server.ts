@@ -6,6 +6,7 @@ import type { TimeoutInterface } from '@orkestrel/timeout'
 import type { EmitterInterface } from '@orkestrel/emitter'
 import type { DispatcherInterface } from '@orkestrel/router'
 import type {
+	Connection,
 	ConnectionStateFunction,
 	MiddlewareContext,
 	MiddlewareHandler,
@@ -46,9 +47,9 @@ import { ServerBinding } from './ServerBinding.js'
  *   bind is pending, and transitions `idle → starting → listening`. A
  *   cancelled or expired bind closes its partial server and resets to `idle` for
  *   another start. `stop()` transitions
- *   to `stopping`: fires a fresh-per-run stop signal so in-flight handlers
+ *   to `stopping`: aborts the signal of every in-flight request so handlers
  *   observe cancellation (a request that arrives during the drain is served
- *   with that signal already aborted), drains in-flight requests and
+ *   with its signal already aborted), drains in-flight requests and
  *   claimed upgraded sockets up to the `drain` deadline (event-driven, no
  *   busy-loop), then closes → `stopped`. After a clean drain the close
  *   destroys every connection that carries no open request exchange, and a
@@ -60,20 +61,20 @@ import { ServerBinding } from './ServerBinding.js'
  *   counted before the close. After an expired drain the close destroys every
  *   socket. A `stop()` call made while a stop runs returns that stop's
  *   promise. `destroy()` is the idempotent final teardown.
- * - **Per request.** In-flight is tracked (finished on response `finish` or
- *   `close`); a `Request` is built through the router's `buildRequest`, its
- *   `signal` linked to this run's stop signal through `@orkestrel/abort`'s
- *   `linkSignal` (a fresh `Request` is constructed with the linked signal —
- *   `buildRequest`'s own abort, armed by request-side and response-side
- *   teardown, composes with the server's stop signal through `AbortSignal.any`,
- *   so a handler awaiting `request.signal` observes either); `context.state` is built through
- *   {@link ServerOptions.state} from the connection facts; the composed
- *   middleware onion runs, terminating in `dispatcher.handle`; the result is
- *   written back through `sendResponse`.
+ * - **Per request.** The exchange's own `AbortController` joins the
+ *   in-flight registry until the response's `finish` or `close`; the one
+ *   `Request` of the exchange is built through the router's `buildRequest`
+ *   with that controller's signal, so `request.signal` aborts on a peer
+ *   disconnect, on `context.abort(reason)`, or on `stop()`, and no request
+ *   signal links to a signal that outlives the exchange; `context.state` is
+ *   built through {@link ServerOptions.state} from the connection facts, which
+ *   `context.connection` carries as the same object; the composed middleware
+ *   onion runs, terminating in `dispatcher.handle`; the result is written
+ *   back through `sendResponse`.
  * - **The built-in boundary** wraps the whole per-request chain, including
  *   setup: `buildRequest` runs behind its own inner boundary that maps a
  *   throw (for example, a malformed `Host` header) to a silent `400` with no
- *   `error` emit; everything after (`Request` reconstruction, connection
+ *   `error` emit; everything after (connection
  *   facts, `state`, the composed onion, and `dispatcher.handle`) runs
  *   behind the outer boundary — a thrown `HTTPError` renders as its status +
  *   message; any other throw renders `500` (message hidden unless
@@ -98,6 +99,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #middleware: Array<MiddlewareHandler<TState>>
 	readonly #upgradeHandlers: UpgradeHandler[] = []
 	readonly #upgraded = new Set<Duplex>()
+	readonly #requests = new Set<AbortController>()
 	readonly #exchanges = new Map<Socket, number>()
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
@@ -118,11 +120,9 @@ export class Server<TState> implements ServerInterface<TState> {
 		readonly requests?: number
 	}
 	#http: NodeHTTPServer | undefined
-	#abort: AbortInterface = createAbort()
 	#wakeup: AbortInterface = createAbort()
 	#status: ServerStatus = 'idle'
 	#port: number | undefined
-	#pending = 0
 	#stopping: Promise<void> | undefined
 
 	constructor(options: ServerOptions<TState>) {
@@ -220,8 +220,6 @@ export class Server<TState> implements ServerInterface<TState> {
 			)
 		}
 		this.#status = 'starting'
-		// A fresh stop signal per run, so a restarted server is not born aborted.
-		this.#abort = createAbort()
 		const server = createHTTPServer((request, response) => this.#handle(request, response))
 		if (this.#timeouts.request !== undefined) server.requestTimeout = this.#timeouts.request
 		if (this.#timeouts.headers !== undefined) server.headersTimeout = this.#timeouts.headers
@@ -241,8 +239,8 @@ export class Server<TState> implements ServerInterface<TState> {
 	// A call during a stop returns the stop in flight, so every caller resolves
 	// after the same close; the field is released only by the stop that set it.
 	// The promise is published before the stop's synchronous prologue, because
-	// that prologue emits `stop` and aborts the stop signal, and a listener on
-	// either can call this method.
+	// that prologue emits `stop` and aborts every in-flight request's signal, and
+	// a listener on either can call this method.
 	stop(): Promise<void> {
 		if (this.#status !== 'listening') return this.#stopping ?? Promise.resolve()
 		const { promise, resolve, reject } = Promise.withResolvers<void>()
@@ -260,7 +258,7 @@ export class Server<TState> implements ServerInterface<TState> {
 			this.#emitter.destroy()
 			return
 		}
-		if (!this.#abort.aborted) this.#abort.abort()
+		for (const exchange of this.#requests) exchange.abort()
 		const server = this.#http
 		if (server !== undefined) await this.#close(server, true)
 		this.#http = undefined
@@ -272,18 +270,18 @@ export class Server<TState> implements ServerInterface<TState> {
 	// One `drain` deadline bounds the whole stop: it bounds the drain, then
 	// stays armed through the clean close's wait on open exchanges, and its
 	// expiry cuts what is still held as an expired drain does. It is a pure
-	// clock rather than the stop signal's child, because a parent abort clears
+	// clock rather than a child of any signal, because a parent abort clears
 	// a `Timeout` instead of expiring it.
 	async #stopGracefully(): Promise<void> {
 		this.#status = 'stopping'
 		this.#emitter.emit('stop')
 		const server = this.#http
-		this.#abort.abort()
+		for (const exchange of this.#requests) exchange.abort()
 		const deadline: TimeoutInterface = createTimeout({ ms: this.#drain })
 		deadline.start()
 		try {
 			await this.#drainPending(deadline.signal)
-			const pending = this.#pending
+			const pending = this.#requests.size
 			const upgraded = this.#upgraded.size
 			this.#emitter.emit('drain', pending, upgraded)
 			if (server !== undefined) {
@@ -302,50 +300,55 @@ export class Server<TState> implements ServerInterface<TState> {
 		this.#status = 'stopped'
 	}
 
-	// Track the request for draining first — before anything that can throw —
-	// so the sync listener itself never throws; the rest of setup (which can
-	// throw on a malformed request) is deferred into the async `#accept`
-	// entry, kept behind the built-in boundary. A request parsed after the
-	// close on a connection an open exchange still holds is not counted work,
-	// so its connection is destroyed before the request counts or runs.
+	// Register the exchange's abort handle for draining first — before anything
+	// that can throw — so the sync listener itself never throws; the rest of
+	// setup (which can throw on a malformed request) is deferred into the async
+	// `#accept` entry, kept behind the built-in boundary. A request that arrives
+	// while the drain runs is registered already aborted. A request parsed after
+	// the close on a connection an open exchange still holds is not counted
+	// work, so its connection is destroyed before the request counts or runs.
 	#handle(message: IncomingMessage, response: ServerResponse): void {
 		if (this.#closed) {
 			message.socket.destroy()
 			return
 		}
-		const finish = this.#trackStart()
-		response.once('finish', finish)
-		response.once('close', finish)
+		const exchange = new AbortController()
+		const release = this.#register(exchange)
+		if (this.#status === 'stopping') exchange.abort()
+		response.once('finish', release)
+		response.once('close', release)
 		void this.#trackExchange(message, response)
-		void this.#accept(message, response)
+		void this.#accept(message, response, exchange)
 	}
 
-	// Build the fetch `Request` + `MiddlewareContext`, run the composed onion,
-	// and write the result back — every escaping throw is caught so the
-	// process can never crash on an unhandled handler (or malformed request)
-	// error. `buildRequest` runs behind its own inner boundary: a throw there
-	// (for example, a malformed `Host` header) maps to a silent `400`, never
-	// `error`.
-	async #accept(message: IncomingMessage, response: ServerResponse): Promise<void> {
-		const created = attempt(() => buildRequest(message, { response }))
+	// Build the one fetch `Request` of the exchange and its `MiddlewareContext`,
+	// run the composed onion, and write the result back — every escaping throw
+	// is caught so the process can never crash on an unhandled handler (or
+	// malformed request) error. `buildRequest` runs behind its own inner
+	// boundary: a throw there (for example, a malformed `Host` header) maps to
+	// a silent `400`, never `error`.
+	async #accept(
+		message: IncomingMessage,
+		response: ServerResponse,
+		exchange: AbortController,
+	): Promise<void> {
+		const created = attempt(() => buildRequest(message, { response, signal: exchange.signal }))
 		if (!created.success) {
 			await this.#respond(this.#boundary(new HTTPError(400, 'invalid request')), response)
 			return
 		}
-		const raw = created.value
+		const request = created.value
 		// Hoisted out of the inner try (not block-scoped inside it) so that try's
 		// catch can attach real request context to the `error` emit / `report`
 		// sink — and so `response` can be emitted with the same facts on either
 		// the success or the error path.
-		const method = raw.method
-		const url = new URL(raw.url)
+		const method = request.method
+		const url = new URL(request.url)
 		const start = performance.now()
 		try {
-			const linked = linkSignal(raw.signal, this.#abort.signal)
-			const request = new Request(raw, { signal: linked })
 			this.#emitter.emit('request', method, url.pathname)
 			const ip = message.socket.remoteAddress
-			const connection = {
+			const connection: Connection = {
 				...(ip === undefined ? {} : { ip }),
 				encrypted: isEncryptedSocket(message.socket),
 			}
@@ -353,7 +356,9 @@ export class Server<TState> implements ServerInterface<TState> {
 				url,
 				method,
 				state: this.#state(connection),
+				connection,
 				body: this.#createBody(request),
+				abort: exchange.abort.bind(exchange),
 			}
 			const runner = compose(this.#middleware, (currentRequest, currentContext) =>
 				this.#dispatcher.handle(currentRequest, currentContext.state),
@@ -565,7 +570,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	// sockets handlers claimed. Derived, so the two counters can never drift
 	// out of step with a third stored flag.
 	get #inflight(): number {
-		return this.#pending + this.#upgraded.size
+		return this.#requests.size + this.#upgraded.size
 	}
 
 	// Arm a fresh drain wakeup when the server goes from settled to busy.
@@ -584,15 +589,13 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#inflight === 0) this.#wakeup.abort()
 	}
 
-	// Track one in-flight request; returns an idempotent finish thunk.
-	#trackStart(): () => void {
+	// Register one in-flight exchange's abort handle; returns the idempotent
+	// removal its response's `finish` or `close` runs.
+	#register(exchange: AbortController): () => void {
 		this.#enter()
-		this.#pending += 1
-		const completions = [undefined].values()
+		this.#requests.add(exchange)
 		return () => {
-			if (completions.next().done) return
-			this.#pending -= 1
-			this.#settle()
+			if (this.#requests.delete(exchange)) this.#settle()
 		}
 	}
 

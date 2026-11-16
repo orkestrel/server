@@ -6,9 +6,11 @@ import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { attempt, isArray, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
+import { createRecorder } from '@orkestrel/test'
 import {
 	clearCookie,
 	compose,
+	wrapMiddleware,
 	computeBodyETag,
 	computeClientKey,
 	computeCodingQuality,
@@ -25,12 +27,14 @@ import {
 	isCookieAttribute,
 	isCookieName,
 	isDangerousKey,
+	supportsMutation,
 	isServerError,
 	isValidRequestId,
 	matchesETag,
 	matchMediaType,
 	mergeVary,
 	negotiateEncoding,
+	normalizeResponse,
 	normalizeSecret,
 	parseAcceptHeader,
 	parseCookies,
@@ -75,18 +79,64 @@ import {
 	recognizeServerRange,
 	compressServerFixture,
 	createTraceLayer,
+	countLiveObjects,
+	createPassLayer,
 	repeatServerNext,
 	raceServerNext,
 	refuseServerRequest,
 	createObservedRefusal,
-	substituteServerRequest,
+	createArgumentLayer,
+	createRetryLayer,
 	createResponseHeader,
+	createResponseLayer,
+	createSeenLayer,
 	stashServerUser,
 } from '../../setupServer.js'
 
 // ── compose (the middleware onion) ───────────────────────────────────────────
 
 describe('compose', () => {
+	it('runs the layers the array held when compose was called, not a layer pushed later', async () => {
+		const order: string[] = []
+		const layers = [createTraceLayer(order, 'first')]
+		const handle = compose(layers, async () => {
+			order.push('terminal')
+			return new Response('ok')
+		})
+		layers.push(createTraceLayer(order, 'late'))
+		await handle(new Request('http://localhost/'), buildContext({}))
+		expect(order).toEqual(['first-before', 'terminal', 'first-after'])
+	})
+
+	it('keeps no response live after many runs of one composed handler', async () => {
+		const handle = compose<Record<string, never>>(
+			[createPassLayer(), createPassLayer()],
+			async () => new Response('ok'),
+		)
+		const request = new Request('http://localhost/')
+		const context = buildContext<Record<string, never>>({})
+		await handle(request, context)
+		const before = await countLiveObjects(Response)
+		for (const _ of Array.from({ length: 3_000 })) await handle(request, context)
+		const after = await countLiveObjects(Response)
+		// A memo that outlives its run keeps every run's response; one run keeps at most a few.
+		expect(after - before).toBeLessThan(30)
+	})
+
+	it('keeps no response live after many calls of a handler wrapped once with no memo', async () => {
+		const handle = wrapMiddleware<Record<string, never>>(
+			createPassLayer(),
+			async () => new Response('ok'),
+		)
+		const request = new Request('http://localhost/')
+		const context = buildContext<Record<string, never>>({})
+		await handle(request, context)
+		const before = await countLiveObjects(Response)
+		for (const _ of Array.from({ length: 3_000 })) await handle(request, context)
+		const after = await countLiveObjects(Response)
+		expect(after - before).toBeLessThan(30)
+	})
+
 	it('runs middleware outermost-first around the terminal', async () => {
 		const order: string[] = []
 		const first = createTraceLayer(order, 'first')
@@ -137,15 +187,84 @@ describe('compose', () => {
 		expect(terminalRan.value).toBe(false)
 	})
 
-	it('substitutes the downstream request by using next(newRequest)', async () => {
-		const seenUrl = new ServerObservation('')
-		const substitute = substituteServerRequest
-		const handle = compose([substitute], async (request) => {
-			seenUrl.value = request.url
+	it('rejects a next() call that passes a Request with a ServerError of code NEXT, and never runs the terminal', async () => {
+		const terminalRan = new ServerObservation(false)
+		const refusal = new ServerObservation<unknown>(undefined)
+		const substitute = createArgumentLayer<Record<string, never>>(
+			() => new Request('http://localhost/substituted'),
+			refusal,
+		)
+		const handle = compose([substitute], async () => {
+			terminalRan.value = true
 			return new Response('ok')
 		})
-		await handle(new Request('http://localhost/original'), buildContext({}))
-		expect(seenUrl.value).toBe('http://localhost/substituted')
+		const caught = await handle(new Request('http://localhost/original'), buildContext({})).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
+		expect(caught).toBe(refusal.value)
+		if (!isServerError(caught))
+			throw new Error(`expected a ServerError, received ${String(caught)}`)
+		expect(caught.code).toBe('NEXT')
+		expect(caught.message).toBe('next() takes no argument; every layer reads one request')
+		expect(terminalRan.value).toBe(false)
+	})
+
+	it('counts a refused next(request) as the layer’s one call, so a later next() rejects and the terminal never runs', async () => {
+		const terminalRuns = createRecorder<[]>()
+		const refusal = new ServerObservation<unknown>(undefined)
+		const handle = compose([createRetryLayer<Record<string, never>>(refusal)], async () => {
+			terminalRuns.handler()
+			return new Response('ok')
+		})
+		const caught = await handle(new Request('http://localhost/'), buildContext({})).then(
+			() => undefined,
+			(error: unknown) => error,
+		)
+		expect(isServerError(refusal.value) ? refusal.value.code : undefined).toBe('NEXT')
+		if (!isServerError(caught))
+			throw new Error(`expected a ServerError, received ${String(caught)}`)
+		expect(caught.code).toBe('NEXT')
+		expect(caught.message).toBe('next() was already called by this middleware')
+		expect(terminalRuns.calls).toHaveLength(0)
+	})
+
+	it('hands every layer and the terminal the same request and context objects', async () => {
+		const seen: Array<readonly [Request, MiddlewareContext<Record<string, never>>]> = []
+		const handle = compose(
+			[createSeenLayer(seen), createSeenLayer(seen)],
+			async (request, context) => {
+				seen.push([request, context])
+				return new Response('ok')
+			},
+		)
+		const request = new Request('http://localhost/')
+		const context = buildContext<Record<string, never>>({})
+		await handle(request, context)
+		expect(seen).toEqual([
+			[request, context],
+			[request, context],
+			[request, context],
+		])
+		expect(
+			seen.every(
+				([seenRequest, seenContext]) => seenRequest === request && seenContext === context,
+			),
+		).toBe(true)
+	})
+
+	it('hands each layer a redirect from the terminal with headers it can set', async () => {
+		const seen: Response[] = []
+		const handle = compose(
+			[createResponseLayer(seen, 'x-outer'), createResponseLayer(seen, 'x-inner')],
+			async () => Response.redirect('http://localhost/next', 302),
+		)
+		const response = await handle(new Request('http://localhost/'), buildContext({}))
+		expect(response.status).toBe(302)
+		expect(response.headers.get('location')).toBe('http://localhost/next')
+		expect(response.headers.get('x-outer')).toBe('set')
+		expect(response.headers.get('x-inner')).toBe('set')
+		expect(seen[0]).toBe(seen[1])
 	})
 
 	it('lets a middleware transform the response after next()', async () => {
@@ -185,12 +304,7 @@ describe('compose', () => {
 		)
 		const state = new ServerUserState()
 		const request = new Request('http://localhost/whoami/7')
-		const response = await handle(request, {
-			url: new URL(request.url),
-			method: request.method,
-			state,
-			body: async () => undefined,
-		})
+		const response = await handle(request, buildContext(state))
 		await expect(response.json()).resolves.toEqual({
 			params: { id: '7' },
 			userId: 'user-42',
@@ -198,19 +312,84 @@ describe('compose', () => {
 	})
 })
 
+describe('normalizeResponse / supportsMutation', () => {
+	it('reads mutable headers as mutable and immutable ones as immutable', () => {
+		expect(supportsMutation(new Headers())).toBe(true)
+		expect(supportsMutation(Response.json({ ok: true }).headers)).toBe(true)
+		expect(supportsMutation(Response.redirect('http://localhost/next', 302).headers)).toBe(false)
+		expect(supportsMutation(Response.error().headers)).toBe(false)
+	})
+
+	it('leaves every entry of the headers it checks as it was, the probe name included', () => {
+		const headers = new Headers([
+			['x-orkestrel-probe', 'kept'],
+			['set-cookie', 'a=1'],
+			['set-cookie', 'b=2'],
+			['vary', 'Accept'],
+		])
+		const before = [...headers.entries()]
+		expect(supportsMutation(headers)).toBe(true)
+		expect([...headers.entries()]).toEqual(before)
+		const empty = new Headers()
+		expect(supportsMutation(empty)).toBe(true)
+		expect([...empty.entries()]).toEqual([])
+	})
+
+	it('passes a mutable response through by identity', () => {
+		const response = new Response('ok', { status: 201, headers: { 'x-kept': 'yes' } })
+		expect(normalizeResponse(response)).toBe(response)
+	})
+
+	it('copies a redirect into a response with the same fields and headers a layer can set', () => {
+		const redirect = Response.redirect('http://localhost/next', 307)
+		const copy = normalizeResponse(redirect)
+		expect(copy).not.toBe(redirect)
+		expect(copy.status).toBe(307)
+		expect(copy.statusText).toBe(redirect.statusText)
+		expect([...copy.headers.entries()]).toEqual([...redirect.headers.entries()])
+		expect(copy.body).toBeNull()
+		copy.headers.set('x-layer', 'set')
+		expect(copy.headers.get('x-layer')).toBe('set')
+	})
+
+	it('passes a response whose status lies outside 200 through 599 through unchanged', () => {
+		const error = Response.error()
+		expect(normalizeResponse(error)).toBe(error)
+	})
+
+	it('remembers each answer in the run memo, so a copy and a checked response come back as they were', () => {
+		const known = new Map<Response, Response>()
+		const mutable = new Response('ok')
+		const redirect = Response.redirect('http://localhost/next', 302)
+		const copy = normalizeResponse(redirect, known)
+		expect(normalizeResponse(mutable, known)).toBe(mutable)
+		expect([...known.entries()]).toEqual([
+			[redirect, copy],
+			[copy, copy],
+			[mutable, mutable],
+		])
+		expect(normalizeResponse(redirect, known)).toBe(copy)
+		expect(normalizeResponse(copy, known)).toBe(copy)
+		expect(known.size).toBe(3)
+	})
+})
+
 // ── Type-level: the middleware seam's generics ───────────────────────────────
 
 describe('MiddlewareContext<TState> / NextFunction / MiddlewareHandler<TState> — type shape', () => {
-	it('types context.state and context.url/method/body from TState', () => {
+	it('types context.state and context.url/method/connection/body/abort from TState', () => {
 		const context = buildContext<ServerAppState>({ userId: 'me' })
 		expectTypeOf(context.state).toEqualTypeOf<ServerAppState>()
 		expectTypeOf(context.url).toEqualTypeOf<URL>()
 		expectTypeOf(context.method).toEqualTypeOf<string>()
+		expectTypeOf(context.connection).toEqualTypeOf<Connection>()
 		expectTypeOf(context.body).returns.toEqualTypeOf<Promise<unknown>>()
+		expectTypeOf(context.abort).parameters.toEqualTypeOf<[reason?: unknown]>()
+		expectTypeOf(context.abort).returns.toEqualTypeOf<void>()
 	})
 
-	it('types NextFunction as an optional-Request-in, Promise<Response>-out continuation', () => {
-		expectTypeOf<NextFunction>().parameter(0).toEqualTypeOf<Request | undefined>()
+	it('types NextFunction as a no-argument, Promise<Response>-out continuation', () => {
+		expectTypeOf<NextFunction>().parameters.toEqualTypeOf<[]>()
 		expectTypeOf<NextFunction>().returns.toEqualTypeOf<Promise<Response>>()
 	})
 

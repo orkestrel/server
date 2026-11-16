@@ -31,16 +31,24 @@
  * - `state` — the shared bag threaded from the adapter's `state` factory,
  *   through every middleware, into `dispatcher.handle`'s `state` — the same
  *   object a route handler reads as `context.state`.
+ * - `connection` — the {@link Connection} the server built for this request,
+ *   the same object the `state` factory received.
  * - `body()` — lazily collect the request body (byte-limited, transparently
  *   decompressed, prototype-scrubbed for JSON), cached so repeated calls (a
  *   body-parsing middleware, then the handler) read the underlying stream
  *   exactly once.
+ * - `abort(reason)` — abort this exchange: the request's own `signal` aborts
+ *   with `reason`. A second call changes nothing, and no other exchange is
+ *   aborted.
+ *
+ * One context describes the accepted exchange: `compose` hands every layer and
+ * the terminal the same object, and nothing replaces it.
  *
  * @example
  * ```ts
- * const middleware: MiddlewareHandler<{ readonly userId?: string }> = async (request, context, next) => {
+ * const middleware: MiddlewareHandler<{ readonly userId?: string }> = async (_request, context, next) => {
  * 	const body = await context.body()
- * 	return next(request)
+ * 	return next()
  * }
  * ```
  */
@@ -48,7 +56,9 @@ export interface MiddlewareContext<TState> {
 	readonly url: URL
 	readonly method: string
 	readonly state: TState
+	readonly connection: Connection
 	body(): Promise<unknown>
+	abort(reason?: unknown): void
 }
 
 /**
@@ -56,16 +66,19 @@ export interface MiddlewareContext<TState> {
  * rest of the onion — guarded so a second call within one invocation rejects.
  *
  * @remarks
- * Call it (optionally with a substituted `Request`) to run the downstream
- * chain and receive its `Response`; omit the call entirely to short-circuit
- * with a `Response` built by this middleware instead. A second call rejects
- * (the double-`next` guard) — each middleware runs the chain at most once.
+ * Call it with no argument to run the downstream chain on the same `Request`
+ * and context and receive its `Response`; omit the call entirely to
+ * short-circuit with a `Response` built by this middleware instead. A second
+ * call, or a call that passes an argument, rejects with a `ServerError` of
+ * code `'NEXT'`, and a refused call still spends the one call: each middleware
+ * runs the chain at most once, and every layer sees the one `Request` the server
+ * built. A response whose headers are
+ * immutable, such as a `Response.redirect` result, resolves as a copy whose
+ * headers the layer can set.
  *
- * @param request - An optional replacement `Request` to hand downstream
- *   (omitted ⇒ the original request continues)
  * @returns The downstream chain's resolved `Response`
  */
-export type NextFunction = (request?: Request) => Promise<Response>
+export type NextFunction = () => Promise<Response>
 
 /**
  * Represents one link in the middleware onion — runs around the rest of the chain.
@@ -73,10 +86,11 @@ export type NextFunction = (request?: Request) => Promise<Response>
  * @typeParam TState - The consumer's opaque per-request state type
  *
  * @remarks
- * Transform the request (call `next(newRequest)`), transform the response
- * (`await next()` then modify the result), short-circuit (return a `Response`
- * without calling `next`), or thread data through `context.state` — no mutable
- * framework object anywhere, only fetch-standard `Request`/`Response`.
+ * Transform the response (`await next()` then modify the result),
+ * short-circuit (return a `Response` without calling `next`), abort the
+ * exchange (`context.abort(reason)`), or thread data through `context.state`
+ * — only fetch-standard `Request`/`Response`, and the request every layer
+ * receives is the one the server built.
  *
  * @example
  * ```ts
@@ -498,8 +512,8 @@ import type { EmitterErrorHandler, EmitterHooks, EmitterInterface } from '@orkes
  * @remarks
  * `idle` (never started, or a fresh instance) → `starting` (binding the
  * listener) → `listening` (accepting requests) → `stopping` (draining
- * in-flight requests) → `stopped` (closed; `start()` may run again, minting a
- * fresh stop signal). `destroy()` is a terminal teardown reachable from any
+ * in-flight requests) → `stopped` (closed; `start()` may run again).
+ * `destroy()` is a terminal teardown reachable from any
  * state, idempotent once `stopped`.
  */
 export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'stopped'
@@ -507,7 +521,7 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
 /**
  * Represents the machine-readable category a
  * {@link import('./errors.js').ServerError} carries — `'STATUS'` for a forbidden
- * lifecycle call, `'NEXT'` for a second `next` call, `'EVENT'` for an SSE field
+ * lifecycle call, `'NEXT'` for a second `next` call or one with an argument, `'EVENT'` for an SSE field
  * the wire cannot carry.
  *
  * @remarks
@@ -520,7 +534,7 @@ export type ServerStatus = 'idle' | 'starting' | 'listening' | 'stopping' | 'sto
 export type ServerErrorCode =
 	/** Identifies a lifecycle call the current {@link ServerStatus} forbids. */
 	| 'STATUS'
-	/** Identifies a middleware that called its `next` a second time within one invocation. */
+	/** Identifies a middleware that called its `next` a second time, or with an argument. */
 	| 'NEXT'
 	/** Identifies an SSE message field the event-stream wire cannot carry. */
 	| 'EVENT'
@@ -738,13 +752,13 @@ export interface ServerOptions<TState> {
  * from the bound address), exposes that {@link AddressInfo} through `address`,
  * observes caller cancellation plus `timeouts.start` while binding, and resolves
  * the actually-bound port. A cancelled or expired bind closes its partial server
- * and resets to `idle`. `stop()` fires the stop signal so in-flight handlers
- * can observe it, drains in-flight requests and claimed upgraded sockets up to
+ * and resets to `idle`. `stop()` aborts the signal of every in-flight request so
+ * handlers can observe it, drains in-flight requests and claimed upgraded sockets up to
  * the configured deadline, then closes the listener and ends each connection
  * when no request exchange is open on it; when that same deadline expires it
- * destroys every socket still open. `destroy()` is the final idempotent teardown. Per request: a `Request` is
- * built through the router's `buildRequest` (its signal linked to the server's
- * stop signal), the composed middleware onion runs terminating in
+ * destroys every socket still open. `destroy()` is the final idempotent teardown. Per request: one `Request` is
+ * built through the router's `buildRequest` with the exchange's own abort signal,
+ * the composed middleware onion runs terminating in
  * `dispatcher.handle`, and the result is written back through
  * `sendResponse` — every escaping throw is caught by the
  * built-in boundary (`HTTPError` → its status; anything else → a
@@ -804,7 +818,7 @@ export interface ServerInterface<TState> {
 	 */
 	start(signal?: AbortSignal): Promise<number>
 	/**
-	 * Stops gracefully within the `drain` deadline: fires the stop signal, drains in-flight
+	 * Stops gracefully within the `drain` deadline: aborts every in-flight request's signal, drains in-flight
 	 * requests and claimed upgraded sockets, then closes the listener; after a clean drain it
 	 * ends each connection when no request exchange is open on it, and when the deadline
 	 * expires it destroys every socket still open.
@@ -845,7 +859,7 @@ export interface ServerInterface<TState> {
 	 * also reset the connection and lose the answered response the peer has
 	 * not yet read. No event reports that cut or that loss. A `stop()` call
 	 * made while a stop runs returns that stop's promise, including a call
-	 * made from a `stop` event listener or from a listener on the stop signal.
+	 * made from a `stop` event listener or from a listener on an aborted request signal.
 	 *
 	 * @returns Resolves after the listener is closed and the status is
 	 *   `'stopped'`; a call from `'idle'`, `'starting'`, or `'stopped'` while

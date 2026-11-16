@@ -15,6 +15,7 @@ import { once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
 import {
+	holds,
 	isArray,
 	isError,
 	isFiniteNumber,
@@ -37,29 +38,29 @@ import { isAddressInfo } from './validators.js'
 
 // The middleware seam's composition engine — a pure function, not a class:
 // `compose` has no instance state, so it lives here rather than as an entity.
-// The returning onion: each middleware may
-// transform the request (`next(newRequest)`), transform the response (`await
-// next()` then mutate the result), or short-circuit (return without calling
-// `next`) — no mutable framework object anywhere. The double-`next` guard
-// (calling `next` twice within one middleware invocation) rejects, preserving
-// the old spine's crown-jewel invariant that each link runs the chain at most
-// once.
+// The returning onion: each middleware may transform the response (`await
+// next()` then mutate the result) or short-circuit (return without calling
+// `next`). Every layer and the terminal receive the same request and context.
 
 /**
  * Composes an ordered chain of {@link MiddlewareHandler} layers around a `terminal`
- * handler into one request handler — the frozen middleware seam.
+ * handler into one request handler — the middleware seam.
  *
  * @remarks
  * `middleware[0]` runs outermost: it is invoked first, and its call to `next`
  * runs `middleware[1]`, and so on until the last middleware's `next` invokes
- * `terminal`. Each middleware's `next` may be called with a substituted
- * `Request` (the downstream chain then sees that request instead of the
- * original), called with no argument (the original request continues
- * downstream), or not called at all (a short-circuit — the middleware's own
- * returned `Response` is sent, and everything downstream never runs). A
- * second call to the same `next` within one middleware invocation rejects —
- * each link runs the chain at most once, so a middleware cannot fork the
- * request into two divergent downstream runs.
+ * `terminal`. Every layer and `terminal` receive the same `Request` and the same
+ * context object. A middleware's `next` is called with no argument, or not
+ * called at all (a short-circuit — the middleware's own returned `Response` is
+ * sent, and everything downstream never runs). A second call to the same
+ * `next` within one middleware invocation, or a call that passes an argument,
+ * rejects with a `ServerError` of code `'NEXT'` — each link runs the chain at
+ * most once, so a middleware cannot fork the request into two divergent
+ * downstream runs. Each `next` resolves the downstream response through
+ * {@link normalizeResponse}, so a layer can set headers on a redirect or a
+ * `fetch` result; each run keeps its own memo of checked responses, which ends
+ * with the run. `compose` copies `middleware` when called, so a layer added to
+ * the array later never runs in the returned handler.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  * @param middleware - The ordered chain, outermost first
@@ -81,9 +82,13 @@ export function compose<TState>(
 	middleware: ReadonlyArray<MiddlewareHandler<TState>>,
 	terminal: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
-	return middleware.reduceRight<
-		(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
-	>((next, layer) => wrapMiddleware(layer, next), terminal)
+	const layers = [...middleware]
+	return (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
+		const known = new Map<Response, Response>()
+		return layers.reduceRight<
+			(request: Request, context: MiddlewareContext<TState>) => Promise<Response>
+		>((next, layer) => wrapMiddleware(layer, next, known), terminal)(request, context)
+	}
 }
 
 /**
@@ -91,12 +96,16 @@ export function compose<TState>(
  * `next` invariant.
  *
  * @remarks
- * The returned handler enforces the one-call `next` invariant while preserving
- * request substitution and the middleware's synchronous or asynchronous result.
+ * The returned handler enforces the one-call, no-argument `next` invariant: every
+ * call, refused or not, spends the layer's one call, so a call after a refused
+ * `next(request)` rejects too. It hands `next` the same request and context, and
+ * keeps the middleware's synchronous or asynchronous result.
  *
  * @typeParam TState - The consumer's opaque per-request state type
  * @param layer - The middleware layer to invoke
  * @param next - The downstream handler wrapped by `layer`
+ * @param known - The {@link normalizeResponse} memo of one composed run, shared by its
+ *   layers; Default: a fresh `Map` per call of the returned handler
  * @returns A handler with `layer` composed around `next`
  *
  * @example
@@ -110,21 +119,96 @@ export function compose<TState>(
 export function wrapMiddleware<TState>(
 	layer: MiddlewareHandler<TState>,
 	next: (request: Request, context: MiddlewareContext<TState>) => Promise<Response>,
+	known?: Map<Response, Response>,
 ): (request: Request, context: MiddlewareContext<TState>) => Promise<Response> {
 	return async (request: Request, context: MiddlewareContext<TState>): Promise<Response> => {
+		const memo = known ?? new Map<Response, Response>()
 		const calls = [next].values()
 		return Promise.resolve(
-			layer(request, context, (nextRequest?: Request): Promise<Response> => {
+			layer(request, context, (...args: readonly unknown[]): Promise<Response> => {
 				const invocation = calls.next()
 				if (invocation.done)
 					return Promise.reject(
 						new ServerError('NEXT', 'next() was already called by this middleware'),
 					)
-				const downstream = invocation.value
-				return downstream(nextRequest ?? request, context)
+				if (args.length > 0)
+					return Promise.reject(
+						new ServerError('NEXT', 'next() takes no argument; every layer reads one request'),
+					)
+				return invocation
+					.value(request, context)
+					.then((response) => normalizeResponse(response, memo))
 			}),
 		)
 	}
+}
+
+/**
+ * Returns a response whose headers a middleware can set: a copy of `response` when its headers are
+ * immutable and its status lies from 200 through 599, and `response` itself otherwise.
+ *
+ * @remarks
+ * A `Response.redirect` result and a `fetch` result carry immutable headers, so `headers.set`
+ * throws on them. The copy keeps the body, the status, the status text, and every header; it
+ * drops the fields a constructed `Response` cannot carry, such as `url` and `redirected`. A
+ * response whose status lies outside 200 through 599, such as `Response.error()`, passes through
+ * unchanged. `known` maps each response already checked to its answer, and the copy to itself, so
+ * a response that crosses several layers of one composed run is checked once.
+ *
+ * @param response - The response a downstream handler resolved
+ * @param known - The memo of one composed run; Default: a fresh `Map`
+ * @returns `response` itself, or its mutable copy
+ *
+ * @example
+ * ```ts
+ * const response = normalizeResponse(Response.redirect('http://localhost/next', 302))
+ * response.headers.set('X-Request-ID', 'abc') // no throw
+ * ```
+ */
+export function normalizeResponse(
+	response: Response,
+	known: Map<Response, Response> = new Map(),
+): Response {
+	const remembered = known.get(response)
+	if (remembered !== undefined) return remembered
+	const normal =
+		response.status < 200 || response.status > 599 || supportsMutation(response.headers)
+			? response
+			: new Response(response.body, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: new Headers(response.headers),
+				})
+	known.set(response, normal)
+	if (normal !== response) known.set(normal, normal)
+	return normal
+}
+
+/**
+ * Checks whether a `Headers` object accepts changes, leaving its entries as they were.
+ *
+ * @remarks
+ * Fetch refuses `delete` on immutable headers before it looks the name up, so deleting a name
+ * the headers lack answers the question and changes nothing. When the probe name is present, the
+ * check sets it to its own combined value instead.
+ *
+ * @param headers - The headers to check
+ * @returns True if `headers` accepts changes; false otherwise
+ *
+ * @example
+ * ```ts
+ * supportsMutation(new Headers()) // true
+ * supportsMutation(Response.redirect('http://localhost/', 302).headers) // false
+ * ```
+ */
+export function supportsMutation(headers: Headers): boolean {
+	const name = 'x-orkestrel-probe'
+	const value = headers.get(name)
+	return holds(() => {
+		if (value === null) headers.delete(name)
+		else headers.set(name, value)
+		return true
+	})
 }
 
 // The cookie machinery (module-scope helpers) — `parseCookies`

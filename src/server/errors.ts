@@ -143,7 +143,8 @@ export function isContentTooLargeError(value: unknown): value is ContentTooLarge
  * Carries a machine-readable {@link ServerErrorCode} and an optional `context`
  * record naming the offending facts. This is a programmer error, so it carries
  * no HTTP `status`: a `'STATUS'` lifecycle refusal is raised to the caller that
- * invoked the lifecycle method, a `'NEXT'` double-`next` refusal escapes its
+ * invoked the lifecycle method, a `'NEXT'` refusal of a second `next` call or
+ * of a `next` call with an argument escapes its
  * middleware into the request boundary, which reaches it as a generic 500 with
  * the message hidden unless `expose` is set, and an `'EVENT'` refusal is raised
  * to the caller that serialized an SSE message, its `context.field` naming the
