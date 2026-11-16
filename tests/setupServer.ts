@@ -366,7 +366,9 @@ export function recognizeServerRange(header: string, size: number): RangeSpec | 
 	if (first === '') {
 		if (!isServerDigits(last)) return undefined
 		const suffix = BigInt(last)
-		if (suffix === 0n || extent === 0n) return { satisfiable: false }
+		// § 14.1.2: a non-zero suffix on an empty representation selects no window, so § 14.2's ignore applies.
+		if (suffix === 0n) return { satisfiable: false }
+		if (extent === 0n) return undefined
 		return {
 			satisfiable: true,
 			start: suffix >= extent ? 0 : Number(extent - suffix),
@@ -476,6 +478,65 @@ export const SERVER_RANGE_PARTS = Object.freeze({
 	joins: Object.freeze([',', ', ', ' , ', ',,', ' ']),
 	sizes: Object.freeze([0, 1, 10, 1000, Number.MAX_SAFE_INTEGER, 1.5, -1]),
 })
+
+/**
+ * Bounds the growth ratio t(4n)/t(n) that a linear call may show in a cost row. On 2026-11-16, at
+ * n = 4,000 with the host's load average near 1.1, 30 solo readings per shape of the base
+ * `parseRange` (`2eb2876`, linear) read 0.91 to 4.36, and the quadratic `parseRange` of
+ * `c90ecec` read 15.93 to 18.28; 8 sits near twice the linear maximum and half the quadratic
+ * minimum.
+ */
+export const SERVER_GROWTH_BOUND = 8
+
+/** Holds the run length n at which a cost row reads t(n), and 4n for t(4n). */
+export const SERVER_GROWTH_SIZE = 4_000
+
+/** Describes one cost-row header: the text before and after a run of spaces of size n. */
+export interface ServerRangeShape {
+	readonly before: string
+	readonly after: string
+}
+
+/** Lists the `Range` header shapes a review found quadratic: a run of spaces inside the field. */
+export const SERVER_RANGE_SHAPES: readonly ServerRangeShape[] = Object.freeze([
+	{ before: 'bytes=0', after: 'x' },
+	{ before: 'bytes', after: 'x=0-1' },
+	{ before: 'bytes=0-1', after: 'x,' },
+])
+
+/**
+ * Times `call` over `repeat` runs, the least of 5 batches, in milliseconds.
+ *
+ * @param call - The call to time
+ * @param repeat - The number of runs in one batch
+ * @returns The duration of the fastest batch
+ */
+export function timeServerBatch(call: () => unknown, repeat: number): number {
+	return Math.min(
+		...Array.from({ length: 5 }, () => {
+			const start = performance.now()
+			Array.from({ length: repeat }, () => call())
+			return performance.now() - start
+		}),
+	)
+}
+
+/**
+ * Measures how a call's cost grows from size n to 4n: the batch time at 4n over the batch time
+ * at n, each the least of 5 batches, with the batch sized so it takes 20 ms or more at n.
+ *
+ * @param build - Builds the call to time for one size
+ * @param size - The size n
+ * @returns t(4n)/t(n), near 4 for a linear call and near 16 for a quadratic one
+ */
+export function measureServerGrowth(build: (size: number) => () => unknown, size: number): number {
+	const small = build(size)
+	const large = build(4 * size)
+	small()
+	large()
+	const repeat = Math.max(1, Math.ceil(20 / Math.max(timeServerBatch(small, 1), 0.001)))
+	return timeServerBatch(large, repeat) / timeServerBatch(small, repeat)
+}
 
 /**
  * Picks one member of a list with a seeded random source.
