@@ -75,13 +75,13 @@ describe('createServer — round-trip', () => {
 		await server.stop()
 	})
 
-	it('propagates construction guards (e.g. timeouts.headers <= timeouts.keepalive)', () => {
+	it('propagates construction guards (e.g. timeouts.headers <= timeouts.request)', () => {
 		const dispatcher = createDispatcher<undefined>()
 		expect(() =>
 			createServer({
 				dispatcher,
 				state: () => undefined,
-				timeouts: { headers: 5_000, keepalive: 1_000 },
+				timeouts: { headers: 5_000, request: 1_000 },
 			}),
 		).toThrow(TypeError)
 	})
