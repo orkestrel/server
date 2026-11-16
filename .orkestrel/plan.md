@@ -142,7 +142,14 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
 3. **Middleware:** M0a, the one-entry collapse (middleware `13622f4`, `7521cb2`); then, after server's tarball, M0b, adopt the seam; M1, the composed oracle; M5, admission; M2, identity and scoping; M3, CSRF and sessions after S6; M4, the response batteries; M6, multipart and static.
 4. The regular-expression census (2026-11-16) found one superlinear pattern outside server: middleware's `isReservedDeviceName` (`src/server/helpers.ts`, `/[. ]+$/`), reached by every `createStatic` GET, about 317 ms for a run of 16,000 dots. M6 replaces it with `/(?<![. ])[. ]+$/`, which agreed with the original on all 299,593 strings up to length 6 over space, dot, tab, U+00A0, U+3000, `a`, `¹`, and an astral character. The fix strips only U+002E and U+0020, strips a mixed trailing run whole, and trims a dots-and-spaces segment to empty. Router has none.
 5. **Upstream fixes** (user ruling, 2026-11-16): a gap a consumer meets in an `@orkestrel` package is fixed in that package, not worked around in the consumer.
-   - **abort:** `linkSignal` and `createAbort({ signal })` compose through `AbortSignal.any`, which on Node 22.23.5 retains about 130 B per call while the source signal lives. Evidence on Node 22.18.0, 22.23.5, 24.22.3, and Chromium comes first, then a design consultation rules the link, then a unit, a review, and abort 0.0.19. Router keeps `createAbort({ signal })` and takes the fix by pin.
+   - **abort:** `linkSignal` and `createAbort({ signal })` compose through `AbortSignal.any`, which on Node 22.18.0 and 22.23.5 retains 105–176 B per child while the source lives. Node 24.16.0 and Chromium keep none. The design consultation (2026-11-16) ruled:
+     - one weak fan-out per source signal (`Cascade`): a `Set` of `WeakRef` controllers, one source listener, and a `FinalizationRegistry`, on every host with no version read;
+     - `linkSignal` moves to `factories.ts` as `createLinkedSignal`;
+     - no explicit release;
+     - three pinned order properties.
+
+     Unit A3 builds it against a per-host bar, then a review and abort 0.0.19. Router keeps `createAbort({ signal })`, and mcp, browser, and scaffold adopt at their visits, each needing the user's authorization to declare `@orkestrel/abort`.
+
    - **contract:** the needs list (2026-11-16) holds 20 rows. The most-shared are:
      - `preview` costs about 0.3 ms for a string longer than 62 UTF-16 units, which every refusal pays (11 packages);
      - no guard for a host error with a string `code` (8);
@@ -175,7 +182,12 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
      - **The consumer census over 13 source trees:** no hand-built `ContractInterface` and no builder options passed as a non-literal. Database's `switch (shape.category)` at `src/core/helpers.ts:1326` stops compiling until its cascade visit adds the two categories.
 
    - Any other `@orkestrel` package a unit finds lacking joins this item.
-6. The mcp, browser, toolbox, and scaffold visits; the integrated `orkestrel-falsify` round; a tree-wide `verifier` run; the consumer run; the releases in layer order.
+6. **Release order and the execution lane** (user rulings, 2026-11-16):
+   - Publishing comes as soon as quality and performance allow.
+   - The HTTP wave releases on contract 0.0.24 in layer order: abort 0.0.19, router 0.0.23, server 0.0.29, then middleware 0.0.35.
+   - Contract 0.0.25 is its own cascade wave after it.
+   - Scaffold unit L1 gives the lane script light lanes on Linux, sampling process trees through `/proc`, so builds and tests share the host while `--solo` timing runs stay alone. It is rolled out after its review, once the queue allows.
+7. The mcp, browser, toolbox, and scaffold visits; the integrated `orkestrel-falsify` round; a tree-wide `verifier` run; the consumer run; the releases in layer order.
 
 ## Deferred
 
