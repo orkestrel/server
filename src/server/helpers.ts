@@ -218,9 +218,9 @@ export function supportsMutation(headers: Headers): boolean {
 // builds a spec-shaped `Set-Cookie` value with its attributes. The signed
 // pair reuses the shipped HMAC token primitives rather than a second HMAC
 // scheme: `writeSignedCookie` is `serializeCookie(name, await signToken(value,
-// { secret }))` appended to a `Headers`, and `readSignedCookie` is `await
-// verifyToken(parseCookies(...)[name], secret)` — so a cookie is a
-// `signToken` value in a `Set-Cookie`, with the same secret rotation + tamper
+// { signer }))` appended to a `Headers`, and `readSignedCookie` is `await
+// verifyToken(parseCookies(...)[name], signer)` — so a cookie is a
+// `signToken` value in a `Set-Cookie`, with the same key rotation and tamper
 // rejection. Every reader narrows untrusted request input with `typeof`,
 // never `as`, and remains total on hostile input.
 
