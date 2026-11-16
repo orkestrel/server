@@ -415,9 +415,12 @@ These invariants hold across `src/server` ↔ `server.md`.
      fault on the inner phase's `400` path, a failed write included, reaches
      both with no `RequestLine`, because no `Request` exists there.
    - A `report` sink that throws, or returns a promise that rejects, is
-     contained, and the response still goes out. One rejection stays out of
-     reach: a native promise whose own `constructor` getter throws refuses
-     every reaction, so its rejection reaches `unhandledRejection`.
+     contained, and the response still goes out. A rejected native promise
+     whose species constructor cannot be found, because its `constructor` or
+     `Symbol.species` lookup throws or yields no constructor, stays out of
+     reach: it refuses every reaction, so its rejection reaches
+     `unhandledRejection`, which ends the process under Node's default
+     unhandled-rejection mode.
    - A write that fails, at a header Node refuses or in the body after the
      headers went out, destroys the connection, so the client reads an abort,
      and is a fault.
@@ -837,7 +840,7 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   it can close one cleanly before the deadline cuts it.
 - **Install a `report` sink for observability** — its own throw and a promise
   it returns that rejects are contained, so the response still goes out;
-  Contract item 6 names the one rejection the server cannot adopt.
+  Contract item 6 names the rejected promises the server cannot adopt.
 
 ## Tests
 
