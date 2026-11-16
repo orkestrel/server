@@ -48,6 +48,7 @@ import {
 	serializeEvent,
 	ServerError,
 	signToken,
+	stripOWS,
 	unwrapETag,
 	verifyToken,
 	writeSignedCookie,
@@ -56,6 +57,12 @@ import { buildContext } from '../../setup.js'
 import {
 	SERVER_EVENT_MESSAGES,
 	SERVER_EVENT_REFUSALS,
+	SERVER_BOM,
+	SERVER_GROWTH_BOUND,
+	SERVER_GROWTH_SIZE,
+	SERVER_NBSP,
+	SERVER_RANGE_SHAPES,
+	SERVER_WIDE_SPACE,
 	SERVER_PROTOTYPE_NAMES,
 	SERVER_RANGE_ADMITTED,
 	SERVER_RANGE_REFUSED,
@@ -64,6 +71,7 @@ import {
 	buildServerCycle,
 	buildServerRangePopulation,
 	buildServerRangeWalk,
+	measureServerGrowth,
 	recognizeServerRange,
 	compressServerFixture,
 	createTraceLayer,
@@ -729,6 +737,23 @@ describe('parseRange', () => {
 		expect(parseRange(header, 1000)).toBeUndefined()
 	})
 
+	it('ignores a non-zero suffix range on an empty resource and refuses only a zero suffix there', () => {
+		expect(parseRange('bytes=-5', 0)).toBeUndefined()
+		expect(parseRange('bytes=-0', 0)).toEqual({ satisfiable: false })
+		expect(parseRange('bytes=0-', 0)).toEqual({ satisfiable: false })
+	})
+
+	it.each(SERVER_RANGE_SHAPES)(
+		'grows linearly on a run of spaces between $before and $after',
+		({ before, after }) => {
+			const growth = measureServerGrowth(
+				(size) => () => parseRange(`${before}${' '.repeat(size)}${after}`, 10),
+				SERVER_GROWTH_SIZE,
+			)
+			expect(growth).toBeLessThan(SERVER_GROWTH_BOUND)
+		},
+	)
+
 	it('answers a size that is not a non-negative safe integer with undefined', () => {
 		expect(parseRange('bytes=0-1', 1.5)).toBeUndefined()
 		expect(parseRange('bytes=0-1', -1)).toBeUndefined()
@@ -767,6 +792,29 @@ describe('parseRange', () => {
 				JSON.stringify(parseRange(header, size)) !== JSON.stringify(answers[index]),
 		)
 		expect(disagreements).toEqual([])
+	})
+})
+
+describe('stripOWS', () => {
+	it('strips spaces and tabs from both ends and keeps them inside', () => {
+		expect(stripOWS(' \tbytes=0-1 \t')).toBe('bytes=0-1')
+		expect(stripOWS('5 -9')).toBe('5 -9')
+		expect(stripOWS(' \t ')).toBe('')
+		expect(stripOWS('')).toBe('')
+	})
+
+	it('keeps a Unicode space that is not OWS, unlike trim', () => {
+		const text = `${SERVER_NBSP}0-1${SERVER_WIDE_SPACE}`
+		expect(stripOWS(` ${text} `)).toBe(text)
+		expect(stripOWS(`${SERVER_BOM}0-1`)).toBe(`${SERVER_BOM}0-1`)
+	})
+
+	it('grows linearly on a run of spaces before another character', () => {
+		const growth = measureServerGrowth(
+			(size) => () => stripOWS(`a${' '.repeat(size)}x`),
+			SERVER_GROWTH_SIZE,
+		)
+		expect(growth).toBeLessThan(SERVER_GROWTH_BOUND)
 	})
 })
 

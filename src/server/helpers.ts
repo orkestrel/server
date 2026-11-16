@@ -968,16 +968,19 @@ export function matchesETag(header: string, etag: string): boolean {
  * `suffix-range` (`"-" suffix-length`), each bound `1*DIGIT` ({@link
  * import('./constants.js').RANGE_BOUND_PATTERN}). A bound of any length is
  * compared with {@link compareDigits}, so none is misread through `Number`.
+ * OWS is stripped with {@link stripOWS}, so the read is linear in the header's
+ * length.
  *
  * Returns `{ satisfiable: true, start, end }` with the window clamped to
  * `[0, size - 1]` (the HTTP inclusive-end convention), and
  * `{ satisfiable: false }` when the range does not overlap the resource: a
- * `first-pos` at or past `size`, a zero `suffix-length`, or an empty resource.
+ * `first-pos` at or past `size`, or a zero `suffix-length`.
  * Returns `undefined`, the § 14.2 "ignore the field and serve the whole
  * resource" answer, for an absent header, another unit, text outside the
  * grammar, a `last-pos` below its `first-pos`, more than one range (not
- * supported), and a `size` that is not a non-negative safe integer. Never
- * throws on a malformed header.
+ * supported), a non-zero `suffix-length` on an empty resource (satisfiable by
+ * § 14.1.2, but it selects no window to serve), and a `size` that is not a
+ * non-negative safe integer. Never throws on a malformed header.
  *
  * @param header - The raw `Range` header value
  * @param size - The resource's total byte length
@@ -994,13 +997,13 @@ export function matchesETag(header: string, etag: string): boolean {
  */
 export function parseRange(header: string | undefined, size: number): RangeSpec | undefined {
 	if (header === undefined || !Number.isSafeInteger(size) || size < 0) return undefined
-	const field = header.replace(/^[ \t]+|[ \t]+$/g, '')
+	const field = stripOWS(header)
 	const equals = field.indexOf('=')
 	if (equals < 0 || field.slice(0, equals).toLowerCase() !== 'bytes') return undefined
 	const specs = field
 		.slice(equals + 1)
-		.replace(/^[ \t]+/, '')
-		.split(/[ \t]*,[ \t]*/)
+		.split(',')
+		.map((item) => stripOWS(item))
 		.filter((spec) => spec !== '')
 	const spec = specs[0]
 	if (spec === undefined || specs.length > 1) return undefined
@@ -1011,7 +1014,8 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	const extent = String(size)
 	if (first === '') {
 		if (!RANGE_BOUND_PATTERN.test(last)) return undefined
-		if (size === 0 || compareDigits(last, '0') === 0) return { satisfiable: false }
+		if (compareDigits(last, '0') === 0) return { satisfiable: false }
+		if (size === 0) return undefined
 		const start = compareDigits(last, extent) < 0 ? size - Number(last) : 0
 		return { satisfiable: true, start, end: size - 1 }
 	}
@@ -1021,6 +1025,30 @@ export function parseRange(header: string | undefined, size: number): RangeSpec 
 	if (compareDigits(first, extent) >= 0) return { satisfiable: false }
 	const end = last === '' || compareDigits(last, extent) >= 0 ? size - 1 : Number(last)
 	return { satisfiable: true, start: Number(first), end }
+}
+
+/**
+ * Strips the OWS of RFC 9110 § 5.6.3 — spaces and tabs, and no other
+ * character — from both ends of a text, in time linear in its length.
+ *
+ * @remarks
+ * Reads the leading run with one anchored match and the trailing run with one
+ * scan from the end, so a long run of spaces followed by another character
+ * costs one pass, where a search for a trailing run restarts at every space.
+ * A Unicode space such as U+00A0 stays, unlike `trim`.
+ *
+ * @param text - The text to strip
+ * @returns `text` without its leading and trailing spaces and tabs
+ *
+ * @example
+ * ```ts
+ * stripOWS(' \tbytes=0-1 ') // 'bytes=0-1'
+ * ```
+ */
+export function stripOWS(text: string): string {
+	const start = /^[ \t]*/.exec(text)?.[0].length ?? 0
+	const end = text.split('').findLastIndex((char) => char !== ' ' && char !== '\t') + 1
+	return end <= start ? '' : text.slice(start, end)
 }
 
 /**
