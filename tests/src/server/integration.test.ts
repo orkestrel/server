@@ -1028,8 +1028,7 @@ describe('the server matrix — the routed 405, HEAD, and OPTIONS', () => {
 		}
 	})
 
-	// The pinned router candidate omits OPTIONS from a 405's Allow; router's R1 carries the fix.
-	it.fails('answers a 405 whose Allow carries OPTIONS', async () => {
+	it('answers a 405 whose Allow carries OPTIONS', async () => {
 		const server = trackServer(
 			running,
 			createServer({
@@ -1086,9 +1085,7 @@ describe('the server matrix — the routed 405, HEAD, and OPTIONS', () => {
 		}
 	})
 
-	// The pinned router candidate drops the GET body of an automatic HEAD uncancelled; router's R1
-	// carries the fix.
-	it.fails('cancels the GET body source of an automatic HEAD', async () => {
+	it('cancels the GET body source of an automatic HEAD', async () => {
 		const cancels = createRecorder<[unknown]>()
 		const server = trackServer(
 			running,
