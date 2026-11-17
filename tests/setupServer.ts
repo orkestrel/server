@@ -31,12 +31,14 @@ import { fileURLToPath } from 'node:url'
 import { queryObjects } from 'node:v8'
 import {
 	createRecorder,
+	readProperty,
 	resolveRoot,
 	waitForAbort,
 	waitForCondition,
 	waitForDelay,
 	waitForEvent,
 } from '@orkestrel/test'
+import { createLoopback } from '@orkestrel/test/server'
 import { HTTPError } from '@src/server'
 
 /** Holds the mutable observation owned by one test invocation. */
@@ -2265,6 +2267,7 @@ export class ServerRawClient {
 	readonly #methods: readonly string[]
 	readonly #chunks: Buffer[] = []
 	readonly #closed = Promise.withResolvers<number>()
+	#fault: string | undefined
 
 	constructor(socket: net.Socket, methods: readonly string[]) {
 		this.#socket = socket
@@ -2272,8 +2275,17 @@ export class ServerRawClient {
 		socket.on('data', (chunk: Buffer) => {
 			this.#chunks.push(chunk)
 		})
-		socket.on('error', () => undefined)
+		socket.on('error', (error: unknown) => {
+			const code: unknown =
+				error instanceof Error ? readProperty<unknown>(error, 'code') : undefined
+			this.#fault = typeof code === 'string' ? code : undefined
+		})
 		socket.once('close', () => this.#closed.resolve(performance.now()))
+	}
+
+	/** Holds the code of the error the socket reported, such as `ECONNRESET`, or `undefined` while it reported none. */
+	get fault(): string | undefined {
+		return this.#fault
 	}
 
 	/** Lists every response read so far, the last one incomplete while its framing is open. */
@@ -2356,6 +2368,52 @@ export async function connectServerClient(
 	const client = new ServerRawClient(socket, methods)
 	await once(socket, 'connect')
 	return client
+}
+
+/** Holds the size of a body that a host holding oversized sends cannot flush to a paused peer at once. */
+export const BIG_BODY_BYTES = 33_554_432
+
+/**
+ * Counts the sends of `bytes` that a socket flushes before one stays held while its peer is paused.
+ *
+ * @remarks
+ * A host that accepts a send in full while its send buffer has room, as Windows does for the first
+ * sends whatever their size, flushes them at once, and only a send that follows a full buffer stays
+ * held. A host that keeps the unaccepted bytes of an oversized send in the socket returns `0`.
+ *
+ * @param bytes - The size of each send
+ * @param limit - The count at which the probe stops
+ * @returns The count of sends that flushed before the first held send, at most `limit`
+ */
+export async function probeSocketSends(bytes: number, limit: number): Promise<number> {
+	const accepted = Promise.withResolvers<net.Socket>()
+	const loopback = await createLoopback(net.createServer((socket) => accepted.resolve(socket)))
+	const client = net.createConnection({ port: loopback.port, host: '127.0.0.1' })
+	client.on('error', () => undefined)
+	client.pause()
+	await once(client, 'connect')
+	const socket = await accepted.promise
+	socket.on('error', () => undefined)
+	try {
+		const flushed = new Set<number>()
+		for (const index of Array.from({ length: limit }, (_, position) => position)) {
+			socket.write(Buffer.alloc(bytes), () => {
+				flushed.add(index)
+			})
+			try {
+				await waitForCondition('the host flushes the probe send', () => flushed.has(index), {
+					budget: 300,
+				})
+			} catch {
+				return index
+			}
+		}
+		return limit
+	} finally {
+		client.destroy()
+		socket.destroy()
+		await loopback.destroy()
+	}
 }
 
 /**
@@ -2445,33 +2503,39 @@ export function buildControlOptions(
 	}
 }
 
-/** Represents the framing class of one timeout cell's connection and the milliseconds until it closed. */
+/**
+ * Represents the framing class of one timeout cell's connection, the milliseconds until it closed,
+ * and the error code the client's socket reported, which is `undefined` for a close by FIN.
+ */
 export interface ServerTimedFraming {
 	readonly framing: ServerFraming
 	readonly elapsed: number
+	readonly fault: string | undefined
 }
 
 /**
  * Writes `head`, then drips `piece` every {@link SERVER_DRIP_GAP} milliseconds until the server
  * closes the connection, and reads the framing class and the time from the first write to the close.
+ * Without `piece`, it writes nothing after `head`, so no client bytes are in flight at the close.
  *
  * @param port - The server's port on `127.0.0.1`
  * @param head - The bytes written first
- * @param piece - The bytes each drip writes
+ * @param piece - The bytes each drip writes, or `undefined` to stall after `head`
  * @param budget - The milliseconds the close may take
  * @returns The framing class and the elapsed milliseconds
  */
 export async function driveServerDrip(
 	port: number,
 	head: string,
-	piece: string,
+	piece: string | undefined,
 	budget: number,
 ): Promise<ServerTimedFraming> {
 	const client = await connectServerClient(port)
 	try {
 		const start = performance.now()
 		client.write(head)
-		void client.drip(piece, Math.ceil(budget / SERVER_DRIP_GAP) + 1, SERVER_DRIP_GAP)
+		if (piece !== undefined)
+			void client.drip(piece, Math.ceil(budget / SERVER_DRIP_GAP) + 1, SERVER_DRIP_GAP)
 		await waitForCondition('the server closes the dripping connection', () => client.closed, {
 			budget,
 		})
@@ -2479,6 +2543,7 @@ export async function driveServerDrip(
 		return {
 			framing: { statuses: client.complete.map((response) => response.status), closed: true },
 			elapsed,
+			fault: client.fault,
 		}
 	} finally {
 		client.destroy()
@@ -2506,6 +2571,7 @@ export async function driveServerIdle(port: number, budget: number): Promise<Ser
 		return {
 			framing: { statuses: client.complete.map((response) => response.status), closed: true },
 			elapsed,
+			fault: client.fault,
 		}
 	} finally {
 		client.destroy()

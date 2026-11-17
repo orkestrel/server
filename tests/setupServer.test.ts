@@ -1,6 +1,7 @@
 import type { LoopbackInterface } from '@orkestrel/test/server'
 import type { Duplex } from 'node:stream'
 import crypto, { createHmac } from 'node:crypto'
+import { once } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
 import { readFileSync } from 'node:fs'
@@ -25,7 +26,9 @@ import {
 	openPausedResponse,
 	probeConnectionDrop,
 	probeLoopback,
+	probeSocketSends,
 	rawRequest,
+	BIG_BODY_BYTES,
 	upgradeRequest,
 	WORKSPACE_ROOT,
 } from './setupServer.js'
@@ -304,6 +307,69 @@ describe('ServerRawClient', () => {
 		await client.ended
 		await waitForCondition('the peer reads the reset', () => failures.count > 0)
 		expect(failures.calls[0]?.[0]).toMatchObject({ code: 'ECONNRESET' })
+	})
+
+	it('reports the error code a bare socket reads from the same peer reset as its fault', async () => {
+		const peer = net.createServer((socket) => socket.resetAndDestroy())
+		const loopback = trackLoopback(bound, await createLoopback(peer))
+		const codes = createRecorder<readonly [unknown]>()
+		const bare = net.createConnection({ port: loopback.port, host: '127.0.0.1' })
+		opened.push(bare)
+		bare.on('error', (error) => codes.handler(readProperty<unknown>(error, 'code')))
+		const client = await connectServerClient(loopback.port)
+		opened.push(client)
+		await client.ended
+		await waitForCondition('the bare socket closes', () => bare.closed)
+		expect(codes.calls).toEqual([[expect.any(String)]])
+		expect(client.fault).toBe(codes.calls[0]?.[0])
+	})
+
+	it('reports no fault when the peer closes with a FIN', async () => {
+		const peer = net.createServer((socket) => socket.end())
+		const loopback = trackLoopback(bound, await createLoopback(peer))
+		const client = await connectServerClient(loopback.port)
+		opened.push(client)
+		await client.ended
+		expect(client.closed).toBe(true)
+		expect(client.fault).toBeUndefined()
+	})
+})
+
+describe('probeSocketSends', () => {
+	it('counts every send a paused peer absorbs up to the limit', async () => {
+		expect(await probeSocketSends(1, 3)).toBe(3)
+	})
+
+	it('stops at the first send a paused peer leaves held, which the peer drains after it resumes', async () => {
+		const limit = 8
+		const sends = await probeSocketSends(BIG_BODY_BYTES, limit)
+		expect(sends).toBeLessThan(limit)
+		const accepted = Promise.withResolvers<net.Socket>()
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(net.createServer((socket) => accepted.resolve(socket))),
+		)
+		const client = net.createConnection({ port: loopback.port, host: '127.0.0.1' })
+		opened.push(client)
+		client.on('error', () => undefined)
+		client.pause()
+		await once(client, 'connect')
+		const socket = await accepted.promise
+		opened.push(socket)
+		for (const index of Array.from({ length: sends }, (_, position) => position)) {
+			socket.write(Buffer.alloc(BIG_BODY_BYTES))
+			await waitForCondition(`send ${index} flushes`, () => socket.writableLength === 0)
+		}
+		socket.write(Buffer.alloc(BIG_BODY_BYTES))
+		await expect(
+			waitForCondition('the held send flushes', () => socket.writableLength === 0, {
+				budget: 600,
+			}),
+		).rejects.toThrow('the held send flushes')
+		client.resume()
+		await waitForCondition('the resumed peer drains the held send', () => {
+			return socket.writableLength === 0
+		})
 	})
 })
 

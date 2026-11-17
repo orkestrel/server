@@ -12,6 +12,7 @@ import { buildErrorResponse, createServer, HTTPError, isServerError } from '@src
 import { createRecorder, readProperty, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
+	BIG_BODY_BYTES,
 	BOUNDARY_BODY_FAULT,
 	BOUNDARY_F3_CASES,
 	BOUNDARY_F3_THROWS,
@@ -56,6 +57,7 @@ import {
 	createRetryLayer,
 	createPingDispatcher,
 	createResponseLayer,
+	probeSocketSends,
 	createRoutedControl,
 	createRoutedDispatcher,
 	createRouterControl,
@@ -1284,8 +1286,6 @@ describe('the boundary — a disconnect only the connection shows', () => {
 	})
 })
 
-const BIG_BODY_BYTES = 33_554_432
-
 describe('the boundary — a disconnect that reaches a body or a queued exchange', () => {
 	it.each([
 		{ label: 'reset', leave: 'reset' },
@@ -1543,6 +1543,9 @@ describe('the boundary — a disconnect that reaches a body or a queued exchange
 	)
 
 	it('fires response for an answer the socket still held when the peer sent its FIN', async () => {
+		// A host that accepts the first sends in full holds an answer only behind as many fill answers.
+		const fills = await probeSocketSends(BIG_BODY_BYTES, 8)
+		const targets = [...Array.from({ length: fills }, () => '/fill'), '/big']
 		const exchanges = new ServerExchanges()
 		const responses = createRecorder<readonly [ResponseRecord]>()
 		const server = trackServer(
@@ -1553,7 +1556,7 @@ describe('the boundary — a disconnect that reaches a body or a queued exchange
 				host: '127.0.0.1',
 				middleware: [
 					async (_request, context, next) => {
-						if (context.url.pathname !== '/big') return next()
+						if (!targets.includes(context.url.pathname)) return next()
 						return new Response(new Uint8Array(BIG_BODY_BYTES))
 					},
 				],
@@ -1565,7 +1568,9 @@ describe('the boundary — a disconnect that reaches a body or a queued exchange
 		socket.on('error', () => undefined)
 		socket.pause()
 		await once(socket, 'connect')
-		socket.write('GET /big HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+		socket.write(
+			targets.map((target) => `GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`).join(''),
+		)
 		await waitForCondition('the server ended the response with bytes unwritten', () => {
 			const response = exchanges.exchange('/big')?.[1]
 			return response?.writableEnded === true && response.writableFinished === false
@@ -1574,7 +1579,7 @@ describe('the boundary — a disconnect that reaches a body or a queued exchange
 		socket.resume()
 		await once(socket, 'close')
 		exchanges.destroy()
-		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/big'])
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(targets)
 	})
 })
 
@@ -1754,8 +1759,48 @@ describe('the server matrix — timeouts delegated to node:http', () => {
 			const [expected, actual] = await Promise.all(
 				[control.port, port].map((target) => driveServerDrip(target, head, 'a', window)),
 			)
-			expect(expected?.framing).toEqual({ statuses: [408], closed: true })
-			expect(actual?.framing).toEqual(expected?.framing)
+			// A drip byte in flight at the close makes the host reset the connection and discard the 408.
+			const delivered = { framing: { statuses: [408], closed: true }, fault: undefined }
+			const discarded = { framing: { statuses: [], closed: true }, fault: 'ECONNRESET' }
+			for (const result of [expected, actual])
+				expect([delivered, discarded]).toContainEqual({
+					framing: result?.framing,
+					fault: result?.fault,
+				})
+			expect(expected?.elapsed).toBeGreaterThanOrEqual(request)
+			expect(actual?.elapsed).toBeGreaterThanOrEqual(request)
+			expect(actual?.elapsed).toBeLessThanOrEqual(window)
+		} finally {
+			await control.destroy()
+		}
+	})
+
+	it('answers a body stalled past timeouts.request with a 408 and a FIN as the control does, within its window', async () => {
+		const control = await createLoopback(
+			createMatrixControl(
+				buildControlOptions(SERVER_MATRIX_TIMEOUTS, SERVER_CONTROL_INTERVAL),
+				createRecorder(),
+			),
+		)
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createMatrixDispatcher<object>(),
+				state: () => ({}),
+				host: '127.0.0.1',
+				timeouts: SERVER_MATRIX_TIMEOUTS,
+			}),
+		)
+		try {
+			const port = await server.start()
+			const window = request * 1.5 + SERVER_TIMEOUT_SLACK
+			const head = 'POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\naaaa'
+			const [expected, actual] = await Promise.all(
+				[control.port, port].map((target) => driveServerDrip(target, head, undefined, window)),
+			)
+			const delivered = { framing: { statuses: [408], closed: true }, fault: undefined }
+			for (const result of [expected, actual])
+				expect({ framing: result?.framing, fault: result?.fault }).toEqual(delivered)
 			expect(expected?.elapsed).toBeGreaterThanOrEqual(request)
 			expect(actual?.elapsed).toBeGreaterThanOrEqual(request)
 			expect(actual?.elapsed).toBeLessThanOrEqual(window)
