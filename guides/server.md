@@ -438,7 +438,8 @@ These invariants hold across `src/server` ↔ `server.md`.
      lies outside 200 through 599, such as the 0 of `Response.error()`.
    - Each fault reaches the `error` event and the `report` sink once, with the
      same `(error, RequestLine)`: every throw except an `HTTPError` whose
-     status the response carries and a throw after a peer disconnect. A
+     status the response carries and a throw after a peer disconnect the
+     server read before the throw. A
      fault on the inner phase's `400` path, a failed write included, reaches
      both with no `RequestLine`, because no `Request` exists there.
    - A `report` sink that throws, or returns a promise that rejects, is
@@ -454,8 +455,12 @@ These invariants hold across `src/server` ↔ `server.md`.
    - A write that fails, at a header Node refuses or in the body after the
      headers went out, destroys the connection, so the client reads an abort,
      and is a fault.
-   - A peer that disconnects before the end is no fault: a throw after the
-     disconnect emits no `error` and calls no `report`.
+   - A peer disconnect the server read before the throw, the peer's FIN or a
+     reset, is no fault: a throw after it emits no `error` and calls no
+     `report`. A `stop()` cut, `destroy()`, and Node's 408 close are no peer
+     disconnect, so a throw after one is a fault. A peer disconnect the server
+     never read is reported the same way: a peer that leaves while the route
+     leaves its body unread, under `timeouts.request: 0`, is a fault.
    - A terminal catch over the whole exchange, the inner phase's `400`
      included, holds a throw from any step, the renderer and the write
      included, so no exchange rejects.
@@ -463,7 +468,9 @@ These invariants hold across `src/server` ↔ `server.md`.
    A `response` event fires once for each response that finished, carrying
    `{ method, pathname, status, ms }`: `status` is the status the server
    wrote, and `ms` is the time from the exchange's acceptance to the last
-   byte of its body, in whole milliseconds. A response whose peer disconnected
+   byte of its body, in whole milliseconds. `response` fires after Node hands
+   the last byte to the operating system, so a peer that resets before it reads
+   the answer leaves the record. A response whose peer disconnected
    first, a body-less answer included, a failed write, and the inner phase's
    `400` fire none. An exchange the server aborted through `context.abort` and
    then answered still fires one.

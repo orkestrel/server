@@ -90,7 +90,8 @@ import { ServerBinding } from './ServerBinding.js'
  *   keeps that status, with no body for 204, 205, and 304, and every other
  *   throw renders `500` (message hidden unless `expose`). Each fault, every
  *   throw except an `HTTPError` whose status the response carries and a
- *   throw after a peer disconnect, reaches `error` and `report` with its
+ *   throw after a peer disconnect the server read first (the peer's FIN or a
+ *   reset), reaches `error` and `report` with its
  *   `RequestLine`; a fault on the inner phase's `400` path carries none,
  *   because no `Request` exists there. A `report` that throws or rejects is
  *   contained, except a rejected native promise whose species constructor
@@ -337,11 +338,19 @@ export class Server<TState> implements ServerInterface<TState> {
 			return
 		}
 		const exchange = new AbortController()
+		const disconnect = new AbortController()
 		const release = this.#register(exchange)
 		if (this.#status === 'stopping') exchange.abort()
-		response.once('close', release)
+		// Only the connection tells a peer disconnect from a close the server or Node made.
+		const socket = message.socket
+		response.once('close', () => {
+			const failure = socket.errored
+			const reset = failure !== null && 'code' in failure && failure.code === 'ECONNRESET'
+			if (!response.writableEnded && (socket.readableEnded || reset)) disconnect.abort()
+			release()
+		})
 		void this.#trackExchange(message, response)
-		void this.#accept(message, response, exchange)
+		void this.#accept(message, response, exchange, disconnect.signal)
 	}
 
 	// The terminal catch: a throw here, the inner phase's `400` included, has no `RequestLine`.
@@ -349,10 +358,11 @@ export class Server<TState> implements ServerInterface<TState> {
 		message: IncomingMessage,
 		response: ServerResponse,
 		exchange: AbortController,
+		disconnect: AbortSignal,
 	): Promise<void> {
 		try {
 			const created = attempt(() => buildRequest(message, { response, signal: exchange.signal }))
-			if (created.success) await this.#serve(created.value, message, response, exchange)
+			if (created.success) await this.#serve(created.value, message, response, exchange, disconnect)
 			else
 				await this.#respond(
 					buildErrorResponse(new HTTPError(400, 'invalid request'), false),
@@ -370,15 +380,16 @@ export class Server<TState> implements ServerInterface<TState> {
 		message: IncomingMessage,
 		response: ServerResponse,
 		exchange: AbortController,
+		disconnect: AbortSignal,
 	): Promise<void> {
 		const line: RequestLine = { method: request.method, url: new URL(request.url) }
 		const start = performance.now()
 		try {
 			this.#emitter.emit('request', line.method, line.url.pathname)
-			const result = await this.#run(request, line, message, exchange)
+			const result = await this.#run(request, line, message, exchange, disconnect)
 			const sent = await this.#respond(result, response, line)
-			// A body-less answer after a disconnect still reaches `finish`, so the peer decides.
-			if (sent && !this.#disconnected(request, exchange)) {
+			// A body-less answer after a disconnect still reaches `finish`, so the latch decides.
+			if (sent && !disconnect.aborted) {
 				this.#emitter.emit('response', {
 					method: line.method,
 					pathname: line.url.pathname,
@@ -398,6 +409,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		line: RequestLine,
 		message: IncomingMessage,
 		exchange: AbortController,
+		disconnect: AbortSignal,
 	): Promise<Response> {
 		try {
 			const ip = message.socket.remoteAddress
@@ -421,17 +433,11 @@ export class Server<TState> implements ServerInterface<TState> {
 			if (isInteger(status) && status >= 200 && status <= 599) return result
 			throw new HTTPError(status, `a handler returned status ${String(status)}`)
 		} catch (error) {
-			return this.#boundary(error, line, this.#disconnected(request, exchange))
+			return this.#boundary(error, line, disconnect.aborted)
 		}
 	}
 
-	// The router aborts the request signal on a peer disconnect; the exchange's own signal aborts
-	// only on `context.abort` and `stop()`.
-	#disconnected(request: Request, exchange: AbortController): boolean {
-		return request.signal.aborted && !exchange.signal.aborted
-	}
-
-	// A peer that closed first is no fault; a failed write destroys the connection and is one.
+	// A failed write destroys the connection and is a fault.
 	async #respond(result: Response, response: ServerResponse, line?: RequestLine): Promise<boolean> {
 		try {
 			await sendResponse(result, response)

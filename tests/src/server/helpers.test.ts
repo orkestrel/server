@@ -1,4 +1,5 @@
 import type { ServerAppState } from '../../setupServer.js'
+import { getEventListeners } from 'node:events'
 import net from 'node:net'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type {
@@ -12,12 +13,13 @@ import { decodeBase64URL, encodeBase64URL } from '@orkestrel/codec'
 import { attempt, isArray, isNumber, isRecord } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createSSEParser } from '@orkestrel/sse'
-import { createRecorder } from '@orkestrel/test'
+import { createRecorder, waitForCondition } from '@orkestrel/test'
 import {
 	buildErrorResponse,
 	clearCookie,
 	compose,
 	wrapMiddleware,
+	collectRequestBody,
 	computeBodyETag,
 	computeClientKey,
 	computeCodingQuality,
@@ -1330,6 +1332,119 @@ describe('isDangerousKey / scrubPrototype', () => {
 })
 
 // ── Body pipeline (readBody) ───────────────────────────────────────────────────
+
+describe('collectRequestBody', () => {
+	it('rejects with the abort reason while a read waits, and cancels the source with that reason', async () => {
+		const pulls = createRecorder<readonly []>()
+		const cancels = createRecorder<readonly [unknown]>()
+		const controller = new AbortController()
+		const init = {
+			method: 'POST',
+			body: new ReadableStream<Uint8Array>({
+				start: (source) => source.enqueue(new TextEncoder().encode('first chunk')),
+				pull: () => pulls.handler(),
+				cancel: cancels.handler,
+			}),
+			duplex: 'half',
+			signal: controller.signal,
+		}
+		const request = new Request('http://localhost/', init)
+		const read = collectRequestBody(request, 0)
+		await waitForCondition('the read waits on the source', () => pulls.count > 0)
+		const reason = { stopped: 'the upload' }
+		controller.abort(reason)
+		await expect(read).rejects.toBe(reason)
+		expect(cancels.calls).toHaveLength(1)
+		expect(cancels.calls[0]?.[0]).toBe(reason)
+	})
+
+	it('rejects a streamed body with the reason when the signal aborted before the call', async () => {
+		const controller = new AbortController()
+		const reason = new Error('aborted before the read')
+		controller.abort(reason)
+		const init = {
+			method: 'POST',
+			body: new ReadableStream<Uint8Array>({
+				start: (source) => source.enqueue(new TextEncoder().encode('first chunk')),
+			}),
+			duplex: 'half',
+			signal: controller.signal,
+		}
+		const request = new Request('http://localhost/', init)
+		await expect(collectRequestBody(request, 0)).rejects.toBe(reason)
+	})
+
+	it('rejects a body-less request with the reason when the signal aborted before the call', async () => {
+		const controller = new AbortController()
+		const reason = new Error('aborted before the read')
+		controller.abort(reason)
+		const request = new Request('http://localhost/', { signal: controller.signal })
+		expect(request.body).toBeNull()
+		await expect(collectRequestBody(request, 0)).rejects.toBe(reason)
+	})
+
+	it('keeps a completed body when the signal aborts after the read resolved, and cancels nothing', async () => {
+		const cancels = createRecorder<readonly [unknown]>()
+		const controller = new AbortController()
+		const init = {
+			method: 'POST',
+			body: new ReadableStream<Uint8Array>({
+				start: (source) => {
+					source.enqueue(new TextEncoder().encode('whole body'))
+					source.close()
+				},
+				cancel: cancels.handler,
+			}),
+			duplex: 'half',
+			signal: controller.signal,
+		}
+		const request = new Request('http://localhost/', init)
+		const read = collectRequestBody(request, 0)
+		const bytes = await read
+		controller.abort(new Error('aborted after the read'))
+		expect(new TextDecoder().decode(bytes)).toBe('whole body')
+		await expect(read).resolves.toBe(bytes)
+		expect(cancels.count).toBe(0)
+	})
+
+	it('holds no abort listener on the request signal after the read resolves, rejects on the abort, or fails at the source', async () => {
+		const resolved = new AbortController()
+		const resolvedRequest = new Request('http://localhost/', {
+			method: 'POST',
+			body: 'whole body',
+			signal: resolved.signal,
+		})
+		await collectRequestBody(resolvedRequest, 0)
+		expect(getEventListeners(resolvedRequest.signal, 'abort')).toHaveLength(0)
+
+		const pulls = createRecorder<readonly []>()
+		const aborted = new AbortController()
+		const abortedInit = {
+			method: 'POST',
+			body: new ReadableStream<Uint8Array>({ pull: () => pulls.handler() }),
+			duplex: 'half',
+			signal: aborted.signal,
+		}
+		const abortedRequest = new Request('http://localhost/', abortedInit)
+		const read = collectRequestBody(abortedRequest, 0)
+		await waitForCondition('the read waits on the source', () => pulls.count > 0)
+		aborted.abort(new Error('stopped'))
+		await expect(read).rejects.toThrow('stopped')
+		expect(getEventListeners(abortedRequest.signal, 'abort')).toHaveLength(0)
+
+		const failure = new Error('the source failed')
+		const failing = new AbortController()
+		const failingInit = {
+			method: 'POST',
+			body: new ReadableStream<Uint8Array>({ pull: () => Promise.reject(failure) }),
+			duplex: 'half',
+			signal: failing.signal,
+		}
+		const failingRequest = new Request('http://localhost/', failingInit)
+		await expect(collectRequestBody(failingRequest, 0)).rejects.toBe(failure)
+		expect(getEventListeners(failingRequest.signal, 'abort')).toHaveLength(0)
+	})
+})
 
 describe('readBody', () => {
 	it('decodes an empty body as undefined', async () => {

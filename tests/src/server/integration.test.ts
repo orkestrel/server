@@ -1,12 +1,13 @@
 import type { Connection, MiddlewareContext, RequestLine, ResponseRecord } from '@src/server'
 import type { ServerListenerReading } from '../../setupServer.js'
+import { once } from 'node:events'
 import http from 'node:http'
 import net from 'node:net'
 import { inspect, isDeepStrictEqual } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { isInteger } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
-import { buildErrorResponse, createServer, isServerError } from '@src/server'
+import { buildErrorResponse, createServer, HTTPError, isServerError } from '@src/server'
 import { createRecorder, readProperty, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
@@ -364,6 +365,148 @@ describe('the exchange seam — abort', () => {
 		await waitForCondition('the peer disconnect aborts the signal', () =>
 			Boolean(requests[0]?.signal.aborted),
 		)
+	})
+})
+
+describe('the exchange seam — a body read the abort settles', () => {
+	it('rejects a read waiting on a stalled upload with the context.abort reason, and the layer still answers', async () => {
+		const reason = new Error('the layer stopped the upload')
+		const settled = createRecorder<readonly [unknown]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { request: 0 },
+				middleware: [
+					async (_request, context) => {
+						const read = context.body()
+						context.abort(reason)
+						settled.handler(await read.catch((error: unknown) => error))
+						return new Response('read stopped')
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await client.wait(1, 'the answer after the stopped read')
+			expect(settled.count).toBe(1)
+			expect(settled.calls[0]?.[0]).toBe(reason)
+			expect(client.complete.map((reply) => [reply.status, reply.body])).toEqual([
+				[200, 'read stopped'],
+			])
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('rejects a read that starts after context.abort with its reason, a body-less GET included', async () => {
+		const reason = new Error('the layer aborted first')
+		const settled = createRecorder<readonly [unknown]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				middleware: [
+					async (_request, context) => {
+						context.abort(reason)
+						settled.handler(await context.body().catch((error: unknown) => error))
+						return new Response('read refused')
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const reply = await fetch(`http://127.0.0.1:${port}/ping`)
+		await expect(reply.text()).resolves.toBe('read refused')
+		expect(settled.count).toBe(1)
+		expect(settled.calls[0]?.[0]).toBe(reason)
+	})
+
+	it('answers the status of an HTTPError reason a layer rethrows from the read, with no fault', async () => {
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { request: 0 },
+				report: reports.handler,
+				middleware: [
+					async (_request, context) => {
+						const read = context.body()
+						context.abort(new HTTPError(408, 'the upload stalled'))
+						await read
+						return new Response('read completed')
+					},
+				],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await client.wait(1, 'the 408')
+			expect(client.complete.map((reply) => reply.status)).toEqual([408])
+			expect([errors.count, reports.count]).toEqual([0, 0])
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('rejects a read waiting on a stalled upload with the stop() reason, answers 503, and drains none pending', async ({
+		annotate,
+	}) => {
+		const entered = createRecorder<readonly []>()
+		const settled = createRecorder<readonly [unknown, unknown]>()
+		const drains = createRecorder<readonly [number, number]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				drain: 500,
+				timeouts: { request: 0 },
+				on: { drain: drains.handler },
+				middleware: [
+					async (request, context) => {
+						const read = context.body()
+						entered.handler()
+						settled.handler(await read.catch((error: unknown) => error), request.signal.reason)
+						return new Response('stopped', { status: 503 })
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await waitForCondition('the layer starts the read', () => entered.count === 1)
+			const started = performance.now()
+			const stopped = server.stop()
+			await client.wait(1, 'the 503')
+			expect(client.complete.map((reply) => reply.status)).toEqual([503])
+			await stopped
+			await annotate(`stop() resolved after ${Math.round(performance.now() - started)} ms`)
+			const [outcome, reason] = settled.calls[0] ?? []
+			expect(outcome).toBeInstanceOf(DOMException)
+			expect(outcome instanceof DOMException ? outcome.name : undefined).toBe('AbortError')
+			expect(outcome).toBe(reason)
+			expect(drains.calls).toEqual([[0, 0]])
+		} finally {
+			client.destroy()
+		}
 	})
 })
 
@@ -754,7 +897,6 @@ describe('the boundary — the response event', () => {
 		expect(responses.calls.map(([record]) => [record.pathname, record.status])).toEqual([
 			['/answer-empty', 200],
 		])
-		expect(errors.count).toBe(0)
 	})
 
 	it('records the status written and the time from acceptance to the finished body', async () => {
@@ -781,6 +923,362 @@ describe('the boundary — the response event', () => {
 		expect(records.get('/unavailable')?.status).toBe(503)
 		expect(records.get('/slow')?.ms).toBeGreaterThanOrEqual(2 * BOUNDARY_SLOW_MS - 1)
 		expect(records.get('/unavailable')?.ms).toBeGreaterThanOrEqual(BOUNDARY_SLOW_MS - 1)
+	})
+})
+
+describe('the boundary — a peer disconnect after the server aborted', () => {
+	it('reports no fault when the peer leaves a read context.abort preceded and the route rethrows', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+				middleware: [createAbortLayer('/upload', ['the layer aborted first'])],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload route starts', () => entered.includes('/upload'))
+		client.destroy()
+		await waitForCondition('the /upload read observes the close', () =>
+			entered.includes('/upload failed'),
+		)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('fires no response for a body-less answer to a peer that left after context.abort', async () => {
+		const entered: string[] = []
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				middleware: [createAbortLayer('/upload-caught', ['the layer aborted first'])],
+			}),
+		)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload-caught HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload-caught route starts', () =>
+			entered.includes('/upload-caught'),
+		)
+		client.destroy()
+		await waitForCondition('the /upload-caught read observes the close', () =>
+			entered.includes('/upload-caught failed'),
+		)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+	})
+
+	it('reports no fault when the peer leaves a read stop() aborted and the route rethrows', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload route starts', () => entered.includes('/upload'))
+		const stopped = server.stop()
+		client.destroy()
+		await waitForCondition('the /upload read observes the close', () =>
+			entered.includes('/upload failed'),
+		)
+		await stopped
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('reports no fault and fires no response when the peer leaves a streamed answer mid-body', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write('POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.')
+		await waitForCondition(
+			'the echoed first chunk arrives',
+			() => client.responses[0]?.body === 'ten bytes.',
+		)
+		client.destroy()
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+})
+
+describe('the boundary — a disconnect only the connection shows', () => {
+	const LATE_REQUEST = 'GET /late HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n'
+
+	it('reports a throw after the stop() cut closed a connection the peer held', async () => {
+		const exchanges = new ServerExchanges()
+		const gate = Promise.withResolvers<void>()
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				drain: 50,
+				report: reports.handler,
+				middleware: [
+					async (_request, context, next) => {
+						if (context.url.pathname !== '/late') return next()
+						entered.push('/late')
+						await gate.promise
+						throw new Error('late failure')
+					},
+				],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['GET'])
+		client.write(LATE_REQUEST)
+		await waitForCondition('the /late layer parks', () => entered.includes('/late'))
+		await server.stop()
+		await waitForCondition(
+			'the server closed the response',
+			() => exchanges.exchange('/late')?.[1].closed === true,
+		)
+		exchanges.destroy()
+		gate.resolve()
+		await waitForCondition('the throw reaches report', () => reports.count > 0)
+		expect([errors.count, reports.count]).toEqual([1, 1])
+		expect(errors.calls[0]?.[1]).toMatchObject({ method: 'GET' })
+		expect(errors.calls[0]?.[1]?.url.pathname).toBe('/late')
+		expect(reports.calls[0]?.[1]?.url.pathname).toBe('/late')
+	})
+
+	it('reports a throw after destroy() closed a connection the peer held', async () => {
+		const exchanges = new ServerExchanges()
+		const gate = Promise.withResolvers<void>()
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+				middleware: [
+					async (_request, context, next) => {
+						if (context.url.pathname !== '/late') return next()
+						entered.push('/late')
+						await gate.promise
+						throw new Error('late failure')
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['GET'])
+		client.write(LATE_REQUEST)
+		await waitForCondition('the /late layer parks', () => entered.includes('/late'))
+		await server.destroy()
+		await waitForCondition(
+			'the server closed the response',
+			() => exchanges.exchange('/late')?.[1].closed === true,
+		)
+		exchanges.destroy()
+		gate.resolve()
+		await waitForCondition('the throw reaches report', () => reports.count > 0)
+		expect(reports.calls[0]?.[1]?.url.pathname).toBe('/late')
+		expect(reports.count).toBe(1)
+	})
+
+	it.each([
+		{ label: 'after context.abort', abort: true },
+		{ label: 'without context.abort', abort: false },
+	])('reports a throw after Node closed a stalled upload with a 408, $label', async ({ abort }) => {
+		const gate = Promise.withResolvers<void>()
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { headers: 100, request: 200 },
+				report: reports.handler,
+				middleware: [
+					async (_request, context, next) => {
+						if (context.url.pathname !== '/late') return next()
+						entered.push('/late')
+						if (abort) context.abort(new Error('the layer aborted first'))
+						await gate.promise
+						throw new Error('late failure')
+					},
+				],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write('POST /late HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.')
+		await waitForCondition('the /late layer parks', () => entered.includes('/late'))
+		await client.wait(1, 'the 408')
+		expect(client.complete.map((reply) => reply.status)).toEqual([408])
+		await waitForCondition('the client sees the close', () => client.closed)
+		await server.stop()
+		gate.resolve()
+		await waitForCondition('the throw reaches report', () => reports.count > 0)
+		expect([errors.count, reports.count]).toEqual([1, 1])
+	})
+
+	it('reports no fault for a throw after the peer reset a connection context.abort preceded', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+				middleware: [createAbortLayer('/upload', ['the layer aborted first'])],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload route starts', () => entered.includes('/upload'))
+		client.reset()
+		await waitForCondition('the /upload read observes the close', () =>
+			entered.includes('/upload failed'),
+		)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('reports a throw after a peer disconnect the server never read', async () => {
+		const gate = Promise.withResolvers<void>()
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { request: 0 },
+				report: reports.handler,
+				middleware: [
+					async (_request, context, next) => {
+						if (context.url.pathname !== '/late') return next()
+						entered.push('/late')
+						await gate.promise
+						throw new Error('late failure')
+					},
+				],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const socket = net.createConnection({ host: '127.0.0.1', port })
+		socket.on('error', () => undefined)
+		await once(socket, 'connect')
+		const closed = once(socket, 'close')
+		socket.write('POST /late HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000000000\r\n\r\n')
+		await waitForCondition('the /late layer parks', () => entered.includes('/late'))
+		const chunk = Buffer.alloc(65_536, 97)
+		await waitForCondition('the client socket buffers a full write', () => !socket.write(chunk))
+		socket.destroy()
+		await closed
+		gate.resolve()
+		await waitForCondition('the throw reaches report', () => reports.count > 0)
+		expect([errors.count, reports.count]).toEqual([1, 1])
+	})
+
+	it('keeps the response record of an answer the peer reset before it read it', async () => {
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+			}),
+		)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const received = createRecorder<readonly [unknown]>()
+		const socket = net.createConnection({ host: '127.0.0.1', port })
+		socket.on('error', () => undefined)
+		socket.on('data', received.handler)
+		socket.pause()
+		await once(socket, 'connect')
+		const closed = once(socket, 'close')
+		socket.write('GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+		await waitForCondition('the ping response record fires', () => responses.count > 0)
+		expect(received.count).toBe(0)
+		socket.resetAndDestroy()
+		await closed
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
 	})
 })
 
