@@ -12,7 +12,7 @@ import type {
 	TokenOptions,
 	TokenSecret,
 } from './types.js'
-import { once } from 'node:events'
+import { addAbortListener, once } from 'node:events'
 import { createServer as createNetServer } from 'node:net'
 import { decodeBase64URL, encodeBase64URL, encodeHex } from '@orkestrel/codec'
 import {
@@ -1491,7 +1491,9 @@ export function scrubPrototype(value: unknown): unknown {
  * throwing a {@link ContentTooLargeError} (413) the instant the running total
  * exceeds `limit` — before the rest of the stream is buffered — rather than
  * collecting an unbounded body. A bodyless request (`request.body === null`)
- * resolves an empty array. A non-positive `limit` means unbounded.
+ * resolves an empty array. A non-positive `limit` means unbounded. When
+ * `request.signal` aborts before the call or while a read waits, the body is
+ * cancelled with the signal's reason and the promise rejects with that reason.
  *
  * @param request - The `Request` to drain
  * @param limit - The maximum total bytes before a 413; a non-positive value means unbounded
@@ -1507,18 +1509,26 @@ export async function collectRequestBody(
 	request: Request,
 	limit: number,
 ): Promise<Uint8Array<ArrayBuffer>> {
+	const signal = request.signal
+	signal.throwIfAborted()
 	if (request.body === null) return new Uint8Array(0)
 	const reader = request.body.getReader()
 	const chunks: Array<{ readonly bytes: Uint8Array; readonly total: number }> = []
-	for (;;) {
-		const { done, value } = await reader.read()
-		if (done) break
-		const total = (chunks.at(-1)?.total ?? 0) + value.byteLength
-		if (limit > 0 && total > limit) {
-			await reader.cancel()
-			throw new ContentTooLargeError(limit)
+	const relay = addAbortListener(signal, () => reader.cancel(signal.reason).catch(() => undefined))
+	try {
+		for (;;) {
+			const { done, value } = await reader.read()
+			signal.throwIfAborted()
+			if (done) break
+			const total = (chunks.at(-1)?.total ?? 0) + value.byteLength
+			if (limit > 0 && total > limit) {
+				await reader.cancel()
+				throw new ContentTooLargeError(limit)
+			}
+			chunks.push({ bytes: value, total })
 		}
-		chunks.push({ bytes: value, total })
+	} finally {
+		relay[Symbol.dispose]()
 	}
 	const merged = new Uint8Array(chunks.at(-1)?.total ?? 0)
 	chunks.reduce((offset, chunk) => {

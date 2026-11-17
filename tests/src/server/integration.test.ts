@@ -6,7 +6,7 @@ import { inspect, isDeepStrictEqual } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { isInteger } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
-import { buildErrorResponse, createServer, isServerError } from '@src/server'
+import { buildErrorResponse, createServer, HTTPError, isServerError } from '@src/server'
 import { createRecorder, readProperty, waitForCondition, waitForDelay } from '@orkestrel/test'
 import { createLoopback } from '@orkestrel/test/server'
 import {
@@ -364,6 +364,148 @@ describe('the exchange seam — abort', () => {
 		await waitForCondition('the peer disconnect aborts the signal', () =>
 			Boolean(requests[0]?.signal.aborted),
 		)
+	})
+})
+
+describe('the exchange seam — a body read the abort settles', () => {
+	it('rejects a read waiting on a stalled upload with the context.abort reason, and the layer still answers', async () => {
+		const reason = new Error('the layer stopped the upload')
+		const settled = createRecorder<readonly [unknown]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { request: 0 },
+				middleware: [
+					async (_request, context) => {
+						const read = context.body()
+						context.abort(reason)
+						settled.handler(await read.catch((error: unknown) => error))
+						return new Response('read stopped')
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await client.wait(1, 'the answer after the stopped read')
+			expect(settled.count).toBe(1)
+			expect(settled.calls[0]?.[0]).toBe(reason)
+			expect(client.complete.map((reply) => [reply.status, reply.body])).toEqual([
+				[200, 'read stopped'],
+			])
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('rejects a read that starts after context.abort with its reason, a body-less GET included', async () => {
+		const reason = new Error('the layer aborted first')
+		const settled = createRecorder<readonly [unknown]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				middleware: [
+					async (_request, context) => {
+						context.abort(reason)
+						settled.handler(await context.body().catch((error: unknown) => error))
+						return new Response('read refused')
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const reply = await fetch(`http://127.0.0.1:${port}/ping`)
+		await expect(reply.text()).resolves.toBe('read refused')
+		expect(settled.count).toBe(1)
+		expect(settled.calls[0]?.[0]).toBe(reason)
+	})
+
+	it('answers the status of an HTTPError reason a layer rethrows from the read, with no fault', async () => {
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				timeouts: { request: 0 },
+				report: reports.handler,
+				middleware: [
+					async (_request, context) => {
+						const read = context.body()
+						context.abort(new HTTPError(408, 'the upload stalled'))
+						await read
+						return new Response('read completed')
+					},
+				],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await client.wait(1, 'the 408')
+			expect(client.complete.map((reply) => reply.status)).toEqual([408])
+			expect([errors.count, reports.count]).toEqual([0, 0])
+		} finally {
+			client.destroy()
+		}
+	})
+
+	it('rejects a read waiting on a stalled upload with the stop() reason, answers 503, and drains none pending', async ({
+		annotate,
+	}) => {
+		const entered = createRecorder<readonly []>()
+		const settled = createRecorder<readonly [unknown, unknown]>()
+		const drains = createRecorder<readonly [number, number]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createPingDispatcher(),
+				state: () => undefined,
+				host: '127.0.0.1',
+				drain: 500,
+				timeouts: { request: 0 },
+				on: { drain: drains.handler },
+				middleware: [
+					async (request, context) => {
+						const read = context.body()
+						entered.handler()
+						settled.handler(await read.catch((error: unknown) => error), request.signal.reason)
+						return new Response('stopped', { status: 503 })
+					},
+				],
+			}),
+		)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		try {
+			client.write('POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\n')
+			await waitForCondition('the layer starts the read', () => entered.count === 1)
+			const started = performance.now()
+			const stopped = server.stop()
+			await client.wait(1, 'the 503')
+			expect(client.complete.map((reply) => reply.status)).toEqual([503])
+			await stopped
+			await annotate(`stop() resolved after ${Math.round(performance.now() - started)} ms`)
+			const [outcome, reason] = settled.calls[0] ?? []
+			expect(outcome).toBeInstanceOf(DOMException)
+			expect(outcome instanceof DOMException ? outcome.name : undefined).toBe('AbortError')
+			expect(outcome).toBe(reason)
+			expect(drains.calls).toEqual([[0, 0]])
+		} finally {
+			client.destroy()
+		}
 	})
 })
 
