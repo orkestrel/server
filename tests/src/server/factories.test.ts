@@ -5,6 +5,7 @@ import type {
 	SignerInterface,
 	SSEStreamInterface,
 } from '@src/server'
+import { ContractError } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import {
 	createNegotiator,
@@ -91,7 +92,7 @@ describe('createServer — round-trip', () => {
 				state: () => undefined,
 				timeouts: { headers: 5_000, request: 1_000 },
 			}),
-		).toThrow(TypeError)
+		).toThrow(ContractError)
 	})
 
 	it('returns ServerInterface<TState> — a factory return type assertion', () => {

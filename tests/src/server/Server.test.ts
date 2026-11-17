@@ -14,7 +14,7 @@ import http from 'node:http'
 import net from 'node:net'
 import { finished as streamFinished } from 'node:stream/promises'
 import { afterEach, describe, expect, expectTypeOf, it } from 'vitest'
-import { attempt } from '@orkestrel/contract'
+import { attempt, ContractError } from '@orkestrel/contract'
 import { createDispatcher } from '@orkestrel/router'
 import { createServer, createStream, HTTPError, isServerError } from '@src/server'
 import { createRecorder, waitForCondition, waitForDelay } from '@orkestrel/test'
@@ -154,15 +154,21 @@ describe('Server — the node:http timeout relation', () => {
 			)
 			expect(node.success).toBe(!refused)
 			expect(built.success).toBe(!refused)
-			expect(built.success ? undefined : built.error).toEqual(
-				refused
-					? new TypeError(
-							'ServerOptions.timeouts.headers must not exceed ServerOptions.timeouts.request (300_000 when omitted) while timeouts.request is positive',
-						)
-					: undefined,
-			)
+			const error = built.success ? undefined : built.error
+			expect(error instanceof ContractError).toBe(refused)
+			expect(
+				error instanceof ContractError ? [error.code, error.context?.path] : undefined,
+			).toEqual(refused ? ['range', ['options', 'timeouts', 'headers']] : undefined)
 		},
 	)
+
+	it('admits an inherited request timeout the relation does not read as positive', () => {
+		const timeouts = Object.create({ request: Number.NaN })
+		const built = attempt(() =>
+			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, timeouts }),
+		)
+		expect(built.success).toBe(true)
+	})
 
 	it('starts and serves under timeouts the former headers ≤ keepalive check refused', async () => {
 		const server = trackServer(
@@ -180,17 +186,22 @@ describe('Server — the node:http timeout relation', () => {
 	})
 
 	it.each(SERVER_TIMEOUT_REFUSALS)(
-		'refuses timeouts.$key of $value with a refusal that names the key and its limit',
+		'refuses timeouts.$key of $value with a ContractError of code range that names the key and its limit',
 		({ key, value, limit }) => {
-			expect(() =>
+			const built = attempt(() =>
 				createServer({
 					dispatcher: createPingDispatcher(),
 					state: () => undefined,
 					timeouts: { [key]: value },
 				}),
-			).toThrow(
-				new TypeError(`ServerOptions.timeouts.${key} must be an integer from 0 through ${limit}`),
 			)
+			const error = built.success ? undefined : built.error
+			expect(error).toBeInstanceOf(ContractError)
+			expect(error).toMatchObject({
+				code: 'range',
+				message: `Server: options.timeouts.${key} must be an integer from 0 through ${limit}`,
+				context: { path: ['options', 'timeouts', key] },
+			})
 		},
 	)
 
@@ -207,106 +218,106 @@ describe('Server — the node:http timeout relation', () => {
 					.status,
 		)
 		expect(accepted).toEqual(['idle', 'idle', 'idle', 'idle', 'idle'])
-		// Node arms keepalive plus its 1_000 ms buffer as one timer, which overflows one past this edge.
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				timeouts: { keepalive: 2_147_482_648 },
-			}),
-		).toThrow(TypeError)
 	})
 })
 
+const REFUSED_LIMIT = 'a non-negative finite number'
+const REFUSED_DURATION = 'an integer from 0 through 2_147_483_647'
+
 describe('Server — construction guards', () => {
-	it('throws when drain / limit are not non-negative finite numbers', () => {
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				drain: Number.NaN,
-			}),
-		).toThrow(TypeError)
-		expect(() =>
-			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, limit: -1 }),
-		).toThrow(TypeError)
-	})
-
-	it('refuses a drain that is not an integer from 0 through 2_147_483_647', () => {
-		const refusal = new TypeError(
-			'ServerOptions.drain must be an integer from 0 through 2_147_483_647',
+	it.each([
+		{ options: { state: 'x' }, code: 'placement', path: ['options', 'state'], limit: 'a function' },
+		{
+			options: { report: 'x' },
+			code: 'placement',
+			path: ['options', 'report'],
+			limit: 'a function',
+		},
+		{
+			options: { drain: Number.NaN },
+			code: 'range',
+			path: ['options', 'drain'],
+			limit: REFUSED_DURATION,
+		},
+		{ options: { drain: 1.5 }, code: 'range', path: ['options', 'drain'], limit: REFUSED_DURATION },
+		{ options: { drain: 3e9 }, code: 'range', path: ['options', 'drain'], limit: REFUSED_DURATION },
+		{ options: { limit: -1 }, code: 'range', path: ['options', 'limit'], limit: REFUSED_LIMIT },
+		{
+			options: { limit: Number.POSITIVE_INFINITY },
+			code: 'range',
+			path: ['options', 'limit'],
+			limit: REFUSED_LIMIT,
+		},
+		{
+			options: { timeouts: { start: 1.5 } },
+			code: 'range',
+			path: ['options', 'timeouts', 'start'],
+			limit: REFUSED_DURATION,
+		},
+		{
+			options: { timeouts: { start: 3e9 } },
+			code: 'range',
+			path: ['options', 'timeouts', 'start'],
+			limit: REFUSED_DURATION,
+		},
+		{
+			options: { timeouts: { start: -1 } },
+			code: 'range',
+			path: ['options', 'timeouts', 'start'],
+			limit: REFUSED_DURATION,
+		},
+		{
+			options: { timeouts: { keepalive: 2_147_482_648 } },
+			code: 'range',
+			path: ['options', 'timeouts', 'keepalive'],
+			limit: 'an integer from 0 through 2_147_482_647',
+		},
+		{
+			options: { timeouts: { headers: 501, request: 500 } },
+			code: 'range',
+			path: ['options', 'timeouts', 'headers'],
+			limit: 'no greater than options.timeouts.request (300_000 when omitted) while it is positive',
+		},
+		{
+			options: { sockets: { connections: 1.5 } },
+			code: 'range',
+			path: ['options', 'sockets', 'connections'],
+			limit: 'a non-negative integer',
+		},
+		{
+			options: { sockets: { headers: Number.NaN } },
+			code: 'range',
+			path: ['options', 'sockets', 'headers'],
+			limit: 'a non-negative integer',
+		},
+		{
+			options: { sockets: { requests: -1 } },
+			code: 'range',
+			path: ['options', 'sockets', 'requests'],
+			limit: 'a non-negative integer',
+		},
+	])('refuses $path with a ContractError of code $code', ({ options, code, path, limit }) => {
+		const built = attempt(() =>
+			Reflect.apply(createServer, undefined, [
+				{ dispatcher: createPingDispatcher(), state: () => undefined, ...options },
+			]),
 		)
-		expect(() =>
-			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 1.5 }),
-		).toThrow(refusal)
-		expect(() =>
-			createServer({ dispatcher: createPingDispatcher(), state: () => undefined, drain: 3e9 }),
-		).toThrow(refusal)
-		expect(
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				drain: 2_147_483_647,
-			}).status,
-		).toBe('idle')
+		const error = built.success ? undefined : built.error
+		expect(error).toBeInstanceOf(ContractError)
+		expect(error).toMatchObject({
+			code,
+			message: `Server: ${path.join('.')} must be ${limit}`,
+			context: { path, limit },
+		})
 	})
 
-	it('refuses a timeouts.start that is not an integer from 0 through 2_147_483_647', () => {
-		const refusal = new TypeError(
-			'ServerOptions.timeouts.start must be an integer from 0 through 2_147_483_647',
-		)
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				timeouts: { start: 1.5 },
-			}),
-		).toThrow(refusal)
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				timeouts: { start: 3e9 },
-			}),
-		).toThrow(refusal)
-		expect(
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				timeouts: { start: 2_147_483_647 },
-			}).status,
-		).toBe('idle')
-	})
-
-	it('throws when startup timeout or socket caps violate their numeric contracts', () => {
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				timeouts: { start: -1 },
-			}),
-		).toThrow(TypeError)
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				sockets: { connections: 1.5 },
-			}),
-		).toThrow(TypeError)
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				sockets: { headers: Number.NaN },
-			}),
-		).toThrow(TypeError)
-		expect(() =>
-			createServer({
-				dispatcher: createPingDispatcher(),
-				state: () => undefined,
-				sockets: { requests: -1 },
-			}),
-		).toThrow(TypeError)
+	it('accepts the upper bound of drain and timeouts.start', () => {
+		for (const options of [{ drain: 2_147_483_647 }, { timeouts: { start: 2_147_483_647 } }]) {
+			expect(
+				createServer({ dispatcher: createPingDispatcher(), state: () => undefined, ...options })
+					.status,
+			).toBe('idle')
+		}
 	})
 })
 

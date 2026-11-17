@@ -28,7 +28,15 @@ import { createAbort, linkSignal } from '@orkestrel/abort'
 import { createTimeout, isTimeoutDuration } from '@orkestrel/timeout'
 import { buildRequest, isEncryptedSocket, sendResponse } from '@orkestrel/router/server'
 import { Emitter } from '@orkestrel/emitter'
-import { attempt, isFiniteNumber, isFunction, isInteger, isPromise } from '@orkestrel/contract'
+import {
+	attempt,
+	isFiniteNumber,
+	isFunction,
+	isInteger,
+	isPromise,
+	refuseValue,
+	settle,
+} from '@orkestrel/contract'
 import { buildErrorResponse, compose, iterateRequestBody } from './helpers.js'
 import { isAddressInfo } from './validators.js'
 import {
@@ -139,41 +147,82 @@ export class Server<TState> implements ServerInterface<TState> {
 	#stopping: Promise<void> | undefined
 
 	constructor(options: ServerOptions<TState>) {
-		if (!isFunction(options.state)) throw new TypeError('ServerOptions.state must be a function')
-		if (options.report !== undefined && !isFunction(options.report))
-			throw new TypeError('ServerOptions.report must be a function')
+		refuseValue(options.state, isFunction, 'Server', {
+			path: ['options', 'state'],
+			limit: 'a function',
+			code: 'placement',
+		})
+		if (options.report !== undefined) {
+			refuseValue(options.report, isFunction, 'Server', {
+				path: ['options', 'report'],
+				limit: 'a function',
+				code: 'placement',
+			})
+		}
 		const drain = options.drain ?? DEFAULT_DRAIN_MS
-		if (!isTimeoutDuration(drain))
-			throw new TypeError('ServerOptions.drain must be an integer from 0 through 2_147_483_647')
+		refuseValue(drain, isTimeoutDuration, 'Server', {
+			path: ['options', 'drain'],
+			limit: 'an integer from 0 through 2_147_483_647',
+			code: 'range',
+		})
 		const limit = options.limit ?? DEFAULT_BODY_LIMIT
-		if (!isFiniteNumber(limit) || limit < 0)
-			throw new TypeError('ServerOptions.limit must be a non-negative finite number')
+		refuseValue(limit, (value): value is number => isFiniteNumber(value) && value >= 0, 'Server', {
+			path: ['options', 'limit'],
+			limit: 'a non-negative finite number',
+			code: 'range',
+		})
 		const timeouts = options.timeouts ?? {}
 		for (const [name, value] of Object.entries(timeouts)) {
 			// Node arms `keepalive` plus its default 1_000 ms `keepAliveTimeoutBuffer` as one timer.
-			const keepalive = name === 'keepalive'
-			if (
-				value !== undefined &&
-				!(isTimeoutDuration(value) && (!keepalive || isTimeoutDuration(value + 1_000)))
-			) {
-				throw new TypeError(
-					`ServerOptions.timeouts.${name} must be an integer from 0 through ${keepalive ? '2_147_482_647' : '2_147_483_647'}`,
+			if (value === undefined) continue
+			if (name === 'keepalive') {
+				refuseValue(
+					value,
+					(candidate): candidate is number =>
+						isTimeoutDuration(candidate) && isTimeoutDuration(candidate + 1_000),
+					'Server',
+					{
+						path: ['options', 'timeouts', name],
+						limit: 'an integer from 0 through 2_147_482_647',
+						code: 'range',
+					},
 				)
+			} else {
+				refuseValue(value, isTimeoutDuration, 'Server', {
+					path: ['options', 'timeouts', name],
+					limit: 'an integer from 0 through 2_147_483_647',
+					code: 'range',
+				})
 			}
 		}
 		// Node's own defaults, so the relation and the checking interval read the values Node enforces.
 		const request = timeouts.request ?? DEFAULT_REQUEST_TIMEOUT_MS
 		const headers = timeouts.headers ?? Math.min(DEFAULT_HEADERS_TIMEOUT_MS, request)
-		if (request > 0 && headers > request) {
-			throw new TypeError(
-				'ServerOptions.timeouts.headers must not exceed ServerOptions.timeouts.request (300_000 when omitted) while timeouts.request is positive',
-			)
-		}
+		refuseValue(
+			headers,
+			(value): value is number => !(request > 0 && Number(value) > request),
+			'Server',
+			{
+				path: ['options', 'timeouts', 'headers'],
+				limit:
+					'no greater than options.timeouts.request (300_000 when omitted) while it is positive',
+				code: 'range',
+			},
+		)
 		const checked = [headers, request].filter((ms) => ms > 0)
 		const sockets = options.sockets ?? {}
 		for (const [name, value] of Object.entries(sockets)) {
-			if (value !== undefined && (!isInteger(value) || value < 0))
-				throw new TypeError(`ServerOptions.sockets.${name} must be a non-negative integer`)
+			if (value === undefined) continue
+			refuseValue(
+				value,
+				(candidate): candidate is number => isInteger(candidate) && candidate >= 0,
+				'Server',
+				{
+					path: ['options', 'sockets', name],
+					limit: 'a non-negative integer',
+					code: 'range',
+				},
+			)
 		}
 		this.#id = crypto.randomUUID()
 		this.#dispatcher = options.dispatcher
@@ -456,11 +505,10 @@ export class Server<TState> implements ServerInterface<TState> {
 		line?: RequestLine,
 		disconnect?: AbortSignal,
 	): Promise<boolean> {
-		try {
-			await sendResponse(result, response)
-		} catch (error) {
+		const sent = await settle(() => sendResponse(result, response))
+		if (!sent.success) {
 			response.destroy()
-			if (disconnect?.aborted !== true) this.#fault(error, line)
+			if (disconnect?.aborted !== true) this.#fault(sent.error, line)
 			return false
 		}
 		return response.writableFinished
@@ -615,7 +663,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		const open = new Map<ServerResponse, () => void>()
 		this.#exchanges.set(socket, open)
 		socket.once('close', () => {
-			for (const [response, settle] of open) if (response.socket === null) settle()
+			for (const [response, release] of open) if (response.socket === null) release()
 			this.#exchanges.delete(socket)
 		})
 	}
@@ -631,12 +679,12 @@ export class Server<TState> implements ServerInterface<TState> {
 	async #trackExchange(
 		message: IncomingMessage,
 		response: ServerResponse,
-		settle: () => void,
+		release: () => void,
 	): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)
 		if (open === undefined) return
-		open.set(response, settle)
+		open.set(response, release)
 		await Promise.all([
 			new Promise((resolve) => message.once('close', resolve)),
 			new Promise((resolve) => response.once('close', resolve)),

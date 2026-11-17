@@ -19,14 +19,17 @@ import {
 	attempt,
 	holds,
 	isArray,
+	isCodedError,
 	isError,
 	isFiniteNumber,
 	isInstance,
 	isNumber,
 	isObject,
 	isRecord,
+	isSafeInteger,
 	isString,
 	parseJSON,
+	settle,
 } from '@orkestrel/contract'
 import {
 	COMPRESSIBLE_TYPES,
@@ -1067,7 +1070,7 @@ export function matchesETag(header: string, etag: string): boolean {
  * ```
  */
 export function parseRange(header: string | undefined, size: number): RangeSpec | undefined {
-	if (header === undefined || !Number.isSafeInteger(size) || size < 0) return undefined
+	if (header === undefined || !isSafeInteger(size) || size < 0) return undefined
 	const field = stripOWS(header)
 	const equals = field.indexOf('=')
 	if (equals < 0 || field.slice(0, equals).toLowerCase() !== 'bytes') return undefined
@@ -1376,7 +1379,7 @@ export function serializeEvent(message: SSEMessage): string {
 		throw new ServerError('EVENT', 'an SSE event type must be one line', { field: 'event' })
 	if (id !== undefined && /[\r\n\0]/.test(id))
 		throw new ServerError('EVENT', 'an SSE id must be one line with no NUL', { field: 'id' })
-	if (retry !== undefined && !(Number.isSafeInteger(retry) && retry >= 0))
+	if (retry !== undefined && !(isSafeInteger(retry) && retry >= 0))
 		throw new ServerError('EVENT', 'an SSE retry must be a non-negative safe integer', {
 			field: 'retry',
 		})
@@ -1762,12 +1765,10 @@ export async function probePort(port: number): Promise<number> {
  */
 export async function discoverPort(preferred?: number): Promise<number> {
 	if (preferred === undefined) return probePort(0)
-	try {
-		return await probePort(preferred)
-	} catch (error) {
-		if (isError(error) && 'code' in error && error.code === 'EADDRINUSE') return probePort(0)
-		throw error
-	}
+	const probed = await settle(() => probePort(preferred))
+	if (probed.success) return probed.value
+	if (isCodedError(probed.error) && probed.error.code === 'EADDRINUSE') return probePort(0)
+	throw probed.error
 }
 
 /**

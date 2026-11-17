@@ -736,7 +736,7 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   claimed upgraded sockets, and connections that still carry an open
  *   request exchange this long to finish before forcing every remaining
  *   socket closed. Defaults to `DEFAULT_DRAIN_MS`. Must be an integer from
- *   0 through 2_147_483_647; construction throws a `TypeError` otherwise.
+ *   0 through 2_147_483_647; construction throws a `ContractError` of code `range` otherwise.
  *   A long-lived upgraded socket that nothing closes therefore costs
  *   `stop()` this whole budget, so a WebSocket handler closes its sockets
  *   on the `stop` event to settle sooner.
@@ -788,7 +788,7 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   `keepalive` an integer from 0 through 2_147_482_647, so that Node's
  *   timer of `keepalive` plus its buffer stays within that limit; `headers`
  *   must not exceed `request` while `request` is positive, Node's own
- *   relation. Construction throws a `TypeError` otherwise. A response deadline belongs to a middleware, such as
+ *   relation. Construction throws a `ContractError` of code `range` otherwise. A response deadline belongs to a middleware, such as
  *   `@orkestrel/middleware`'s `createDeadline`, which aborts the exchange
  *   through `context.abort`. A startup expiry rejects with a `DOMException`
  *   named `TimeoutError`; caller cancellation rejects with the caller
