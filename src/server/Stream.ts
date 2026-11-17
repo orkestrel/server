@@ -25,7 +25,7 @@ import { SSE_HEADERS } from './constants.js'
  * receiving `false` awaits `drain()`; that promise resolves on the next
  * consumer pull restoring capacity, or on stream closure. `comment` writes a
  * `: text` keep-alive line per line of its text, which a conforming SSE parser
- * ignores; `end` closes the stream. Every method is a safe no-op once `closed`
+ * ignores; `end` closes the stream. Every method is a safe no-op while `closed`
  * (ended by `end()`, or the consumer cancelled the stream), so a late write
  * never throws.
  *

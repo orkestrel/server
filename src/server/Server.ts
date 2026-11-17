@@ -668,7 +668,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#inflight === 0) this.#wakeup = createAbort()
 	}
 
-	// Fire the current drain wakeup once the last unit of drainable work has
+	// Fire the current drain wakeup after the last unit of drainable work has
 	// left. Called after that unit is uncounted — event-driven, never a
 	// busy-loop.
 	#settle(): void {

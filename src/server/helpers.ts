@@ -223,7 +223,7 @@ export function supportsMutation(headers: Headers): boolean {
 // verifyToken(parseCookies(...)[name], signer)` — so a cookie is a
 // `signToken` value in a `Set-Cookie`, with the same key rotation and tamper
 // rejection. Every reader narrows untrusted request input with `typeof`,
-// never `as`, and remains total on hostile input.
+// never `as`, and remains total on malformed input.
 
 /**
  * Parses a raw `Cookie:` request header into a `name → value` lookup.
@@ -723,7 +723,7 @@ export function computeCodingQuality(entries: readonly AcceptEntry[], coding: st
  * keeps the earlier-offered coding on a client-side tie, which is what makes
  * `available` the server's preference order. An empty `available` list, and a
  * list the client rejects outright, both yield `undefined` (identity — no
- * compression). Total on hostile input.
+ * compression). Total on malformed input.
  *
  * @typeParam T - The coding string type (so a `readonly Encoding[]` returns an `Encoding`)
  * @param entries - The parsed {@link AcceptEntry} list
@@ -758,7 +758,7 @@ export function resolveCoding<T extends string>(
  * {@link resolveCoding}, the same selection leaf `Negotiator.encoding` runs, so
  * the two doors onto this axis cannot drift. Returns `undefined` when the
  * client accepts none of `available` (identity — no compression). Total on
- * hostile input.
+ * malformed input.
  *
  * @typeParam T - The coding string type (so a `readonly Encoding[]` returns an `Encoding`)
  * @param header - The raw `Accept-Encoding` header value
@@ -1160,7 +1160,7 @@ export function compareDigits(left: string, right: string): number {
  * echoes the request's `Origin` only when it is present in the list, else
  * `undefined` (no header set). Security: the literal `'null'` origin — sent
  * by a sandboxed iframe, a `file://` document, an opaque-origin redirect — is
- * never reflected even if `'null'` were listed, closing the hostile-context
+ * never reflected even if `'null'` were listed, closing the opaque-origin
  * cross-origin-access hole.
  *
  * @param origin - The configured origin policy — `'*'`, a single origin, or an allow-list
@@ -1414,7 +1414,7 @@ export function serializeComment(text: string): string {
 // transparently decompresses a `gzip`/`deflate` `Content-Encoding` body
 // through a byte-counting `TransformStream` that aborts the instant
 // decompressed output exceeds `decompression` (the zip-bomb defense — fail
-// before materializing the bomb, since `DecompressionStream` has no
+// before materializing the bomb, because `DecompressionStream` has no
 // `maxOutputLength` knob), then decodes by content type. `scrubPrototype` /
 // `isDangerousKey` are the prototype-pollution scrub `readBody` applies to a
 // parsed JSON or urlencoded body.
@@ -1573,7 +1573,7 @@ export function parseEncoding(header: string | null): Exclude<Encoding, 'identit
  * @remarks
  * Pipes `bytes` through `DecompressionStream(encoding)` and a byte-counting
  * `TransformStream` that aborts the pipe the instant the running decompressed
- * total exceeds `cap` — fail-before-materialize, since `DecompressionStream`
+ * total exceeds `cap` — fail-before-materialize, because `DecompressionStream`
  * has no `maxOutputLength` knob. A cap breach surfaces
  * as a {@link ContentTooLargeError} (413); a genuinely corrupt/truncated
  * compressed stream surfaces as a distinct `400`-mappable {@link HTTPError}
@@ -1689,7 +1689,7 @@ export async function readBody(request: Request, options?: BodyOptions): Promise
 // ============================================================================
 //  The node face — pure helpers. Every function here is genuinely
 //  node-bound (a `node:net` probe) — everything
-//  fetch/string-pure lives above in this same file and is consumed, never
+//  fetch/string-pure lives earlier in this same file and is consumed, never
 //  duplicated (the socket-encrypted narrow and the `Request`/`Response`
 //  conversion are `@orkestrel/router`'s `isEncryptedSocket` / `buildRequest` /
 //  `sendResponse`).

@@ -262,10 +262,10 @@ the queue, so a `drain()` before any write also waits on that pull.
 
 | Method    | Returns         | Summary                                                                                                                                                                                                        |
 | --------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `write`   | `boolean`       | Serializes and enqueues one `SSEMessage` to the wire, reporting whether the process-local queue still has capacity afterward — `false` also once the stream is closed.                                         |
-| `comment` | `void`          | Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores, and a no-op once the stream is closed.                                                                                          |
+| `write`   | `boolean`       | Serializes and enqueues one `SSEMessage` to the wire, reporting whether the process-local queue still has capacity afterward — `false` also after the stream closes.                                           |
+| `comment` | `void`          | Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores, and a no-op after the stream closes.                                                                                            |
 | `drain`   | `Promise<void>` | Parks until the process-local stream queue has capacity again — resolving on the consumer pull that restores it, or immediately when capacity is already available or the stream is closed, and never polling. |
-| `end`     | `void`          | Ends the stream, completing the response — a no-op once already `closed`, and it settles any parked producer.                                                                                                  |
+| `end`     | `void`          | Ends the stream, completing the response — a no-op after the stream closes, and it settles any parked producer.                                                                                                |
 
 #### `ServerInterface`
 
@@ -489,7 +489,7 @@ These invariants hold across `src/server` ↔ `server.md`.
    `UpgradeHandler`s run in registration order; the first to return `true`
    claims the socket and stops the fan-out; a handler that throws is treated as
    declined (the throw surfaces on `error` with no request context — `error`'s
-   second argument is `undefined` on the upgrade path, since no fetch
+   second argument is `undefined` on the upgrade path, because no fetch
    `Request` exists there, only a raw `IncomingMessage` — and never crashes
    the process) and the fan-out continues; an upgrade nothing claims destroys
    the socket so it never leaks a dangling connection. A claimed socket is
@@ -502,7 +502,7 @@ These invariants hold across `src/server` ↔ `server.md`.
    `limit`), transparently decompresses a `gzip`/`deflate` body through a
    byte-counting `TransformStream` that aborts the instant decompressed output
    would exceed `decompression` (fail before materializing a decompression
-   bomb, since `DecompressionStream` has no `maxOutputLength`), decodes an
+   bomb, because `DecompressionStream` has no `maxOutputLength`), decodes an
    `application/x-www-form-urlencoded` body to a record whose repeated field
    keeps its last value, and scrubs `__proto__`/`constructor`/`prototype` keys
    from a parsed JSON or urlencoded body (`scrubPrototype`) before it is ever

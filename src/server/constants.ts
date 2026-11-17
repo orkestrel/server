@@ -55,7 +55,7 @@ export const DEFAULT_BODY_LIMIT = 1_048_576
  * it transparently decompresses a `Content-Encoding` request body.
  *
  * @remarks
- * A small compressed payload (under {@link DEFAULT_BODY_LIMIT} on the wire)
+ * A small compressed body (under {@link DEFAULT_BODY_LIMIT} on the wire)
  * can inflate by many orders of magnitude — a classic decompression bomb.
  * Capping the decompressed byte count makes the pipe abort the moment the
  * output would exceed this, before the full bomb is materialized, so the
@@ -91,7 +91,7 @@ export const SSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
  * to match, `^[A-Za-z0-9_-]{1,200}$`.
  *
  * @remarks
- * An incoming id carrying CRLF, a log-injection payload, a control character,
+ * An incoming id carrying CRLF, log-injection input, a control character,
  * or more characters than the pattern admits fails the match and is rejected —
  * a fresh id is minted instead — so it never rides into a response header or
  * `context.state`. Frozen so a consumer can read but never mutate the shared

@@ -190,7 +190,7 @@ export interface SignerInterface {
  * @param signer - The {@link SignerInterface} whose `sign` signs the payload.
  * @param ttl - An optional lifetime in milliseconds. When set, the expiry
  *   timestamp is bound into the signed payload (HMAC-covered, tamper-proof);
- *   `verifyToken` rejects the token once that instant has passed. Omitted ⇒
+ *   `verifyToken` refuses the token after that instant passes. Omitted ⇒
  *   the token never expires.
  */
 export interface TokenOptions {
@@ -434,7 +434,7 @@ export interface StreamOptions {
  * per line of its text (ignored by a conforming SSE parser — no spurious
  * event); `end` closes the stream. The stream opens with one comment line, so
  * the response pump has a first chunk and the headers leave before any event.
- * Every method is a safe no-op once `closed` is `true`, so a late `write`
+ * Every method is a safe no-op while `closed` is `true`, so a late `write`
  * never throws.
  *
  * The readiness signal is deliberately local: it reflects the
@@ -456,8 +456,8 @@ export interface SSEStreamInterface {
 	readonly closed: boolean
 	/**
 	 * Serializes and enqueues one {@link SSEMessage} to the wire, reporting whether the
-	 * process-local queue still has capacity afterward — `false` also once the stream
-	 * is closed.
+	 * process-local queue still has capacity afterward — `false` also after the stream
+	 * closes.
 	 *
 	 * @param message - The event to send (its `data` split on `\n` into `data:` lines)
 	 * @returns True if the process-local stream queue has capacity after
@@ -470,7 +470,7 @@ export interface SSEStreamInterface {
 	write(message: SSEMessage): boolean
 	/**
 	 * Writes a `: text` SSE comment line — a keep-alive a conforming parser ignores,
-	 * and a no-op once the stream is closed.
+	 * and a no-op after the stream closes.
 	 *
 	 * @param text - The comment text (sent after the `: ` prefix, one comment line per line)
 	 */
@@ -487,7 +487,7 @@ export interface SSEStreamInterface {
 	 */
 	drain(): Promise<void>
 	/**
-	 * Ends the stream, completing the response — a no-op once already `closed`, and it
+	 * Ends the stream, completing the response — a no-op after the stream closes, and it
 	 * settles any parked producer.
 	 */
 	end(): void
