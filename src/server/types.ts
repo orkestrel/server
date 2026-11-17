@@ -632,8 +632,9 @@ export interface ResponseRecord {
  *   whose status the response carries, a returned status no `Response`
  *   carries included), a response write that fails, or a throw the terminal
  *   catch holds; each carries the request's {@link RequestLine}, the same
- *   pair `report` receives. A throw after a peer disconnect is no fault and
- *   fires nothing. The request is `undefined` for an upgrade-handler throw
+ *   pair `report` receives. A throw after a peer disconnect the server read
+ *   before the throw, the peer's FIN or a reset, is no fault and fires nothing;
+ *   a `stop()` cut, `destroy()`, and Node's 408 close are no peer disconnect. The request is `undefined` for an upgrade-handler throw
  *   (no fetch `Request` exists on that path — only a raw `IncomingMessage`),
  *   a listen failure, and a fault on the `400` path of a request no
  *   `Request` could be built for, a failed write of that `400` included.
@@ -651,7 +652,9 @@ export interface ResponseRecord {
  *   throw), and `ms`, the time from the exchange's acceptance, before
  *   `request` fires, to that last byte, in whole milliseconds. A response
  *   whose peer disconnected first, a body-less answer included, and a write
- *   that failed fire no `response`,
+ *   that failed fire no `response`; `response` fires after Node hands the
+ *   last byte to the operating system, so a peer that resets before it reads
+ *   the answer leaves the record,
  *   and neither does a request rejected at the `buildRequest` inner boundary
  *   (a plain `400`, for example a malformed `Host` header), because no parsed
  *   `Request` exists yet to derive its facts from.
@@ -747,7 +750,7 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   `error` event carries: every throw except an `HTTPError` whose status the
  *   response carries, a returned status no `Response` carries, a response
  *   write that fails, and a throw the terminal catch holds. A throw after a
- *   peer disconnect is no fault. A sink that throws, or returns a promise
+ *   peer disconnect the server read first is no fault. A sink that throws, or returns a promise
  *   that rejects, is contained, so the response still goes out, except a
  *   rejected native promise whose species constructor cannot build a promise:
  *   its `constructor` lookup throws or yields a value that is neither

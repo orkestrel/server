@@ -90,7 +90,8 @@ import { ServerBinding } from './ServerBinding.js'
  *   keeps that status, with no body for 204, 205, and 304, and every other
  *   throw renders `500` (message hidden unless `expose`). Each fault, every
  *   throw except an `HTTPError` whose status the response carries and a
- *   throw after a peer disconnect, reaches `error` and `report` with its
+ *   throw after a peer disconnect the server read first (the peer's FIN or a
+ *   reset), reaches `error` and `report` with its
  *   `RequestLine`; a fault on the inner phase's `400` path carries none,
  *   because no `Request` exists there. A `report` that throws or rejects is
  *   contained, except a rejected native promise whose species constructor
