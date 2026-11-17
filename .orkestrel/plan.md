@@ -82,8 +82,15 @@ Harden `@orkestrel/router`, `@orkestrel/server`, and `@orkestrel/middleware` to 
 - **CSRF:** the token is `random.HMAC(key, label + sessionId + random)`, a signed double submit that carries no session id; with no session, it is a signed double submit over the battery's own nonce cookie. The token is read from a JSON or urlencoded body; a multipart form sends it in the header. On rotation, `state.csrf` holds the arrived session's token, and a rotating handler answers with a redirect.
 - **CORS:** in list mode every response and preflight carries `Vary: Origin`; a disallowed origin's preflight carries no CORS headers. `createCors` and `CorsOptions` become `createCORS` and `CORSOptions`.
 - **Scoping:** `only` and `except` match through router core's `compilePath` and `matchPath`, and middleware peers on router.
-- **Sessions:** a session is stored only after a handler writes to it or regenerates it. Eviction at capacity is constant-time.
+- **Sessions:** a session is stored only after a handler writes to it or regenerates it. Eviction at capacity is constant-time and keeps no heap per read.
 - **Admission:** every factory admits its option bag whole, and a refusal is a `ContractError` with its path.
+
+### Caching, ranges, and forms
+
+- **`If-Range`:** any `If-Range` serves the full `200`.
+- **Multipart:** a boundary over 70 characters answers `400` (RFC 2046 § 5.1.1).
+- **Coded validators:** behind compression, a strong tag on a coded `200` becomes `W/` (RFC 9110 § 8.8.1).
+- **`304`:** the `304` that `createETag` answers carries `Content-Length` and `Vary: Accept-Encoding`, the headers of the `200` it stands for.
 
 ### Performance
 
@@ -207,4 +214,5 @@ One review pass on numbered claims, by a reviewer that did not write the unit. A
 
 - 2026-11-16: the evidence round and the design consultation closed, and § Rulings records them. M0a landed on middleware's working branch. S4, the untrusted substrate, merged into server's working branch as `d9f8fc4` after its third review passed. R1's and R2's reviews failed (§ Sequence item 1), and fix rounds R1b and R2b are running. M5 (middleware `fc3f323`) is under review. S2a, the abort evidence, and the contract list are running.
 - 2026-11-16, later: server's working branch carries S2a, S2b, S3, and S6, merged through unit SI on router's R2b build (`b245633`), each step through the full gate chain. S2b's report limit is stated by the species-constructor steps `then` runs. The `MaxListenersExceededWarning` (11 `close` listeners per `ServerResponse`) came from router's R2 writer (`af49292`), which R2b replaced; it reads 0 on the R2b pin. M0b passed. M1's review failed: the guide's fence order drops `Vary: Origin` and the security headers on a thrown error, so its canonical-order cells land red with closer M4, which owns the onion order. An `is*` guard returns false for a value missing a declared member, so `isSessionControl` checks every member of `SessionControlInterface` (M3). R1d, M1-b, M2's review, M3, S5, C-D4, and the lane unit L1c (Fable's freeze-to-fixpoint kill) are running.
-- Next: merge R1 after its confirming pass and re-pin the consumers on router's integrated build; then M4 and M6, the visits, and the integrated round.
+- 2026-11-17: router's working branch carries R4 to R6 and passed its gate chain at `5a3b7ef`; R6's review is running. Server's S7 (the disconnect latch and the abortable body read) is under an independent pass on router's `5a3b7ef` build. Middleware's falsify round failed claim 4 (the session store's live iterator kept about 82 B per read); unit MS replaced it with a tick ledger, and middleware's working branch carries MS at `815c948`.
+- Next: release router 0.0.23, then server 0.0.29 and middleware 0.0.35, each after its gate chain on the final packs.
