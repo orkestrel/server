@@ -2334,6 +2334,11 @@ export class ServerRawClient {
 	destroy(): void {
 		this.#socket.destroy()
 	}
+
+	/** Resets the connection from the client side, so the peer reads `ECONNRESET`. */
+	reset(): void {
+		this.#socket.resetAndDestroy()
+	}
 }
 
 /**

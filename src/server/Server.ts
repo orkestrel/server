@@ -340,10 +340,12 @@ export class Server<TState> implements ServerInterface<TState> {
 		const disconnect = new AbortController()
 		const release = this.#register(exchange)
 		if (this.#status === 'stopping') exchange.abort()
-		// A close before the end latches a peer disconnect, unless the server destroyed the response
-		// with an error; the exchange's own signal cannot tell, because it may have aborted first.
+		// Only the connection tells a peer disconnect from a close the server or Node made.
+		const socket = message.socket
 		response.once('close', () => {
-			if (!response.writableEnded && response.errored === null) disconnect.abort()
+			const failure = socket.errored
+			const reset = failure !== null && 'code' in failure && failure.code === 'ECONNRESET'
+			if (!response.writableEnded && (socket.readableEnded || reset)) disconnect.abort()
 			release()
 		})
 		void this.#trackExchange(message, response)
@@ -384,7 +386,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		try {
 			this.#emitter.emit('request', line.method, line.url.pathname)
 			const result = await this.#run(request, line, message, exchange, disconnect)
-			const sent = await this.#respond(result, response, line, disconnect)
+			const sent = await this.#respond(result, response, line)
 			// A body-less answer after a disconnect still reaches `finish`, so the latch decides.
 			if (sent && !disconnect.aborted) {
 				this.#emitter.emit('response', {
@@ -434,18 +436,13 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 	}
 
-	// A failed write destroys the connection and is a fault, unless the peer disconnected first.
-	async #respond(
-		result: Response,
-		response: ServerResponse,
-		line?: RequestLine,
-		disconnect?: AbortSignal,
-	): Promise<boolean> {
+	// A failed write destroys the connection and is a fault.
+	async #respond(result: Response, response: ServerResponse, line?: RequestLine): Promise<boolean> {
 		try {
 			await sendResponse(result, response)
 		} catch (error) {
 			response.destroy()
-			if (disconnect?.aborted !== true) this.#fault(error, line)
+			this.#fault(error, line)
 			return false
 		}
 		return response.writableFinished

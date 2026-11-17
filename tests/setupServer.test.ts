@@ -284,6 +284,27 @@ describe('ServerRawClient', () => {
 			client.destroy()
 		}
 	})
+
+	it('resets the connection so the peer socket reads ECONNRESET', async () => {
+		const failures = createRecorder<readonly [unknown]>()
+		const requests = createRecorder<readonly []>()
+		const loopback = trackLoopback(
+			bound,
+			await createLoopback(
+				http.createServer((request) => {
+					request.socket.on('error', failures.handler)
+					requests.handler()
+				}),
+			),
+		)
+		const client = await connectServerClient(loopback.port, ['GET'])
+		client.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+		await waitForCondition('the peer reads the request', () => requests.count > 0)
+		client.reset()
+		await client.ended
+		await waitForCondition('the peer reads the reset', () => failures.count > 0)
+		expect(failures.calls[0]?.[0]).toMatchObject({ code: 'ECONNRESET' })
+	})
 })
 
 describe('subtractServerListeners', () => {
