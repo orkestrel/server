@@ -96,7 +96,7 @@ import { ServerBinding } from './ServerBinding.js'
  *   because no `Request` exists there. A `report` that throws or rejects is
  *   contained, except a rejected native promise whose species constructor
  *   cannot build a promise, which reaches `unhandledRejection` (see
- *   `ServerOptions.report`). A write that fails destroys the connection and is a fault,
+ *   `ServerOptions.report`). A write that fails destroys the connection and is a fault, unless the peer disconnected first,
  *   and a terminal catch over the whole exchange, the `400` path included,
  *   holds a throw from any step.
  * - **Upgrade fan-out** — verbatim old semantics (first-claimer-wins, a
