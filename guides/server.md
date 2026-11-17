@@ -468,6 +468,13 @@ These invariants hold across `src/server` ↔ `server.md`.
    `400` fire none. An exchange the server aborted through `context.abort` and
    then answered still fires one.
 
+   In 0.0.28, the boundary rendered every thrown `HTTPError` with its own
+   status, so a status the `Response` constructor refuses, such as 101 or
+   600, threw out of the boundary and nothing caught it. `report` received
+   only a throw that was not an `HTTPError`, and a promise it returned went
+   unhandled. A failed write destroyed the connection with no `error` emit
+   and no `report` call, and it still fired `response`.
+
 7. **Upgrade fan-out is isolated, first-claimer-wins.** Registered
    `UpgradeHandler`s run in registration order; the first to return `true`
    claims the socket and stops the fan-out; a handler that throws is treated as
@@ -528,7 +535,10 @@ These invariants hold across `src/server` ↔ `server.md`.
    expiry is HMAC-covered inside the signed payload. `verifyToken` and
    `readSignedCookie` reject only when the signer's `verify` rejects, which the
    signer `createSigner` returns never does, so a consumer signer's outage
-   surfaces as an error, not as an invalid token.
+   surfaces as an error, not as an invalid token. In 0.0.28, each token
+   helper took a `TokenSecret` in place of a signer, `TokenOptions` carried
+   `secret`, every call imported a WebCrypto key, and a blank secret entry
+   was dropped rather than refused.
 10. **Seam semantics: returning onion.** Each `MiddlewareHandler` receives a
     `next` that, called, runs the downstream chain and resolves its `Response`;
     not calling it short-circuits with the middleware's own `Response`; a
@@ -545,6 +555,8 @@ These invariants hold across `src/server` ↔ `server.md`.
     such as a `Response.redirect` or a `fetch` result, as a copy with the
     same body, status, status text, and headers, so a layer can set headers
     after `await next()`; it passes every other response through by identity.
+    In 0.0.28, `next` took an optional `Request` and ran the downstream chain
+    on it, so a layer could replace the request.
 11. **The bag is the router's state.** `compose`'s `terminal` is
     `(request, context) => dispatcher.handle(request, context.state)` — the
     exact object every middleware wrote into `context.state` is what a route
@@ -554,7 +566,9 @@ These invariants hold across `src/server` ↔ `server.md`.
     socket and handed to `ServerOptions.state`; `context.connection` is that
     same object, whatever the `state` factory keeps — `X-Forwarded-For` is never
     implicitly trusted; a deployment behind a trusted proxy derives its own
-    client key explicitly in `state` or in middleware.
+    client key explicitly in `state` or in middleware. In 0.0.28, the context
+    carried no `connection`, and only the `state` factory received the
+    `Connection`.
 13. **One abort signal per exchange.** The server builds one
     `AbortController` per exchange and passes its signal to the router's
     `buildRequest`, so `request.signal` aborts when the peer disconnects, when
@@ -566,7 +580,10 @@ These invariants hold across `src/server` ↔ `server.md`.
     arrives during the drain is served with its signal already aborted, and
     the `drain` event's pending count is the registry's size. No request
     signal links to a signal that outlives its exchange, so nothing per
-    request stays reachable after the exchange ends.
+    request stays reachable after the exchange ends. In 0.0.28, the server
+    built a second `Request` whose signal linked the router's disconnect
+    signal to one stop signal per run, through the `linkSignal` function of
+    `@orkestrel/abort`, and the context carried no `abort`.
 14. **Receipt timeouts are delegated to `node:http`.** `start()` passes
     `timeouts.headers`, `timeouts.request`, and `timeouts.keepalive` to
     `node:http`'s `createServer` as its `headersTimeout`, `requestTimeout`,
@@ -596,7 +613,11 @@ These invariants hold across `src/server` ↔ `server.md`.
     relation. No server timeout bounds the response; a response deadline is
     a middleware's, such as the `createDeadline` middleware of
     `@orkestrel/middleware`, which aborts the exchange through
-    `context.abort`.
+    `context.abort`. In 0.0.28, the server set these three as properties of
+    the `node:http` server and left `connectionsCheckingInterval` at Node's
+    30_000 ms, so a `headers` or `request` timeout expired up to 30_000 ms
+    after it passed; construction accepted any non-negative finite number and
+    refused a `headers` greater than `keepalive`.
 15. **Socket caps map without policy.** `sockets.connections` /
     `sockets.headers` / `sockets.requests` apply directly to node's
     `maxConnections` / `maxHeadersCount` / `maxRequestsPerSocket` before bind.
@@ -701,6 +722,14 @@ const server = createServer<State>({
 	middleware: [cors, auth], // CORS claims preflights before dispatcher.handle's auto-OPTIONS
 })
 ```
+
+The dispatcher of the `@orkestrel/router` release that 0.0.29 depends on
+answers a path that matches with no route for the method with `405` and an
+`Allow` header that lists `OPTIONS`. It answers a `HEAD` with no `HEAD` route
+by running the `GET` handler, cancelling that response's body, and sending its
+status and headers alone, and an `OPTIONS` with no `OPTIONS` route with `204`
+and the same `Allow`. In 0.0.28, a `405`'s `Allow` left out `OPTIONS`, and an
+automatic `HEAD` left the `GET` body uncancelled.
 
 ### Typed state slices
 
@@ -895,8 +924,8 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   the dispatcher's own auto-`OPTIONS` runs last.
 - **Read `context.body()` through the cache, never `request.body` directly**
   — the stream is drained exactly once, capped and zip-bomb-safe.
-- **Thread `request.signal` into downstream work** — it fires on either
-  client disconnect or server `stop()`.
+- **Thread `request.signal` into downstream work** — it aborts on a client
+  disconnect, on `context.abort`, or on server `stop()`.
 - **Never derive a rate key from `X-Forwarded-For`** — use the injected
   `Connection.ip` (or your own trusted-proxy derivation).
 - **Publish a state-slice interface per middleware family** — intersect the
@@ -1037,8 +1066,8 @@ new TextDecoder().decode(body) // 'hi' — capped decompression, the zip-bomb de
   documentation-as-contract.
 - [`router.md`](router.md) — `@orkestrel/router`, the dispatcher this server
   consumes and never re-implements.
-- [`abort.md`](abort.md) — `@orkestrel/abort`, the stop-signal/request-signal
-  linking primitive.
+- [`abort.md`](abort.md) — `@orkestrel/abort`, the abort and signal-linking
+  primitives behind the bounded startup and the drain's wake-park.
 - [`emitter.md`](emitter.md) — `@orkestrel/emitter`, the `Server`'s lifecycle
   event map.
 - [`contract.md`](contract.md) — `@orkestrel/contract`, the guards backing

@@ -4,7 +4,7 @@
 //  fetch/string-pure (no `node:*`, no DOM):
 //
 //    1. The middleware seam — {@link MiddlewareContext}, {@link NextFunction},
-//       {@link MiddlewareHandler} — the frozen contract `compose` wires
+//       {@link MiddlewareHandler} — the contract `compose` wires
 //       together and the `@orkestrel/middleware` package peer-depends on.
 //       {@link Connection} is the adapter-injected per-request fact
 //       slice a consumer's `state` function turns into its `TState`.

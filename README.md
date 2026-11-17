@@ -20,7 +20,7 @@ npm install @orkestrel/server
 
 ## Requirements
 
-- Node.js >= 22.12.0, matching the `engines` field in `package.json`
+- Node.js >= 22.18.0, the `engines.node` floor in `package.json`; 0.0.28 declared >= 22.12.0
 - ESM and CommonJS builds
 
 ## Usage
@@ -61,7 +61,8 @@ A route handler reads `context.state` exactly as middleware wrote it — the
 composed onion terminates in the dispatcher, so there is no second plumbing
 layer between the middleware seam and the router. The package also exports
 `HTTPError` and its subclasses, the `compose` middleware primitive,
-cookie/token/body helpers, `Negotiator` for content negotiation, and
+cookie/token/body helpers, `createSigner` for the signer every signed cookie
+and token helper takes, `Negotiator` for content negotiation, and
 `createStream` for Server-Sent Events.
 
 ## Guide
@@ -73,7 +74,9 @@ body pipeline), and the `Server` lifecycle entity — see
 
 ## Package
 
-Published as a single entry point per the `exports` field in `package.json`.
+Published as one entry point, `.`, per the `exports` field in `package.json`:
+import `createServer` and every other export from `@orkestrel/server`. The
+package has no `./server` subpath, in 0.0.29 as in 0.0.28.
 
 ## License
 
