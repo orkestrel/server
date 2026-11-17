@@ -926,6 +926,135 @@ describe('the boundary — the response event', () => {
 	})
 })
 
+describe('the boundary — a peer disconnect after the server aborted', () => {
+	it('reports no fault when the peer leaves a read context.abort preceded and the route rethrows', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+				middleware: [createAbortLayer('/upload', ['the layer aborted first'])],
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload route starts', () => entered.includes('/upload'))
+		client.destroy()
+		await waitForCondition('the /upload read observes the close', () =>
+			entered.includes('/upload failed'),
+		)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('fires no response for a body-less answer to a peer that left after context.abort', async () => {
+		const entered: string[] = []
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				middleware: [createAbortLayer('/upload-caught', ['the layer aborted first'])],
+			}),
+		)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload-caught HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload-caught route starts', () =>
+			entered.includes('/upload-caught'),
+		)
+		client.destroy()
+		await waitForCondition('the /upload-caught read observes the close', () =>
+			entered.includes('/upload-caught failed'),
+		)
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+	})
+
+	it('reports no fault when the peer leaves a read stop() aborted and the route rethrows', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write(
+			'POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.',
+		)
+		await waitForCondition('the /upload route starts', () => entered.includes('/upload'))
+		const stopped = server.stop()
+		client.destroy()
+		await waitForCondition('the /upload read observes the close', () =>
+			entered.includes('/upload failed'),
+		)
+		await stopped
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+
+	it('reports no fault and fires no response when the peer leaves a streamed answer mid-body', async () => {
+		const entered: string[] = []
+		const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+		const responses = createRecorder<readonly [ResponseRecord]>()
+		const server = trackServer(
+			running,
+			createServer({
+				dispatcher: createBoundaryDispatcher(entered),
+				state: () => undefined,
+				host: '127.0.0.1',
+				report: reports.handler,
+			}),
+		)
+		server.emitter.on('error', errors.handler)
+		server.emitter.on('response', responses.handler)
+		const port = await server.start()
+		const client = await connectServerClient(port, ['POST'])
+		client.write('POST /echo HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1000\r\n\r\nten bytes.')
+		await waitForCondition(
+			'the echoed first chunk arrives',
+			() => client.responses[0]?.body === 'ten bytes.',
+		)
+		client.destroy()
+		expect((await readBoundaryReply(port, '/ping')).body).toBe('pong')
+		await waitForCondition('the control response fires', () =>
+			responses.calls.some(([record]) => record.pathname === '/ping'),
+		)
+		expect(responses.calls.map(([record]) => record.pathname)).toEqual(['/ping'])
+		expect([errors.count, reports.count]).toEqual([0, 0])
+	})
+})
+
 describe('the boundary — the terminal catch', () => {
 	it('never rejects an exchange, and pairs every error event with one report', async () => {
 		const rejections = createRecorder<readonly [unknown]>()

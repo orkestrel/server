@@ -1651,7 +1651,11 @@ export function buildBoundaryResponse(status: number): Response {
  * - `GET /f3/:index` throws the member of {@link BOUNDARY_F3_THROWS} at `index`.
  * - `GET /boom` throws an `Error`, and `GET /ping` answers `pong`.
  * - `GET /hang` parks until its request signal aborts, then throws the signal's reason.
- * - `POST /upload` reads its body as text, then answers it.
+ * - `POST /upload` reads its body as text, then answers it; a read that fails appends
+ *   `/upload failed` and rethrows.
+ * - `POST /upload-caught` reads its body as text, then answers it; a read that fails appends
+ *   `/upload-caught failed` and answers a 200 with no body.
+ * - `POST /echo` answers its own request body as the response body.
  * - `GET /trickle` answers {@link BOUNDARY_FIRST_CHUNK}, then a body that waits until it is
  *   cancelled.
  * - `GET /fail-body` answers {@link BOUNDARY_FIRST_CHUNK}, then fails with
@@ -1708,7 +1712,33 @@ export function createBoundaryDispatcher(entered: string[]): DispatcherInterface
 		path: '/upload',
 		handler: async (request) => {
 			entered.push('/upload')
-			return new Response(await request.text())
+			const text = await request.text().catch((error: unknown) => {
+				entered.push('/upload failed')
+				throw error
+			})
+			return new Response(text)
+		},
+	})
+	dispatcher.add({
+		method: 'POST',
+		path: '/upload-caught',
+		handler: async (request) => {
+			entered.push('/upload-caught')
+			return request.text().then(
+				(text) => new Response(text),
+				() => {
+					entered.push('/upload-caught failed')
+					return new Response(null)
+				},
+			)
+		},
+	})
+	dispatcher.add({
+		method: 'POST',
+		path: '/echo',
+		handler: (request) => {
+			entered.push('/echo')
+			return new Response(request.body)
 		},
 	})
 	dispatcher.add({
