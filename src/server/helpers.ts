@@ -23,6 +23,7 @@ import {
 	isFiniteNumber,
 	isInstance,
 	isNumber,
+	isObject,
 	isRecord,
 	isString,
 	parseJSON,
@@ -1465,7 +1466,8 @@ export function scrubPrototype(value: unknown): unknown {
 	const nodes = new Set<unknown>([value])
 	for (const node of nodes) {
 		if (isArray(node)) {
-			for (const member of node) if (isArray(member) || isRecord(member)) nodes.add(member)
+			for (const member of node)
+				if (isObject(member) && (isArray(member) || isRecord(member))) nodes.add(member)
 			continue
 		}
 		if (!isRecord(node)) continue
@@ -1475,7 +1477,7 @@ export function scrubPrototype(value: unknown): unknown {
 				continue
 			}
 			const member = node[key]
-			if (isArray(member) || isRecord(member)) nodes.add(member)
+			if (isObject(member) && (isArray(member) || isRecord(member))) nodes.add(member)
 		}
 	}
 	return value

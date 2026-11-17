@@ -78,6 +78,8 @@ import {
 	SERVER_GROWTH_BOUND,
 	SERVER_GROWTH_SIZE,
 	SERVER_NBSP,
+	SERVER_SCRUB_ARRAY_BOUND,
+	SERVER_SCRUB_RECORD_BOUND,
 	SERVER_RANGE_SHAPES,
 	SERVER_WIDE_SPACE,
 	SERVER_PROTOTYPE_NAMES,
@@ -88,6 +90,7 @@ import {
 	buildServerCycle,
 	buildServerRangePopulation,
 	buildServerRangeWalk,
+	compareServerCost,
 	measureServerGrowth,
 	recognizeServerRange,
 	compressServerFixture,
@@ -1295,6 +1298,34 @@ describe('isDangerousKey / scrubPrototype', () => {
 		const cycle = buildServerCycle(1_000, reads)
 		expect(scrubPrototype(cycle)).toBe(cycle)
 		expect(reads.value).toBe(1)
+	})
+
+	it('spends a fraction of a container element on a primitive array element, which no guard admits', () => {
+		const primitives = Array.from({ length: SERVER_GROWTH_SIZE }, (_, index) => index)
+		const containers = Array.from({ length: SERVER_GROWTH_SIZE }, () => [])
+		const ratio = compareServerCost(
+			() => scrubPrototype(primitives),
+			() => scrubPrototype(containers),
+		)
+		expect(ratio).toBeGreaterThan(0)
+		expect(ratio).toBeLessThan(SERVER_SCRUB_ARRAY_BOUND)
+	})
+
+	it('spends a fraction of a container member on a primitive record member, which no guard admits', () => {
+		const count = SERVER_GROWTH_SIZE / 4
+		const primitives = Array.from({ length: count }, (_, index) => ({
+			a: index,
+			b: index,
+			c: index,
+			d: index,
+		}))
+		const containers = Array.from({ length: count }, () => ({ a: [], b: [], c: [], d: [] }))
+		const ratio = compareServerCost(
+			() => scrubPrototype(primitives),
+			() => scrubPrototype(containers),
+		)
+		expect(ratio).toBeGreaterThan(0)
+		expect(ratio).toBeLessThan(SERVER_SCRUB_RECORD_BOUND)
 	})
 })
 

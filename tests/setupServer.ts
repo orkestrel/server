@@ -505,6 +505,24 @@ export const SERVER_GROWTH_BOUND = 8
 /** Holds the run length n at which a cost row reads t(n), and 4n for t(4n). */
 export const SERVER_GROWTH_SIZE = 4_000
 
+/**
+ * Bounds the cost ratio of scrubbing an array of n primitives over an array of n empty arrays. On
+ * 2026-11-17, at n = 4,000, 12 solo readings of the base `scrubPrototype` (`b245633`, both guards
+ * on every member) read 0.316 to 0.427 over two runs with the host's load average from 1.9 to 5.6,
+ * and the scrub that skips the guards for a primitive read 0.028 to 0.081; 0.15 sits near half the
+ * base minimum and twice the skip's maximum.
+ */
+export const SERVER_SCRUB_ARRAY_BOUND = 0.15
+
+/**
+ * Bounds the cost ratio of scrubbing n/4 records of 4 primitive members over n/4 records of 4
+ * empty-array members. On 2026-11-17, at n = 4,000 with the host's load average from 3.6 to 5.6,
+ * 12 solo readings each read 0.444 to 0.481 for the base `scrubPrototype` (`b245633`), 0.451 to
+ * 0.517 with the skip on array members only, and 0.254 to 0.277 with the skip on record members
+ * too; 0.36 sits between them.
+ */
+export const SERVER_SCRUB_RECORD_BOUND = 0.36
+
 /** Describes one cost-row header: the text before and after a run of spaces of size n. */
 export interface ServerRangeShape {
 	readonly before: string
@@ -544,19 +562,33 @@ export function timeServerBatch(call: () => unknown, repeat: number): number {
  * @returns t(4n)/t(n), near 4 for a linear call and near 16 for a quadratic one
  */
 export function measureServerGrowth(build: (size: number) => () => unknown, size: number): number {
-	const small = build(size)
-	const large = build(4 * size)
-	small()
-	large()
-	const repeat = Math.max(1, Math.ceil(20 / Math.max(timeServerBatch(small, 1), 0.001)))
+	return compareServerCost(build(4 * size), build(size))
+}
+
+/**
+ * Compares two calls' costs: the batch time of `call` over the batch time of `reference`, each the
+ * least of 5 batches, with the batch sized so `reference` takes 20 ms or more.
+ *
+ * @remarks
+ * The batches interleave in 5 rounds, `reference` first in the even rounds and `call` first in the
+ * odd ones, so a burst of contention on the host reaches both calls rather than one.
+ *
+ * @param call - The call whose cost is the numerator
+ * @param reference - The call whose cost is the denominator
+ * @returns t(call)/t(reference)
+ */
+export function compareServerCost(call: () => unknown, reference: () => unknown): number {
+	reference()
+	call()
+	const repeat = Math.max(1, Math.ceil(20 / Math.max(timeServerBatch(reference, 1), 0.001)))
 	const rounds = Array.from({ length: 5 }, (_, round) =>
 		round % 2 === 0
-			? { small: timeServerBatch(small, repeat), large: timeServerBatch(large, repeat) }
-			: { large: timeServerBatch(large, repeat), small: timeServerBatch(small, repeat) },
+			? { reference: timeServerBatch(reference, repeat), call: timeServerBatch(call, repeat) }
+			: { call: timeServerBatch(call, repeat), reference: timeServerBatch(reference, repeat) },
 	)
 	return (
-		Math.min(...rounds.map((times) => times.large)) /
-		Math.min(...rounds.map((times) => times.small))
+		Math.min(...rounds.map((times) => times.call)) /
+		Math.min(...rounds.map((times) => times.reference))
 	)
 }
 
