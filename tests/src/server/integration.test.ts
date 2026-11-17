@@ -1495,6 +1495,53 @@ describe('the boundary — a disconnect that reaches a body or a queued exchange
 		expect([errors.count, reports.count]).toEqual([2, 2])
 	})
 
+	it.each([
+		{ label: 'reset', leave: 'reset' },
+		{ label: 'FIN', leave: 'fin' },
+	])(
+		'keeps the router disconnect reason on the active request signal when the peer leaves ($label)',
+		async ({ leave }) => {
+			const entered: string[] = []
+			const reasons: unknown[] = []
+			const reports = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const errors = createRecorder<readonly [unknown, RequestLine | undefined]>()
+			const server = trackServer(
+				running,
+				createServer({
+					dispatcher: createBoundaryDispatcher(entered),
+					state: () => undefined,
+					host: '127.0.0.1',
+					report: reports.handler,
+					middleware: [
+						async (request, context, next) => {
+							if (context.url.pathname !== '/late') return next()
+							entered.push('/late')
+							await once(request.signal, 'abort')
+							reasons.push(request.signal.reason)
+							throw request.signal.reason
+						},
+					],
+				}),
+			)
+			server.emitter.on('error', errors.handler)
+			const port = await server.start()
+			const socket = net.createConnection({ host: '127.0.0.1', port })
+			socket.on('error', () => undefined)
+			await once(socket, 'connect')
+			socket.write('GET /late HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n')
+			await waitForCondition('the /late layer parks', () => entered.includes('/late'))
+			if (leave === 'reset') socket.resetAndDestroy()
+			else socket.end()
+			await waitForCondition('the layer reads the abort reason', () => reasons.length === 1)
+			await yieldLoop()
+			expect(reasons[0]).toBeInstanceOf(Error)
+			expect(reasons[0]).toMatchObject({
+				message: 'request to /late disconnected before response completed',
+			})
+			expect([errors.count, reports.count]).toEqual([0, 0])
+		},
+	)
+
 	it('fires response for an answer the socket still held when the peer sent its FIN', async () => {
 		const exchanges = new ServerExchanges()
 		const responses = createRecorder<readonly [ResponseRecord]>()
