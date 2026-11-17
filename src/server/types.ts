@@ -630,7 +630,8 @@ export interface ResponseRecord {
  * - `error` — a fault, fired once per fault. On the per-request path that is
  *   a throw the built-in boundary reports (every throw except an `HTTPError`
  *   whose status the response carries, a returned status no `Response`
- *   carries included), a response write that fails, or a throw the terminal
+ *   carries included), a response write that fails unless the peer
+ *   disconnected first, or a throw the terminal
  *   catch holds; each carries the request's {@link RequestLine}, the same
  *   pair `report` receives. A throw after a peer disconnect the server read
  *   before the throw, the peer's FIN or a reset, is no fault and fires nothing;
@@ -749,7 +750,7 @@ export type ConnectionStateFunction<TState> = (connection: Connection) => TState
  *   fault to (logging / metrics), with the same `(error, RequestLine)` the
  *   `error` event carries: every throw except an `HTTPError` whose status the
  *   response carries, a returned status no `Response` carries, a response
- *   write that fails, and a throw the terminal catch holds. A throw after a
+ *   write that fails unless the peer disconnected first, and a throw the terminal catch holds. A throw after a
  *   peer disconnect the server read first is no fault. A sink that throws, or returns a promise
  *   that rejects, is contained, so the response still goes out, except a
  *   rejected native promise whose species constructor cannot build a promise:

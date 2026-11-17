@@ -96,7 +96,7 @@ import { ServerBinding } from './ServerBinding.js'
  *   because no `Request` exists there. A `report` that throws or rejects is
  *   contained, except a rejected native promise whose species constructor
  *   cannot build a promise, which reaches `unhandledRejection` (see
- *   `ServerOptions.report`). A write that fails destroys the connection and is a fault,
+ *   `ServerOptions.report`). A write that fails destroys the connection and is a fault, unless the peer disconnected first,
  *   and a terminal catch over the whole exchange, the `400` path included,
  *   holds a throw from any step.
  * - **Upgrade fan-out** — verbatim old semantics (first-claimer-wins, a
@@ -117,7 +117,7 @@ export class Server<TState> implements ServerInterface<TState> {
 	readonly #upgradeHandlers: UpgradeHandler[] = []
 	readonly #upgraded = new Set<Duplex>()
 	readonly #requests = new Set<AbortController>()
-	readonly #exchanges = new Map<Socket, number>()
+	readonly #exchanges = new Map<Socket, Map<ServerResponse, () => void>>()
 	readonly #emitter: Emitter<ServerEventMap>
 	readonly #host: string | undefined
 	readonly #configuredPort: number | undefined
@@ -343,14 +343,26 @@ export class Server<TState> implements ServerInterface<TState> {
 		if (this.#status === 'stopping') exchange.abort()
 		// Only the connection tells a peer disconnect from a close the server or Node made.
 		const socket = message.socket
-		response.once('close', () => {
-			const failure = socket.errored
-			const reset = failure !== null && 'code' in failure && failure.code === 'ECONNRESET'
-			if (!response.writableEnded && (socket.readableEnded || reset)) disconnect.abort()
-			release()
+		response.once('close', () => this.#latch(socket, response, disconnect, release))
+		void this.#trackExchange(message, response, () => {
+			this.#latch(socket, response, disconnect, release)
+			exchange.abort()
 		})
-		void this.#trackExchange(message, response)
 		void this.#accept(message, response, exchange, disconnect.signal)
+	}
+
+	// Latch the peer disconnect the socket shows, an error on the response excluded, then release the exchange.
+	#latch(
+		socket: Socket,
+		response: ServerResponse,
+		disconnect: AbortController,
+		release: () => void,
+	): void {
+		const failure = socket.errored
+		const reset = failure !== null && 'code' in failure && failure.code === 'ECONNRESET'
+		if (!response.writableEnded && response.errored === null && (socket.readableEnded || reset))
+			disconnect.abort()
+		release()
 	}
 
 	// The terminal catch: a throw here, the inner phase's `400` included, has no `RequestLine`.
@@ -387,7 +399,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		try {
 			this.#emitter.emit('request', line.method, line.url.pathname)
 			const result = await this.#run(request, line, message, exchange, disconnect)
-			const sent = await this.#respond(result, response, line)
+			const sent = await this.#respond(result, response, line, disconnect)
 			// A body-less answer after a disconnect still reaches `finish`, so the latch decides.
 			if (sent && !disconnect.aborted) {
 				this.#emitter.emit('response', {
@@ -437,13 +449,18 @@ export class Server<TState> implements ServerInterface<TState> {
 		}
 	}
 
-	// A failed write destroys the connection and is a fault.
-	async #respond(result: Response, response: ServerResponse, line?: RequestLine): Promise<boolean> {
+	// A failed write destroys the connection and is a fault, unless the peer disconnected first.
+	async #respond(
+		result: Response,
+		response: ServerResponse,
+		line?: RequestLine,
+		disconnect?: AbortSignal,
+	): Promise<boolean> {
 		try {
 			await sendResponse(result, response)
 		} catch (error) {
 			response.destroy()
-			this.#fault(error, line)
+			if (disconnect?.aborted !== true) this.#fault(error, line)
 			return false
 		}
 		return response.writableFinished
@@ -578,7 +595,7 @@ export class Server<TState> implements ServerInterface<TState> {
 		return new Promise<void>((resolve) => {
 			server.close(() => resolve())
 			if (force) this.#cut(server)
-			else for (const [socket, open] of this.#exchanges) if (open === 0) socket.destroy()
+			else for (const [socket, open] of this.#exchanges) if (open.size === 0) socket.destroy()
 		})
 	}
 
@@ -592,9 +609,15 @@ export class Server<TState> implements ServerInterface<TState> {
 
 	// Count a connection's open exchanges from its accept to its close, so a
 	// clean close can find the connections that carry none.
+	// Node never closes a queued (pipelined) response whose connection ended, so the socket's close
+	// settles each exchange that still has no socket assigned; an active response settles from its own close.
 	#trackConnection(socket: Socket): void {
-		this.#exchanges.set(socket, 0)
-		socket.once('close', () => this.#exchanges.delete(socket))
+		const open = new Map<ServerResponse, () => void>()
+		this.#exchanges.set(socket, open)
+		socket.once('close', () => {
+			for (const [response, settle] of open) if (response.socket === null) settle()
+			this.#exchanges.delete(socket)
+		})
 	}
 
 	// Count one exchange open on its connection until both its request message
@@ -605,19 +628,21 @@ export class Server<TState> implements ServerInterface<TState> {
 	// zero. Node's `requestTimeout` bounds an upload that keeps sending after
 	// its response unless `timeouts.request` is 0; then only the stop's
 	// deadline does.
-	async #trackExchange(message: IncomingMessage, response: ServerResponse): Promise<void> {
+	async #trackExchange(
+		message: IncomingMessage,
+		response: ServerResponse,
+		settle: () => void,
+	): Promise<void> {
 		const socket = message.socket
 		const open = this.#exchanges.get(socket)
 		if (open === undefined) return
-		this.#exchanges.set(socket, open + 1)
+		open.set(response, settle)
 		await Promise.all([
 			new Promise((resolve) => message.once('close', resolve)),
 			new Promise((resolve) => response.once('close', resolve)),
 		])
-		const left = this.#exchanges.get(socket)
-		if (left === undefined) return
-		this.#exchanges.set(socket, left - 1)
-		if (left === 1 && this.#closed) socket.destroy()
+		open.delete(response)
+		if (open.size === 0 && this.#exchanges.get(socket) === open && this.#closed) socket.destroy()
 	}
 
 	// The listener has closed while the server stops, so the drain has settled

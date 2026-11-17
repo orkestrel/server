@@ -454,13 +454,16 @@ These invariants hold across `src/server` ↔ `server.md`.
      Node's default unhandled-rejection mode.
    - A write that fails, at a header Node refuses or in the body after the
      headers went out, destroys the connection, so the client reads an abort,
-     and is a fault.
+     and is a fault, unless the peer disconnected first.
    - A peer disconnect the server read before the throw, the peer's FIN or a
      reset, is no fault: a throw after it emits no `error` and calls no
      `report`. A `stop()` cut, `destroy()`, and Node's 408 close are no peer
      disconnect, so a throw after one is a fault. A peer disconnect the server
      never read is reported the same way: a peer that leaves while the route
-     leaves its body unread, under `timeouts.request: 0`, is a fault.
+     leaves its body unread, under `timeouts.request: 0`, is a fault. A queued
+     exchange of a pipelining client, whose response Node never closes, settles
+     when its connection closes: its `request.signal` aborts, and a throw after a
+     peer disconnect is no fault.
    - A terminal catch over the whole exchange, the inner phase's `400`
      included, holds a throw from any step, the renderer and the write
      included, so no exchange rejects.
